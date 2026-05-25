@@ -340,6 +340,80 @@ async def parse_idea_with_gpt(text: str):
         return None
 
 
+async def parse_capture_with_gpt(text: str, default_timezone: str):
+    if not _openai_client:
+        return None
+
+    now = _today_in_timezone(default_timezone)
+    system = (
+        "Ты извлекаешь из русской голосовой расшифровки запись для бота идей и задач. "
+        "Верни только JSON без markdown. Поля: "
+        "type: idea | task | reminder; "
+        "title: короткое название 2-6 слов, без обращений ('чат', 'привет'), без команд "
+        "('сделай задачу', 'добавь идею'), без даты и времени; "
+        "body: нормализованное описание или исходный смысл; "
+        "due_date: YYYY-MM-DD или пустая строка; "
+        "due_time: HH:MM в 24-часовом формате или пустая строка; "
+        "timezone: IANA timezone или пустая строка. "
+        "Если пользователь явно сказал 'идея', 'добавь идею', 'точнее идею' — type=idea, "
+        "если нет явной даты/времени-напоминания. Если есть 'задача', 'напомни' или время — type=task/reminder. "
+        "Исправляй падежи для title: 'молока' -> 'молоко', 'хлеба' -> 'хлеб', 'яиц' -> 'яйца'. "
+        "Для списков покупок делай title вроде 'Купить молоко и хлеб' или 'Купить молоко, хлеб и яйца'. "
+        "Если сказано 'сегодня/завтра/послезавтра', вычисли due_date. "
+        "Если есть время, но нет даты, выбери ближайшую будущую дату в указанном timezone. "
+        "Если timezone не указан, используй default_timezone. "
+        f"Сегодня: {now.date().isoformat()}. Текущее время: {now.strftime('%H:%M')}. "
+        f"default_timezone: {default_timezone}."
+    )
+    try:
+        response = await _async_call(
+            _openai_client.chat.completions.create,
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": text},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.1,
+        )
+        raw = response.choices[0].message.content
+        data = json.loads(raw)
+        capture_type = (data.get("type") or "").strip().lower()
+        if capture_type not in {"idea", "task", "reminder"}:
+            return None
+
+        title = _compact_spaces(data.get("title") or "")
+        body = _compact_spaces(data.get("body") or text)
+        due_date = _compact_spaces(data.get("due_date") or "")
+        due_time = _compact_spaces(data.get("due_time") or "")
+        timezone = _compact_spaces(data.get("timezone") or "")
+
+        if not title:
+            return None
+        if due_time and not re.match(r"^\d{2}:\d{2}$", due_time):
+            due_time = extract_capture_due_time(due_time)
+        if due_date and not re.match(r"^\d{4}-\d{2}-\d{2}$", due_date):
+            due_date = ""
+        if timezone:
+            try:
+                ZoneInfo(timezone)
+            except ZoneInfoNotFoundError:
+                timezone = extract_capture_timezone(timezone)
+
+        return {
+            "type": capture_type,
+            "title": title[:120],
+            "body": body or text,
+            "due_date": due_date,
+            "due_time": due_time,
+            "timezone": timezone,
+            "source": "gpt",
+        }
+    except Exception:
+        logger.exception("GPT capture parsing failed")
+        return None
+
+
 TIMEZONE_ALIASES = {
     "омск": "Asia/Omsk",
     "омску": "Asia/Omsk",
@@ -668,10 +742,38 @@ def classify_capture_text(text: str) -> dict:
         "type": capture_type,
         "title": generate_capture_title(normalized, capture_type),
         "body": clean,
+        "due_date": "",
         "due_time": due_time,
         "due_date_hint": "послезавтра" if "послезавтра" in low else "завтра" if "завтра" in low else "сегодня" if "сегодня" in low else "",
         "timezone": timezone,
+        "source": "rules",
     }
+
+
+async def classify_capture(update: Update, text: str, forced_type: str | None = None) -> dict:
+    user_id = update.effective_user.id
+    default_timezone = effective_user_timezone(user_id)
+    parsed = await parse_capture_with_gpt(text, default_timezone)
+    if parsed:
+        capture = parsed
+    else:
+        capture = classify_capture_text(text)
+
+    if forced_type:
+        capture["type"] = forced_type
+
+    timezone = capture.get("timezone") or default_timezone
+    due_time = capture.get("due_time", "")
+    due_date = capture.get("due_date", "")
+    if due_time and not due_date:
+        due_date = resolve_capture_due_date(capture.get("body") or text, timezone, due_time)
+
+    capture["timezone"] = timezone
+    capture["due_date"] = due_date
+    capture["due_time"] = due_time
+    capture["body"] = capture.get("body") or text
+    capture["title"] = _compact_spaces(capture.get("title") or generate_capture_title(text, capture["type"]))
+    return capture
 
 
 def generate_capture_title(text: str, capture_type: str) -> str:
@@ -1291,25 +1393,24 @@ async def _handle_task_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if len(text) > 500:
         text = text[:500]
 
-    capture = classify_capture_text(text)
-    title = capture["title"]
-
     user_id = update.effective_user.id
     db.upsert_user(user_id)
+    capture = await classify_capture(update, text, forced_type="task")
+    title = capture["title"]
     timezone = capture.get("timezone") or effective_user_timezone(user_id)
-    due_date = resolve_capture_due_date(text, timezone, capture.get("due_time", ""))
+    due_date = capture.get("due_date", "")
     task_id = db.add_task(
         user_id,
         title,
         title=title,
-        body=text,
+        body=capture.get("body") or text,
         due_date=due_date,
         due_time=capture.get("due_time", ""),
         timezone=timezone,
     )
 
     await update.message.reply_html(
-        f"✅ Задача создана\n\n{task_message(title, False, text, due_date, capture.get('due_time', ''), timezone)}",
+        f"✅ Задача создана\n\n{task_message(title, False, capture.get('body') or text, due_date, capture.get('due_time', ''), timezone)}",
         reply_markup=main_menu_keyboard(),
     )
     await update.message.reply_text(
@@ -1355,14 +1456,14 @@ async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     db.upsert_user(user_id)
 
-    capture = classify_capture_text(text)
+    capture = await classify_capture(update, text)
     capture_type = capture["type"]
 
     if capture_type in {"task", "reminder"}:
         title = capture["title"]
         due_time = capture.get("due_time", "")
         timezone = capture.get("timezone") or effective_user_timezone(user_id)
-        due_date = resolve_capture_due_date(capture["body"], timezone, due_time)
+        due_date = capture.get("due_date", "")
         task_id = db.add_task(
             user_id,
             title,
@@ -1393,7 +1494,7 @@ async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     brief = capture["title"]
     details = capture["body"]
-    if _openai_client:
+    if _openai_client and capture.get("source") != "gpt":
         parsed = await parse_idea_with_gpt(text)
         if parsed:
             brief, details = parsed
