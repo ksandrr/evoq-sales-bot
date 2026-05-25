@@ -3,7 +3,8 @@ import json
 import html
 import logging
 import tempfile
-from datetime import time, timezone
+from datetime import time
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 from telegram import (
@@ -35,7 +36,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# OpenAI client (опционально, для распознавания голоса)
+# OpenAI клиент (опционально — для голосовых)
 _openai_client = None
 if OPENAI_API_KEY:
     try:
@@ -50,17 +51,34 @@ else:
 
 # Состояния диалогов
 BRIEF, DETAILS = range(2)
-SET_TIME = 100
+ADD_REMINDER_TIME = 200
 
 REMINDER_JOB_PREFIX = "reminder:"
 
 # Подписи кнопок главного меню
 BTN_ADD = "➕ Добавить идею"
 BTN_LIST = "📚 Мои идеи"
-BTN_TIME = "⏰ Время напоминаний"
+BTN_REMINDERS = "⏰ Напоминания"
 BTN_TEST = "🔔 Тест напоминания"
+BTN_VOICE = "🎤 Голосовой ввод"
 BTN_HELP = "ℹ️ Помощь"
 BTN_CANCEL = "✖️ Отмена"
+
+# Преднастроенные часовые пояса (можно выбрать одной кнопкой)
+PRESET_TIMEZONES = [
+    ("UTC", "UTC"),
+    ("Europe/Kaliningrad", "Калининград (UTC+2)"),
+    ("Europe/Moscow", "Москва (UTC+3)"),
+    ("Europe/Samara", "Самара (UTC+4)"),
+    ("Asia/Yekaterinburg", "Екатеринбург (UTC+5)"),
+    ("Asia/Omsk", "Омск (UTC+6)"),
+    ("Asia/Novosibirsk", "Новосибирск (UTC+7)"),
+    ("Asia/Irkutsk", "Иркутск (UTC+8)"),
+    ("Asia/Yakutsk", "Якутск (UTC+9)"),
+    ("Asia/Vladivostok", "Владивосток (UTC+10)"),
+    ("Asia/Magadan", "Магадан (UTC+11)"),
+    ("Asia/Kamchatka", "Камчатка (UTC+12)"),
+]
 
 
 # --- Клавиатуры ---
@@ -69,8 +87,9 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
             [BTN_ADD],
-            [BTN_LIST, BTN_TIME],
-            [BTN_TEST, BTN_HELP],
+            [BTN_LIST, BTN_REMINDERS],
+            [BTN_TEST, BTN_VOICE],
+            [BTN_HELP],
         ],
         resize_keyboard=True,
         input_field_placeholder="Тапни кнопку, напиши или наговори идею...",
@@ -121,8 +140,7 @@ def full_message(brief: str, details: str) -> str:
 
 # --- Голос: распознавание и парсинг ---
 
-async def transcribe_voice(voice_file) -> str | None:
-    """Скачивает voice-файл из Telegram, отправляет в Whisper, возвращает текст."""
+async def transcribe_voice(voice_file):
     if not _openai_client:
         return None
 
@@ -145,8 +163,7 @@ async def transcribe_voice(voice_file) -> str | None:
             pass
 
 
-async def parse_idea_with_gpt(text: str) -> tuple[str, str] | None:
-    """Просит GPT извлечь из произвольного текста brief + details. Возвращает (brief, details)."""
+async def parse_idea_with_gpt(text: str):
     if not _openai_client:
         return None
 
@@ -182,50 +199,74 @@ async def parse_idea_with_gpt(text: str) -> tuple[str, str] | None:
 
 
 async def _async_call(fn, *args, **kwargs):
-    """Запускает синхронный вызов OpenAI SDK в отдельном потоке, чтобы не блокировать event loop."""
     import asyncio
 
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: fn(*args, **kwargs))
 
 
-# --- Обработчики верхнего уровня ---
+# --- Главные команды ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     db.upsert_user(user_id)
-    schedule_user_reminder(context.application, user_id)
+    schedule_user_reminders(context.application, user_id)
 
-    hour, minute = db.get_user_time(user_id)
+    tz = db.get_user_timezone(user_id)
+    reminders = db.get_user_reminders(user_id)
+    times_txt = ", ".join(f"{h:02d}:{m:02d}" for _, h, m in reminders) or "—"
     text = (
         "👋 Привет! Я бот для записи твоих идей.\n\n"
-        "Каждый день я буду напоминать тебе о них — кратко, "
-        "а кнопкой «📖 Подробнее» можно развернуть полное описание.\n\n"
-        f"⏰ Сейчас напоминания приходят в <b>{hour:02d}:{minute:02d} UTC</b>.\n"
-        "Это можно изменить кнопкой «⏰ Время напоминаний».\n\n"
-        "Жми кнопки внизу или просто наговори идею голосом."
+        "Каждый день я буду напоминать о них в удобное тебе время.\n\n"
+        f"🌍 Часовой пояс: <b>{html.escape(tz)}</b>\n"
+        f"⏰ Напоминания: <b>{times_txt}</b>\n\n"
+        "Используй кнопки внизу. Идею можно ввести текстом или голосом."
     )
     await update.message.reply_html(text, reply_markup=main_menu_keyboard())
 
 
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    voice_note = (
-        "🎤 <b>Голосовые сообщения</b>: можно надиктовать идею. "
-        "Бот сам распознает речь и разделит её на название и описание."
+    voice_status = (
+        "включён — можно наговорить идею голосом"
         if _openai_client
-        else "🎤 <b>Голосовые сообщения</b> временно недоступны — администратор не настроил OpenAI API."
+        else "выключен — нажми «🎤 Голосовой ввод», чтобы узнать, как включить"
     )
     text = (
         "<b>Как это работает</b>\n\n"
         f"• <b>{BTN_ADD}</b> — пошагово введи краткое название и подробное описание.\n"
         f"• <b>{BTN_LIST}</b> — посмотреть все идеи. У каждой кнопка «📖 Подробнее» и «🗑 Удалить».\n"
-        f"• <b>{BTN_TIME}</b> — поменять время ежедневного напоминания (UTC).\n"
-        f"• <b>{BTN_TEST}</b> — прислать тестовое напоминание прямо сейчас.\n\n"
-        f"{voice_note}\n\n"
-        "Дневное напоминание выглядит так: бот пишет «🌅 Напоминаю про твои идеи (N):» "
-        "и затем шлёт каждую идею отдельным сообщением с кнопкой «📖 Подробнее»."
+        f"• <b>{BTN_REMINDERS}</b> — управление списком ежедневных напоминаний и часовым поясом.\n"
+        f"• <b>{BTN_TEST}</b> — отправить тестовое напоминание прямо сейчас.\n"
+        f"• <b>{BTN_VOICE}</b> — инструкция по голосовому вводу (сейчас {voice_status}).\n\n"
+        "Дневное напоминание — короткое сообщение со списком названий твоих идей. "
+        "Чтобы посмотреть детали — открой «📚 Мои идеи»."
     )
     await update.message.reply_html(text, reply_markup=main_menu_keyboard())
+
+
+async def voice_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if _openai_client:
+        text = (
+            "🎤 <b>Голосовой ввод включён.</b>\n\n"
+            "Просто запиши голосовое прямо в чате — я расшифрую речь и сохраню как идею. "
+            "Если запишешь голосовое во время добавления идеи, я подставлю текст в текущий шаг."
+        )
+    else:
+        text = (
+            "🎤 <b>Как включить голосовой ввод</b>\n\n"
+            "Голос работает через OpenAI Whisper (распознавание) и GPT-4o-mini "
+            "(разделение на название/описание). Это платно, но дёшево "
+            "(~$0.006 за минуту голоса, на $5 хватит надолго).\n\n"
+            "<b>Шаги:</b>\n"
+            "1. Зайди на https://platform.openai.com\n"
+            "2. Settings → Billing → пополни баланс ($5 минимум).\n"
+            "3. API keys → Create new secret key → скопируй ключ (sk-proj-…).\n"
+            "4. В Railway → твой сервис → Variables → добавь:\n"
+            "   <code>OPENAI_API_KEY</code> = твой ключ.\n"
+            "5. Railway сам перезапустит бота — голос заработает.\n\n"
+            "Бесплатные альтернативы (без OpenAI) — см. справку в репо или попроси меня их встроить."
+        )
+    await update.message.reply_html(text, reply_markup=main_menu_keyboard(), disable_web_page_preview=True)
 
 
 async def list_ideas(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -250,6 +291,17 @@ async def list_ideas(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# --- Тестовое напоминание + ежедневное ---
+
+def _build_reminder_text(ideas) -> str:
+    lines = [f"💡 {html.escape(b)}" for _, b, _ in ideas]
+    return (
+        f"👋 Привет! Напоминаю про твои идеи ({len(ideas)}):\n\n"
+        + "\n".join(lines)
+        + f"\n\nЗагляни в «{BTN_LIST}» — может, что-то захочешь сделать прямо сейчас."
+    )
+
+
 async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     ideas = db.get_user_ideas(user_id)
@@ -260,11 +312,51 @@ async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await update.message.reply_text(
-        "🔔 Так будет выглядеть дневное напоминание:",
+    await update.message.reply_html(
+        _build_reminder_text(ideas),
         reply_markup=main_menu_keyboard(),
     )
-    await _send_reminder(context.bot, user_id, ideas)
+
+
+async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
+    user_id = context.job.data["user_id"]
+    ideas = db.get_user_ideas(user_id)
+    if not ideas:
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=_build_reminder_text(ideas),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        logger.exception("Не удалось отправить напоминание пользователю %s", user_id)
+
+
+def _user_tzinfo(user_id: int):
+    tz_name = db.get_user_timezone(user_id)
+    try:
+        return ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        logger.warning("Неизвестный часовой пояс %s у пользователя %s, fallback на UTC", tz_name, user_id)
+        return ZoneInfo("UTC")
+
+
+def schedule_user_reminders(application: Application, user_id: int):
+    job_queue = application.job_queue
+    prefix = f"{REMINDER_JOB_PREFIX}{user_id}:"
+    for job in list(job_queue.jobs()):
+        if job.name and job.name.startswith(prefix):
+            job.schedule_removal()
+
+    tzinfo = _user_tzinfo(user_id)
+    for rid, hour, minute in db.get_user_reminders(user_id):
+        job_queue.run_daily(
+            send_daily_reminder,
+            time=time(hour=hour, minute=minute, tzinfo=tzinfo),
+            data={"user_id": user_id},
+            name=f"{prefix}{rid}",
+        )
 
 
 # --- Диалог: добавить идею ---
@@ -289,7 +381,7 @@ async def _handle_brief_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return BRIEF
     if len(brief) > 200:
         await update.message.reply_text(
-            "Слишком длинно для краткого описания (макс. 200 символов). Сократи, пожалуйста.",
+            "Слишком длинно (макс. 200 символов). Сократи, пожалуйста.",
             reply_markup=cancel_keyboard(),
         )
         return BRIEF
@@ -297,7 +389,7 @@ async def _handle_brief_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
     context.user_data["brief"] = brief
     voice_hint = " или наговори голосом 🎤" if _openai_client else ""
     await update.message.reply_text(
-        f"📖 Теперь напиши подробное описание идеи (что именно, зачем, как){voice_hint}.\n\n"
+        f"📖 Теперь подробное описание (что именно, зачем, как){voice_hint}.\n\n"
         f"Или нажми «{BTN_CANCEL}».",
         reply_markup=cancel_keyboard(),
     )
@@ -328,7 +420,7 @@ async def _handle_details_text(update: Update, context: ContextTypes.DEFAULT_TYP
     brief = context.user_data.get("brief", "")
     db.upsert_user(user_id)
     idea_id = db.add_idea(user_id, brief, details)
-    schedule_user_reminder(context.application, user_id)
+    schedule_user_reminders(context.application, user_id)
 
     await update.message.reply_html(
         f"✅ Идея сохранена!\n\n{brief_message(brief)}",
@@ -359,53 +451,108 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# --- Диалог: настройка времени ---
+# --- Меню напоминаний ---
 
-async def settime_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    hour, minute = db.get_user_time(update.effective_user.id)
-    await update.message.reply_text(
-        f"⏰ Сейчас напоминания приходят в {hour:02d}:{minute:02d} UTC.\n\n"
-        f"Введи новое время в формате HH:MM (UTC), например: 09:30.\n\n"
+def _reminders_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    rows = []
+    for rid, h, m in db.get_user_reminders(user_id):
+        rows.append([
+            InlineKeyboardButton(f"🔔 {h:02d}:{m:02d}", callback_data=f"rem_noop:{rid}"),
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"rem_del:{rid}"),
+        ])
+    rows.append([InlineKeyboardButton("➕ Добавить напоминание", callback_data="rem_add")])
+    rows.append([InlineKeyboardButton("🌍 Сменить часовой пояс", callback_data="rem_tz")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _reminders_text(user_id: int) -> str:
+    tz = db.get_user_timezone(user_id)
+    reminders = db.get_user_reminders(user_id)
+    head = f"🌍 Часовой пояс: <b>{html.escape(tz)}</b>\n\n"
+    if not reminders:
+        return head + "У тебя пока нет напоминаний. Добавь первое кнопкой ниже."
+    return (
+        head
+        + f"Напоминания ({len(reminders)}), время по этому поясу.\n"
+        + "Чтобы удалить — нажми «🗑 Удалить» рядом со временем."
+    )
+
+
+async def reminders_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    db.upsert_user(user_id)
+    await update.message.reply_html(
+        _reminders_text(user_id),
+        reply_markup=_reminders_keyboard(user_id),
+    )
+
+
+async def _refresh_reminders_menu(query, user_id: int):
+    try:
+        await query.edit_message_text(
+            _reminders_text(user_id),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_reminders_keyboard(user_id),
+        )
+    except Exception:
+        # Если сообщение нельзя отредактировать — пришлём новое.
+        await query.message.reply_html(
+            _reminders_text(user_id),
+            reply_markup=_reminders_keyboard(user_id),
+        )
+
+
+async def reminders_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    tz = db.get_user_timezone(query.from_user.id)
+    await query.message.reply_text(
+        f"Введи время напоминания в формате HH:MM по времени «{tz}».\n"
+        "Например: 12:00\n\n"
         f"Или нажми «{BTN_CANCEL}».",
         reply_markup=cancel_keyboard(),
     )
-    return SET_TIME
+    return ADD_REMINDER_TIME
 
 
-async def settime_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def reminders_add_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     try:
         hh, mm = text.split(":")
-        hour = int(hh)
-        minute = int(mm)
-        if not (0 <= hour < 24 and 0 <= minute < 60):
+        h, m = int(hh), int(mm)
+        if not (0 <= h < 24 and 0 <= m < 60):
             raise ValueError
     except ValueError:
         await update.message.reply_text(
-            "⚠️ Неверный формат. Используй HH:MM, например 09:30.",
+            "⚠️ Неверный формат. Введи HH:MM, например 12:00.",
             reply_markup=cancel_keyboard(),
         )
-        return SET_TIME
+        return ADD_REMINDER_TIME
 
     user_id = update.effective_user.id
     db.upsert_user(user_id)
-    db.update_user_time(user_id, hour, minute)
-    schedule_user_reminder(context.application, user_id)
+    created = db.add_reminder(user_id, h, m)
+    schedule_user_reminders(context.application, user_id)
 
-    await update.message.reply_text(
-        f"✅ Готово. Напоминания будут приходить в {hour:02d}:{minute:02d} UTC.",
-        reply_markup=main_menu_keyboard(),
+    if created:
+        msg = f"✅ Напоминание на {h:02d}:{m:02d} добавлено."
+    else:
+        msg = f"ℹ️ Напоминание на {h:02d}:{m:02d} уже было — ничего не изменилось."
+
+    await update.message.reply_text(msg, reply_markup=main_menu_keyboard())
+    await update.message.reply_html(
+        _reminders_text(user_id),
+        reply_markup=_reminders_keyboard(user_id),
     )
     return ConversationHandler.END
 
 
-# --- Голос вне диалога: создаём идею целиком ---
+# --- Голос вне диалога: создаём идею целиком через GPT ---
 
 async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _openai_client:
         await update.message.reply_text(
-            "🎤 Голосовые сообщения сейчас не настроены. "
-            "Попроси администратора добавить переменную окружения OPENAI_API_KEY.",
+            "🎤 Голосовой ввод сейчас не настроен. Нажми «🎤 Голосовой ввод», чтобы узнать, как включить.",
             reply_markup=main_menu_keyboard(),
         )
         return
@@ -419,7 +566,7 @@ async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not parsed:
         await update.message.reply_text(
             "Не получилось распознать идею из голосового. "
-            "Попробуй наговорить ещё раз или нажми «➕ Добавить идею» и введи пошагово.",
+            "Попробуй ещё раз или нажми «➕ Добавить идею» и введи пошагово.",
             reply_markup=main_menu_keyboard(),
         )
         return
@@ -428,7 +575,7 @@ async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     db.upsert_user(user_id)
     idea_id = db.add_idea(user_id, brief, details)
-    schedule_user_reminder(context.application, user_id)
+    schedule_user_reminders(context.application, user_id)
 
     await update.message.reply_html(
         f"✅ Идея сохранена из голосового!\n\n{full_message(brief, details)}",
@@ -440,10 +587,10 @@ async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def _transcribe_or_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+async def _transcribe_or_warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _openai_client:
         await update.message.reply_text(
-            "🎤 Голосовые сейчас не настроены. Напиши текстом, пожалуйста.",
+            "🎤 Голосовой ввод сейчас не настроен. Напиши текстом, пожалуйста.",
             reply_markup=cancel_keyboard(),
         )
         return None
@@ -474,51 +621,94 @@ async def _transcribe_or_warn(update: Update, context: ContextTypes.DEFAULT_TYPE
     return text
 
 
-# --- Inline-кнопки ---
+# --- Inline-кнопки (общий обработчик) ---
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
+    data = query.data or ""
+    user_id = query.from_user.id
+
+    # Меню напоминаний
+    if data.startswith("rem_del:"):
+        rid = int(data.split(":", 1)[1])
+        db.delete_reminder(rid, user_id)
+        schedule_user_reminders(context.application, user_id)
+        await _refresh_reminders_menu(query, user_id)
+        return
+
+    if data == "rem_tz":
+        rows = [
+            [InlineKeyboardButton(label, callback_data=f"rem_tz_set:{tz}")]
+            for tz, label in PRESET_TIMEZONES
+        ]
+        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="rem_back")])
+        await query.edit_message_text(
+            "Выбери часовой пояс:",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+        return
+
+    if data.startswith("rem_tz_set:"):
+        tz = data.split(":", 1)[1]
+        try:
+            ZoneInfo(tz)
+        except ZoneInfoNotFoundError:
+            await query.answer("Неизвестный часовой пояс", show_alert=True)
+            return
+        db.upsert_user(user_id)
+        db.set_user_timezone(user_id, tz)
+        schedule_user_reminders(context.application, user_id)
+        await _refresh_reminders_menu(query, user_id)
+        return
+
+    if data == "rem_back":
+        await _refresh_reminders_menu(query, user_id)
+        return
+
+    if data == "rem_noop:0" or data.startswith("rem_noop:"):
+        return
+
+    # Меню после сохранения
+    if data == "menu:list":
+        ideas = db.get_user_ideas(user_id)
+        if not ideas:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"У тебя пока нет идей. Нажми «{BTN_ADD}».",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"📚 Твои идеи ({len(ideas)}):",
+            reply_markup=main_menu_keyboard(),
+        )
+        for iid, brief, _ in ideas:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=brief_message(brief),
+                parse_mode=ParseMode.HTML,
+                reply_markup=idea_keyboard(iid, expanded=False),
+            )
+        return
+
+    if data == "menu:add":
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"Нажми «{BTN_ADD}» внизу — и начнём вводить новую идею.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # Идеи: expand/collapse/delete
     try:
-        action, payload = query.data.split(":", 1)
+        action, idea_id_str = data.split(":", 1)
+        idea_id = int(idea_id_str)
     except (ValueError, AttributeError):
         return
 
-    user_id = query.from_user.id
-
-    if action == "menu":
-        if payload == "list":
-            ideas = db.get_user_ideas(user_id)
-            if not ideas:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"У тебя пока нет идей. Нажми «{BTN_ADD}».",
-                    reply_markup=main_menu_keyboard(),
-                )
-                return
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"📚 Твои идеи ({len(ideas)}):",
-                reply_markup=main_menu_keyboard(),
-            )
-            for iid, brief, _ in ideas:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=brief_message(brief),
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=idea_keyboard(iid, expanded=False),
-                )
-            return
-        if payload == "add":
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"Нажми кнопку «{BTN_ADD}» внизу — и начнём вводить новую идею.",
-                reply_markup=main_menu_keyboard(),
-            )
-            return
-
-    idea_id = int(payload)
     idea = db.get_idea(idea_id, user_id)
     if not idea:
         await query.edit_message_text("⚠️ Идея не найдена или была удалена.")
@@ -546,49 +736,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# --- Ежедневное напоминание ---
-
-async def _send_reminder(bot, user_id: int, ideas):
-    await bot.send_message(
-        chat_id=user_id,
-        text=f"🌅 Напоминаю про твои идеи ({len(ideas)}):",
-    )
-    for idea_id, brief, _ in ideas:
-        await bot.send_message(
-            chat_id=user_id,
-            text=brief_message(brief),
-            parse_mode=ParseMode.HTML,
-            reply_markup=idea_keyboard(idea_id, expanded=False),
-        )
-
-
-async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
-    user_id = context.job.data["user_id"]
-    ideas = db.get_user_ideas(user_id)
-    if not ideas:
-        return
-    try:
-        await _send_reminder(context.bot, user_id, ideas)
-    except Exception:
-        logger.exception("Не удалось отправить напоминание пользователю %s", user_id)
-
-
-def schedule_user_reminder(application: Application, user_id: int):
-    job_queue = application.job_queue
-    job_name = f"{REMINDER_JOB_PREFIX}{user_id}"
-
-    for job in job_queue.get_jobs_by_name(job_name):
-        job.schedule_removal()
-
-    hour, minute = db.get_user_time(user_id)
-    job_queue.run_daily(
-        send_daily_reminder,
-        time=time(hour=hour, minute=minute, tzinfo=timezone.utc),
-        data={"user_id": user_id},
-        name=job_name,
-    )
-
-
 # --- Прочее ---
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -598,7 +745,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(application: Application):
     db.init_db()
     for user_id in db.get_all_user_ids():
-        schedule_user_reminder(application, user_id)
+        schedule_user_reminders(application, user_id)
     logger.info("Bot started; reminders scheduled.")
 
 
@@ -615,14 +762,10 @@ def main():
         .build()
     )
 
-    # Точки входа в диалог добавления идеи: команда, кнопка меню
-    add_entry_filters = (
-        filters.Regex(f"^{BTN_ADD}$")
-    )
     add_conv = ConversationHandler(
         entry_points=[
             CommandHandler("add", add_start),
-            MessageHandler(add_entry_filters, add_start),
+            MessageHandler(filters.Regex(f"^{BTN_ADD}$"), add_start),
         ],
         states={
             BRIEF: [
@@ -647,16 +790,13 @@ def main():
         allow_reentry=True,
     )
 
-    settime_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("settime", settime_start),
-            MessageHandler(filters.Regex(f"^{BTN_TIME}$"), settime_start),
-        ],
+    add_reminder_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(reminders_add_start, pattern="^rem_add$")],
         states={
-            SET_TIME: [
+            ADD_REMINDER_TIME: [
                 MessageHandler(
                     filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{BTN_CANCEL}$"),
-                    settime_apply,
+                    reminders_add_apply,
                 ),
             ],
         },
@@ -671,16 +811,21 @@ def main():
     application.add_handler(CommandHandler("help", show_help))
     application.add_handler(CommandHandler("list", list_ideas))
     application.add_handler(CommandHandler("test", test_reminder))
+    application.add_handler(CommandHandler("reminders", reminders_show))
+    application.add_handler(CommandHandler("settime", reminders_show))
+    application.add_handler(CommandHandler("voice", voice_instructions))
 
     application.add_handler(add_conv)
-    application.add_handler(settime_conv)
+    application.add_handler(add_reminder_conv)
 
     # Кнопки главного меню (вне диалогов)
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_LIST}$"), list_ideas))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_TEST}$"), test_reminder))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_VOICE}$"), voice_instructions))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_HELP}$"), show_help))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_REMINDERS}$"), reminders_show))
 
-    # Голосовые сообщения вне диалогов — создаём идею целиком через GPT
+    # Голосовые вне диалогов — создаём идею целиком через GPT
     application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, voice_top_level))
 
     application.add_handler(CallbackQueryHandler(handle_callback))
