@@ -66,11 +66,25 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 text TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                body TEXT NOT NULL DEFAULT '',
+                due_time TEXT NOT NULL DEFAULT '',
+                timezone TEXT NOT NULL DEFAULT '',
                 done INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             )
             """
         )
+
+        task_cols = _table_columns(c, "tasks")
+        if "title" not in task_cols:
+            c.execute("ALTER TABLE tasks ADD COLUMN title TEXT NOT NULL DEFAULT ''")
+        if "body" not in task_cols:
+            c.execute("ALTER TABLE tasks ADD COLUMN body TEXT NOT NULL DEFAULT ''")
+        if "due_time" not in task_cols:
+            c.execute("ALTER TABLE tasks ADD COLUMN due_time TEXT NOT NULL DEFAULT ''")
+        if "timezone" not in task_cols:
+            c.execute("ALTER TABLE tasks ADD COLUMN timezone TEXT NOT NULL DEFAULT ''")
 
         # Миграция: если в старой схеме были reminder_hour/reminder_minute —
         # перенесём их в таблицу reminders, чтобы существующие напоминания не пропали.
@@ -190,11 +204,24 @@ def delete_reminder(reminder_id: int, user_id: int):
         )
 
 
-def add_task(user_id: int, text: str) -> int:
+def add_task(
+    user_id: int,
+    text: str,
+    title: str | None = None,
+    body: str | None = None,
+    due_time: str = "",
+    timezone: str = "",
+) -> int:
+    title = (title or text or "").strip()
+    body = (body or text or "").strip()
+    text = (text or title or body).strip()
     with _conn() as c:
         cur = c.execute(
-            "INSERT INTO tasks (user_id, text, done, created_at) VALUES (?, ?, 0, ?)",
-            (user_id, text, datetime.utcnow().isoformat()),
+            """
+            INSERT INTO tasks (user_id, text, title, body, due_time, timezone, done, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+            """,
+            (user_id, text, title, body, due_time or "", timezone or "", datetime.utcnow().isoformat()),
         )
         return cur.lastrowid
 
@@ -202,7 +229,18 @@ def add_task(user_id: int, text: str) -> int:
 def get_user_tasks(user_id: int):
     with _conn() as c:
         return c.execute(
-            "SELECT id, text, done FROM tasks WHERE user_id = ? ORDER BY done, id",
+            """
+            SELECT
+                id,
+                COALESCE(NULLIF(title, ''), text) AS title,
+                done,
+                COALESCE(NULLIF(body, ''), text) AS body,
+                due_time,
+                timezone
+            FROM tasks
+            WHERE user_id = ?
+            ORDER BY done, id
+            """,
             (user_id,),
         ).fetchall()
 
@@ -210,7 +248,17 @@ def get_user_tasks(user_id: int):
 def get_task(task_id: int, user_id: int):
     with _conn() as c:
         return c.execute(
-            "SELECT id, text, done FROM tasks WHERE id = ? AND user_id = ?",
+            """
+            SELECT
+                id,
+                COALESCE(NULLIF(title, ''), text) AS title,
+                done,
+                COALESCE(NULLIF(body, ''), text) AS body,
+                due_time,
+                timezone
+            FROM tasks
+            WHERE id = ? AND user_id = ?
+            """,
             (task_id, user_id),
         ).fetchone()
 

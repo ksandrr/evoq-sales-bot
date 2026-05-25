@@ -2,6 +2,7 @@ import os
 import json
 import html
 import logging
+import re
 import subprocess
 import tempfile
 import urllib.request
@@ -140,7 +141,6 @@ BTN_ADD_TASK = "✅ Задача"
 BTN_LIST_TASKS = "📋 Мои задачи"
 BTN_REMINDERS = "⏰ Напоминания"
 BTN_TEST = "🔔 Тест"
-BTN_VOICE = "🎤 Голос"
 BTN_HELP = "ℹ️ Помощь"
 BTN_CANCEL = "✖️ Отмена"
 
@@ -169,7 +169,7 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
             [BTN_ADD, BTN_ADD_TASK],
             [BTN_LIST, BTN_LIST_TASKS],
             [BTN_REMINDERS, BTN_TEST],
-            [BTN_VOICE, BTN_HELP],
+            [BTN_HELP],
         ],
         resize_keyboard=True,
         input_field_placeholder="Тапни кнопку, напиши или наговори...",
@@ -334,6 +334,160 @@ async def parse_idea_with_gpt(text: str):
         return None
 
 
+TIMEZONE_ALIASES = {
+    "омск": "Asia/Omsk",
+    "омску": "Asia/Omsk",
+    "омское": "Asia/Omsk",
+    "москва": "Europe/Moscow",
+    "москве": "Europe/Moscow",
+    "мск": "Europe/Moscow",
+    "самара": "Europe/Samara",
+    "самаре": "Europe/Samara",
+    "екатеринбург": "Asia/Yekaterinburg",
+    "екатеринбургу": "Asia/Yekaterinburg",
+    "новосибирск": "Asia/Novosibirsk",
+    "новосибирску": "Asia/Novosibirsk",
+    "иркутск": "Asia/Irkutsk",
+    "иркутску": "Asia/Irkutsk",
+    "владивосток": "Asia/Vladivostok",
+    "владивостоку": "Asia/Vladivostok",
+}
+
+CAPTURE_INTENT_WORDS = (
+    "задача", "задачу", "напомни", "напоминание", "поставь задачу",
+    "сделай задачу", "поставь напоминание",
+)
+DATE_TIME_WORDS = (
+    "сегодня", "завтра", "послезавтра", "вечером", "утром", "днем", "днём",
+    "ночью", "по омску", "по москве",
+)
+ACTION_WORDS = (
+    "купить", "сделать", "позвонить", "написать", "проверить", "отправить",
+    "созвониться", "встретиться", "подготовить", "разобрать", "найти",
+)
+
+
+def _compact_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def extract_capture_timezone(text: str, default_tz: str = "") -> str:
+    low = (text or "").lower()
+    for alias, tz in TIMEZONE_ALIASES.items():
+        if re.search(rf"\b{re.escape(alias)}\b", low):
+            return tz
+    return default_tz
+
+
+def extract_capture_due_time(text: str) -> str:
+    low = (text or "").lower().replace("ё", "е")
+
+    m = re.search(r"\b(?:к|на|в)\s+([01]?\d|2[0-3])[:.](\d{2})\b", low)
+    if m:
+        return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
+
+    m = re.search(
+        r"\b(?:к|на|в)?\s*([01]?\d|2[0-3])\s*(?:час(?:ов|а)?|ч)?\s*(утра|дня|вечера|ночи)\b",
+        low,
+    )
+    if m:
+        hour = int(m.group(1))
+        part = m.group(2)
+        if part in {"вечера", "дня"} and hour < 12:
+            hour += 12
+        if part == "ночи" and hour == 12:
+            hour = 0
+        return f"{hour:02d}:00"
+
+    m = re.search(r"\b(?:к|на|в)\s+([01]?\d|2[0-3])\s*(?:час(?:ов|а)?|ч)?\b", low)
+    if m:
+        hour = int(m.group(1))
+        if "вечер" in low and hour < 12:
+            hour += 12
+        return f"{hour:02d}:00"
+
+    return ""
+
+
+def classify_capture_text(text: str) -> dict:
+    clean = _compact_spaces(text)
+    low = clean.lower().replace("ё", "е")
+    due_time = extract_capture_due_time(clean)
+    timezone = extract_capture_timezone(clean)
+    has_idea_prefix = bool(re.match(r"^\s*идея\s*[:\-—]", low))
+
+    has_intent = any(word in low for word in CAPTURE_INTENT_WORDS)
+    has_date_time = due_time or any(word in low for word in DATE_TIME_WORDS) or bool(re.search(r"\b[кнв]\s+\d", low))
+    has_action = any(re.search(rf"\b{word}\b", low) for word in ACTION_WORDS)
+
+    if has_idea_prefix and not has_date_time:
+        capture_type = "idea"
+    elif has_intent or has_date_time:
+        capture_type = "reminder" if "напом" in low else "task"
+    elif has_action:
+        capture_type = "task"
+    else:
+        capture_type = "idea"
+
+    return {
+        "type": capture_type,
+        "title": generate_capture_title(clean, capture_type),
+        "body": clean,
+        "due_time": due_time,
+        "timezone": timezone,
+    }
+
+
+def generate_capture_title(text: str, capture_type: str) -> str:
+    title = _compact_spaces(text).strip(" .,!?:;")
+    title = re.sub(
+        r"^(идея|задача|напоминание)\s*[:\-—]\s*",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(
+        r"^(сделай|создай|поставь|добавь)\s+(мне\s+)?(задачу|напоминание)\s+",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(r"^напомни(ть)?\s+(мне\s+)?", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"^(нужно|надо|что нужно)\s+", "", title, flags=re.IGNORECASE)
+    title = re.sub(
+        r"\b(на|к|в)\s+\d{1,2}([:.]\d{2})?\s*(час(?:ов|а)?|ч)?\s*(утра|дня|вечера|ночи)?\b",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(
+        r"\b(сегодня|завтра|послезавтра|вечером|утром|днем|днём|ночью|по\s+\w+)\b",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(r"\bчто\s+нужно\s+", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\bмолока\b", "молоко", title, flags=re.IGNORECASE)
+    title = _compact_spaces(title).strip(" .,!?:;")
+
+    if capture_type == "idea":
+        title = re.sub(r"^сделать\s+", "", title, flags=re.IGNORECASE)
+        title = re.sub(r"\bс\s+360-турами\b", "", title, flags=re.IGNORECASE)
+        m = re.search(r"\bоффер\s+для\s+застройщиков\b", title, flags=re.IGNORECASE)
+        if m:
+            title = m.group(0)
+
+    title = re.sub(r"\bпосле\s+запуска\b", "", title, flags=re.IGNORECASE)
+    title = _compact_spaces(title).strip(" .,!?:;")
+
+    words = title.split()
+    if len(words) > 6:
+        title = " ".join(words[:6])
+    if not title:
+        title = _compact_spaces(text).split(".")[0][:80].strip() or "Без названия"
+    return title[:1].upper() + title[1:]
+
+
 async def _async_call(fn, *args, **kwargs):
     import asyncio
 
@@ -369,7 +523,7 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif _vosk_available():
         voice_status = "включён (Vosk, оффлайн) — можно наговорить идею или задачу голосом"
     else:
-        voice_status = "выключен — нажми «🎤 Голос», чтобы узнать, как включить"
+        voice_status = "выключен — команда /voice покажет, как включить"
     text = (
         "<b>Как это работает</b>\n\n"
         "<b>Идеи</b> — то, что хочется обдумать и не забыть.\n"
@@ -380,7 +534,7 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• <b>{BTN_LIST_TASKS}</b> — список задач с галочками «сделано».\n\n"
         f"• <b>{BTN_REMINDERS}</b> — ежедневные напоминания (по идеям) и часовой пояс.\n"
         f"• <b>{BTN_TEST}</b> — отправить тестовое напоминание прямо сейчас.\n"
-        f"• <b>{BTN_VOICE}</b> — инструкция по голосовому вводу (сейчас {voice_status})."
+        f"• <b>/voice</b> — инструкция по голосовому вводу (сейчас {voice_status})."
     )
     await update.message.reply_html(text, reply_markup=main_menu_keyboard())
 
@@ -702,10 +856,25 @@ async def reminders_add_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # --- Задачи ---
 
-def task_message(text: str, done: bool) -> str:
+def _task_row_parts(task) -> tuple[int, str, bool, str, str, str]:
+    if len(task) >= 6:
+        task_id, title, done, body, due_time, timezone = task[:6]
+    else:
+        task_id, title, done = task[:3]
+        body, due_time, timezone = title, "", ""
+    return task_id, title, bool(done), body, due_time, timezone
+
+
+def task_message(title: str, done: bool, body: str = "", due_time: str = "", timezone: str = "") -> str:
+    title = title or body or "Без названия"
+    meta = ""
+    if due_time:
+        meta = f"\n⏰ {html.escape(due_time)}"
+        if timezone:
+            meta += f" {html.escape(timezone)}"
     if done:
-        return f"✔️ <s>{html.escape(text)}</s>"
-    return f"⬜ {html.escape(text)}"
+        return f"✔️ <s>{html.escape(title)}</s>{meta}"
+    return f"⬜ {html.escape(title)}{meta}"
 
 
 def task_keyboard(task_id: int, done: bool) -> InlineKeyboardMarkup:
@@ -730,16 +899,17 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    open_count = sum(1 for _, _, d in tasks if not d)
+    open_count = sum(1 for task in tasks if not _task_row_parts(task)[2])
     done_count = len(tasks) - open_count
     await update.message.reply_text(
         f"📋 Задачи: {open_count} открыто, {done_count} сделано.",
         reply_markup=main_menu_keyboard(),
     )
-    for tid, text, done in tasks:
+    for task in tasks:
+        tid, title, done, body, due_time, timezone = _task_row_parts(task)
         await update.message.reply_html(
-            task_message(text, bool(done)),
-            reply_markup=task_keyboard(tid, bool(done)),
+            task_message(title, done, body, due_time, timezone),
+            reply_markup=task_keyboard(tid, done),
         )
 
 
@@ -764,12 +934,23 @@ async def _handle_task_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if len(text) > 500:
         text = text[:500]
 
+    capture = classify_capture_text(text)
+    title = capture["title"]
+
     user_id = update.effective_user.id
     db.upsert_user(user_id)
-    task_id = db.add_task(user_id, text)
+    timezone = capture.get("timezone") or db.get_user_timezone(user_id)
+    task_id = db.add_task(
+        user_id,
+        title,
+        title=title,
+        body=text,
+        due_time=capture.get("due_time", ""),
+        timezone=timezone,
+    )
 
     await update.message.reply_html(
-        f"✅ Задача добавлена!\n\n{task_message(text, False)}",
+        f"✅ Задача создана\n\n{task_message(title, False, text, capture.get('due_time', ''), timezone)}",
         reply_markup=main_menu_keyboard(),
     )
     await update.message.reply_text(
@@ -797,12 +978,12 @@ async def task_add_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await _handle_task_text(update, context, text)
 
 
-# --- Голос вне диалога: создаём идею целиком через GPT ---
+# --- Голос вне диалога: классифицируем в идею / задачу / напоминание ---
 
 async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not voice_available():
         await update.message.reply_text(
-            f"🎤 Голосовой ввод сейчас не настроен. Нажми «{BTN_VOICE}», чтобы узнать, как включить.",
+            "🎤 Голосовой ввод сейчас не настроен. Команда /voice покажет, как включить.",
             reply_markup=main_menu_keyboard(),
         )
         return
@@ -812,8 +993,44 @@ async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    brief = None
-    details = None
+    user_id = update.effective_user.id
+    db.upsert_user(user_id)
+
+    capture = classify_capture_text(text)
+    capture_type = capture["type"]
+
+    if capture_type in {"task", "reminder"}:
+        title = capture["title"]
+        due_time = capture.get("due_time", "")
+        timezone = capture.get("timezone") or db.get_user_timezone(user_id)
+        task_id = db.add_task(
+            user_id,
+            title,
+            title=title,
+            body=capture["body"],
+            due_time=due_time,
+            timezone=timezone,
+        )
+        response = "🔔 Напоминание создано" if capture_type == "reminder" else "✅ Задача создана"
+        await update.message.reply_html(
+            f"{response}\n\n{task_message(title, False, capture['body'], due_time, timezone)}",
+            reply_markup=main_menu_keyboard(),
+        )
+        await update.message.reply_text(
+            "Что дальше?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Сделано", callback_data=f"task_done:{task_id}")],
+                [
+                    InlineKeyboardButton("➕ Ещё задача", callback_data="menu:add_task"),
+                    InlineKeyboardButton("📋 Все задачи", callback_data="menu:list_tasks"),
+                ],
+                [InlineKeyboardButton("🗑 Удалить эту", callback_data=f"task_del:{task_id}")],
+            ]),
+        )
+        return
+
+    brief = capture["title"]
+    details = capture["body"]
     if _openai_client:
         parsed = await parse_idea_with_gpt(text)
         if parsed:
@@ -826,13 +1043,11 @@ async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
         brief = first[:120]
         details = text.strip()
 
-    user_id = update.effective_user.id
-    db.upsert_user(user_id)
     idea_id = db.add_idea(user_id, brief, details)
     schedule_user_reminders(context.application, user_id)
 
     await update.message.reply_html(
-        f"✅ Идея сохранена из голосового!\n\n{full_message(brief, details)}",
+        f"✅ Идея сохранена\n\n{full_message(brief, details)}",
         reply_markup=main_menu_keyboard(),
     )
     await update.message.reply_text(
@@ -965,19 +1180,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=main_menu_keyboard(),
             )
             return
-        open_count = sum(1 for _, _, d in tasks if not d)
+        open_count = sum(1 for task in tasks if not _task_row_parts(task)[2])
         done_count = len(tasks) - open_count
         await context.bot.send_message(
             chat_id=user_id,
             text=f"📋 Задачи: {open_count} открыто, {done_count} сделано.",
             reply_markup=main_menu_keyboard(),
         )
-        for tid, text, done in tasks:
+        for task in tasks:
+            tid, title, done, body, due_time, timezone = _task_row_parts(task)
             await context.bot.send_message(
                 chat_id=user_id,
-                text=task_message(text, bool(done)),
+                text=task_message(title, done, body, due_time, timezone),
                 parse_mode=ParseMode.HTML,
-                reply_markup=task_keyboard(tid, bool(done)),
+                reply_markup=task_keyboard(tid, done),
             )
         return
 
@@ -1000,25 +1216,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not task:
             await query.edit_message_text("⚠️ Задача не найдена или была удалена.")
             return
-        _, text, _done = task
+        _, title, _done, body, due_time, timezone = _task_row_parts(task)
         if action == "task_done":
             db.set_task_done(tid, user_id, True)
             await query.edit_message_text(
-                task_message(text, True),
+                task_message(title, True, body, due_time, timezone),
                 parse_mode=ParseMode.HTML,
                 reply_markup=task_keyboard(tid, True),
             )
         elif action == "task_undone":
             db.set_task_done(tid, user_id, False)
             await query.edit_message_text(
-                task_message(text, False),
+                task_message(title, False, body, due_time, timezone),
                 parse_mode=ParseMode.HTML,
                 reply_markup=task_keyboard(tid, False),
             )
         elif action == "task_del":
             db.delete_task(tid, user_id)
             await query.edit_message_text(
-                f"🗑 Задача удалена:\n\n{task_message(text, False)}",
+                f"🗑 Задача удалена:\n\n{task_message(title, False, body, due_time, timezone)}",
                 parse_mode=ParseMode.HTML,
             )
         return
@@ -1166,11 +1382,10 @@ def main():
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_LIST}$"), list_ideas))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_LIST_TASKS}$"), list_tasks))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_TEST}$"), test_reminder))
-    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_VOICE}$"), voice_instructions))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_HELP}$"), show_help))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_REMINDERS}$"), reminders_show))
 
-    # Голосовые вне диалогов — создаём идею целиком через GPT
+    # Голосовые вне диалогов — классифицируем в идею / задачу / напоминание.
     application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, voice_top_level))
 
     application.add_handler(CallbackQueryHandler(handle_callback))
