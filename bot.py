@@ -2,7 +2,10 @@ import os
 import json
 import html
 import logging
+import subprocess
 import tempfile
+import urllib.request
+import zipfile
 from datetime import time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -43,24 +46,101 @@ if OPENAI_API_KEY:
         from openai import OpenAI
 
         _openai_client = OpenAI(api_key=OPENAI_API_KEY)
-        logger.info("OpenAI клиент инициализирован — голосовые сообщения будут распознаваться.")
+        logger.info("OpenAI клиент инициализирован — голосовые сообщения будут распознаваться через Whisper.")
     except ImportError:
         logger.warning("Установлен OPENAI_API_KEY, но пакет openai не установлен.")
 else:
-    logger.info("OPENAI_API_KEY не задан — голосовые сообщения будут отклоняться.")
+    logger.info("OPENAI_API_KEY не задан — будет использован Vosk (если установлен).")
+
+# Vosk — оффлайн-распознавание (fallback, если OpenAI не настроен).
+VOSK_MODEL_URL = os.getenv(
+    "VOSK_MODEL_URL",
+    "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip",
+)
+_vosk_model = None
+_vosk_checked = False
+
+
+def _vosk_model_dir() -> str:
+    explicit = os.getenv("VOSK_MODEL_PATH")
+    if explicit:
+        return explicit
+    if os.path.isdir("/data"):
+        return "/data/vosk-model"
+    return "/tmp/vosk-model"
+
+
+def _download_vosk_model(target_dir: str):
+    logger.info("Скачиваем Vosk модель: %s", VOSK_MODEL_URL)
+    work_dir = tempfile.mkdtemp(prefix="vosk-dl-")
+    zip_path = os.path.join(work_dir, "model.zip")
+    urllib.request.urlretrieve(VOSK_MODEL_URL, zip_path)
+    with zipfile.ZipFile(zip_path) as z:
+        z.extractall(work_dir)
+    for name in os.listdir(work_dir):
+        src = os.path.join(work_dir, name)
+        if os.path.isdir(src) and name.startswith("vosk-model"):
+            os.makedirs(os.path.dirname(target_dir) or ".", exist_ok=True)
+            os.rename(src, target_dir)
+            logger.info("Vosk модель распакована в %s", target_dir)
+            return
+    raise RuntimeError("Не нашёл папку с моделью внутри архива")
+
+
+def _get_vosk_model():
+    global _vosk_model, _vosk_checked
+    if _vosk_model is not None:
+        return _vosk_model
+    if _vosk_checked:
+        return None
+    _vosk_checked = True
+
+    try:
+        from vosk import Model, SetLogLevel
+    except ImportError:
+        logger.info("Пакет vosk не установлен — Vosk fallback недоступен.")
+        return None
+
+    SetLogLevel(-1)
+    model_dir = _vosk_model_dir()
+    try:
+        if not os.path.isdir(model_dir):
+            _download_vosk_model(model_dir)
+        _vosk_model = Model(model_dir)
+        logger.info("Vosk модель загружена из %s", model_dir)
+    except Exception:
+        logger.exception("Не удалось инициализировать Vosk")
+        _vosk_model = None
+    return _vosk_model
+
+
+def _vosk_available() -> bool:
+    try:
+        import vosk  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def voice_available() -> bool:
+    return bool(_openai_client) or _vosk_available()
+
 
 # Состояния диалогов
 BRIEF, DETAILS = range(2)
 ADD_REMINDER_TIME = 200
+TASK_TEXT = 300
 
 REMINDER_JOB_PREFIX = "reminder:"
 
 # Подписи кнопок главного меню
-BTN_ADD = "➕ Добавить идею"
-BTN_LIST = "📚 Мои идеи"
+BTN_ADD = "➕ Идея"
+BTN_LIST = "💡 Мои идеи"
+BTN_ADD_TASK = "✅ Задача"
+BTN_LIST_TASKS = "📋 Мои задачи"
 BTN_REMINDERS = "⏰ Напоминания"
-BTN_TEST = "🔔 Тест напоминания"
-BTN_VOICE = "🎤 Голосовой ввод"
+BTN_TEST = "🔔 Тест"
+BTN_VOICE = "🎤 Голос"
 BTN_HELP = "ℹ️ Помощь"
 BTN_CANCEL = "✖️ Отмена"
 
@@ -86,13 +166,13 @@ PRESET_TIMEZONES = [
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [BTN_ADD],
-            [BTN_LIST, BTN_REMINDERS],
-            [BTN_TEST, BTN_VOICE],
-            [BTN_HELP],
+            [BTN_ADD, BTN_ADD_TASK],
+            [BTN_LIST, BTN_LIST_TASKS],
+            [BTN_REMINDERS, BTN_TEST],
+            [BTN_VOICE, BTN_HELP],
         ],
         resize_keyboard=True,
-        input_field_placeholder="Тапни кнопку, напиши или наговори идею...",
+        input_field_placeholder="Тапни кнопку, напиши или наговори...",
     )
 
 
@@ -141,24 +221,80 @@ def full_message(brief: str, details: str) -> str:
 # --- Голос: распознавание и парсинг ---
 
 async def transcribe_voice(voice_file):
-    if not _openai_client:
+    if not voice_available():
         return None
 
     with tempfile.NamedTemporaryFile(suffix=".oga", delete=False) as tmp:
         tmp_path = tmp.name
     try:
         await voice_file.download_to_drive(tmp_path)
-        with open(tmp_path, "rb") as f:
-            transcript = await _async_call(
-                _openai_client.audio.transcriptions.create,
-                model="whisper-1",
-                file=f,
-                language="ru",
-            )
-        return (transcript.text or "").strip() or None
+
+        if _openai_client:
+            with open(tmp_path, "rb") as f:
+                transcript = await _async_call(
+                    _openai_client.audio.transcriptions.create,
+                    model="whisper-1",
+                    file=f,
+                    language="ru",
+                )
+            return (transcript.text or "").strip() or None
+
+        text = await _async_call(_vosk_transcribe_file, tmp_path)
+        return (text or "").strip() or None
     finally:
         try:
             os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _vosk_transcribe_file(ogg_path: str):
+    model = _get_vosk_model()
+    if model is None:
+        return None
+
+    import wave
+    from vosk import KaldiRecognizer
+
+    wav_path = ogg_path + ".wav"
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", ogg_path,
+                "-ar", "16000", "-ac", "1", "-f", "wav", wav_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        if result.returncode != 0:
+            logger.warning("ffmpeg вернул код %s: %s", result.returncode, result.stderr.decode(errors="ignore")[:200])
+            return None
+
+        wf = wave.open(wav_path, "rb")
+        rec = KaldiRecognizer(model, wf.getframerate())
+        chunks = []
+        while True:
+            data = wf.readframes(4000)
+            if not data:
+                break
+            if rec.AcceptWaveform(data):
+                piece = json.loads(rec.Result()).get("text", "")
+                if piece:
+                    chunks.append(piece)
+        final = json.loads(rec.FinalResult()).get("text", "")
+        if final:
+            chunks.append(final)
+        wf.close()
+        return " ".join(chunks).strip() or None
+    except FileNotFoundError:
+        logger.error("ffmpeg не найден — Vosk не может конвертировать OGG. Установи ffmpeg на хост.")
+        return None
+    except Exception:
+        logger.exception("Vosk транскрипция упала")
+        return None
+    finally:
+        try:
+            os.unlink(wav_path)
         except OSError:
             pass
 
@@ -216,30 +352,35 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reminders = db.get_user_reminders(user_id)
     times_txt = ", ".join(f"{h:02d}:{m:02d}" for _, h, m in reminders) or "—"
     text = (
-        "👋 Привет! Я бот для записи твоих идей.\n\n"
-        "Каждый день я буду напоминать о них в удобное тебе время.\n\n"
+        "👋 Привет! Я бот-задачник и идейник в одном.\n\n"
+        f"💡 <b>Идеи</b> — то, что хочется обдумать. Каждый день в удобное время "
+        "я буду напоминать о них списком.\n"
+        f"✅ <b>Задачи</b> — то, что нужно сделать. Хранятся с галочками «сделано/не сделано».\n\n"
         f"🌍 Часовой пояс: <b>{html.escape(tz)}</b>\n"
         f"⏰ Напоминания: <b>{times_txt}</b>\n\n"
-        "Используй кнопки внизу. Идею можно ввести текстом или голосом."
+        "Используй кнопки внизу. Идею или задачу можно ввести текстом или голосом."
     )
     await update.message.reply_html(text, reply_markup=main_menu_keyboard())
 
 
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    voice_status = (
-        "включён — можно наговорить идею голосом"
-        if _openai_client
-        else "выключен — нажми «🎤 Голосовой ввод», чтобы узнать, как включить"
-    )
+    if _openai_client:
+        voice_status = "включён (OpenAI Whisper) — можно наговорить идею или задачу голосом"
+    elif _vosk_available():
+        voice_status = "включён (Vosk, оффлайн) — можно наговорить идею или задачу голосом"
+    else:
+        voice_status = "выключен — нажми «🎤 Голос», чтобы узнать, как включить"
     text = (
         "<b>Как это работает</b>\n\n"
-        f"• <b>{BTN_ADD}</b> — пошагово введи краткое название и подробное описание.\n"
-        f"• <b>{BTN_LIST}</b> — посмотреть все идеи. У каждой кнопка «📖 Подробнее» и «🗑 Удалить».\n"
-        f"• <b>{BTN_REMINDERS}</b> — управление списком ежедневных напоминаний и часовым поясом.\n"
+        "<b>Идеи</b> — то, что хочется обдумать и не забыть.\n"
+        f"• <b>{BTN_ADD}</b> — ввести краткое название и подробное описание.\n"
+        f"• <b>{BTN_LIST}</b> — посмотреть все идеи. У каждой «📖 Подробнее» и «🗑 Удалить».\n\n"
+        "<b>Задачи</b> — то, что нужно сделать.\n"
+        f"• <b>{BTN_ADD_TASK}</b> — наговорить или ввести задачу одной строкой.\n"
+        f"• <b>{BTN_LIST_TASKS}</b> — список задач с галочками «сделано».\n\n"
+        f"• <b>{BTN_REMINDERS}</b> — ежедневные напоминания (по идеям) и часовой пояс.\n"
         f"• <b>{BTN_TEST}</b> — отправить тестовое напоминание прямо сейчас.\n"
-        f"• <b>{BTN_VOICE}</b> — инструкция по голосовому вводу (сейчас {voice_status}).\n\n"
-        "Дневное напоминание — короткое сообщение со списком названий твоих идей. "
-        "Чтобы посмотреть детали — открой «📚 Мои идеи»."
+        f"• <b>{BTN_VOICE}</b> — инструкция по голосовому вводу (сейчас {voice_status})."
     )
     await update.message.reply_html(text, reply_markup=main_menu_keyboard())
 
@@ -247,24 +388,36 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def voice_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _openai_client:
         text = (
-            "🎤 <b>Голосовой ввод включён.</b>\n\n"
-            "Просто запиши голосовое прямо в чате — я расшифрую речь и сохраню как идею. "
-            "Если запишешь голосовое во время добавления идеи, я подставлю текст в текущий шаг."
+            "🎤 <b>Голосовой ввод включён (OpenAI Whisper).</b>\n\n"
+            "Просто запиши голосовое прямо в чате:\n"
+            "• Вне диалогов — создастся идея (GPT сам разобьёт на название и описание).\n"
+            f"• В режиме «{BTN_ADD_TASK}» — текст голоса сохранится как задача.\n"
+            f"• На шагах «{BTN_ADD}» (название/описание) — текст голоса подставится в шаг."
+        )
+    elif _vosk_available():
+        text = (
+            "🎤 <b>Голосовой ввод включён (Vosk, оффлайн, бесплатно).</b>\n\n"
+            "Vosk работает прямо на сервере, без OpenAI. Качество ниже Whisper, "
+            "но для коротких фраз вполне приемлемо.\n\n"
+            f"• «{BTN_ADD_TASK}» — наговори задачу, она сохранится как есть.\n"
+            f"• На шагах «{BTN_ADD}» — голос подставится в текущий шаг.\n"
+            "• Вне диалогов голос создаст идею (название = первая фраза, описание = весь текст).\n\n"
+            "Если хочешь лучшее качество — добавь <code>OPENAI_API_KEY</code> в Railway Variables, "
+            "и бот автоматически переключится на Whisper."
         )
     else:
         text = (
-            "🎤 <b>Как включить голосовой ввод</b>\n\n"
-            "Голос работает через OpenAI Whisper (распознавание) и GPT-4o-mini "
-            "(разделение на название/описание). Это платно, но дёшево "
-            "(~$0.006 за минуту голоса, на $5 хватит надолго).\n\n"
-            "<b>Шаги:</b>\n"
-            "1. Зайди на https://platform.openai.com\n"
-            "2. Settings → Billing → пополни баланс ($5 минимум).\n"
-            "3. API keys → Create new secret key → скопируй ключ (sk-proj-…).\n"
-            "4. В Railway → твой сервис → Variables → добавь:\n"
-            "   <code>OPENAI_API_KEY</code> = твой ключ.\n"
-            "5. Railway сам перезапустит бота — голос заработает.\n\n"
-            "Бесплатные альтернативы (без OpenAI) — см. справку в репо или попроси меня их встроить."
+            "🎤 <b>Голосовой ввод выключен.</b>\n\n"
+            "Доступно два варианта:\n\n"
+            "<b>1. OpenAI Whisper (рекомендуется, платно но дёшево):</b>\n"
+            "• https://platform.openai.com → Billing → пополни $5.\n"
+            "• API keys → Create new secret key.\n"
+            "• Railway → Variables → добавь <code>OPENAI_API_KEY</code>.\n\n"
+            "<b>2. Vosk (бесплатно, оффлайн, качество ниже):</b>\n"
+            "• Установи пакет vosk (он уже в requirements.txt).\n"
+            "• На сервере нужен ffmpeg (nixpacks.toml в репо уже его ставит).\n"
+            "• Vosk сам скачает русскую модель (~45 МБ) при первом голосовом.\n\n"
+            "Railway сам перезапустит бота — голос заработает."
         )
     await update.message.reply_html(text, reply_markup=main_menu_keyboard(), disable_web_page_preview=True)
 
@@ -362,7 +515,7 @@ def schedule_user_reminders(application: Application, user_id: int):
 # --- Диалог: добавить идею ---
 
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    voice_hint = " или наговори голосом 🎤" if _openai_client else ""
+    voice_hint = " или наговори голосом 🎤" if voice_available() else ""
     await update.message.reply_text(
         f"📝 Введи краткое описание идеи (одна строка){voice_hint}.\n\n"
         f"Или нажми «{BTN_CANCEL}».",
@@ -387,7 +540,7 @@ async def _handle_brief_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return BRIEF
 
     context.user_data["brief"] = brief
-    voice_hint = " или наговори голосом 🎤" if _openai_client else ""
+    voice_hint = " или наговори голосом 🎤" if voice_available() else ""
     await update.message.reply_text(
         f"📖 Теперь подробное описание (что именно, зачем, как){voice_hint}.\n\n"
         f"Или нажми «{BTN_CANCEL}».",
@@ -547,12 +700,109 @@ async def reminders_add_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ConversationHandler.END
 
 
+# --- Задачи ---
+
+def task_message(text: str, done: bool) -> str:
+    if done:
+        return f"✔️ <s>{html.escape(text)}</s>"
+    return f"⬜ {html.escape(text)}"
+
+
+def task_keyboard(task_id: int, done: bool) -> InlineKeyboardMarkup:
+    toggle_label = "↩️ Не сделано" if done else "✅ Сделано"
+    toggle_action = "task_undone" if done else "task_done"
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(toggle_label, callback_data=f"{toggle_action}:{task_id}"),
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"task_del:{task_id}"),
+        ],
+    ])
+
+
+async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    tasks = db.get_user_tasks(user_id)
+
+    if not tasks:
+        await update.message.reply_text(
+            f"Задач пока нет. Нажми «{BTN_ADD_TASK}» и наговори или напиши задачу.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    open_count = sum(1 for _, _, d in tasks if not d)
+    done_count = len(tasks) - open_count
+    await update.message.reply_text(
+        f"📋 Задачи: {open_count} открыто, {done_count} сделано.",
+        reply_markup=main_menu_keyboard(),
+    )
+    for tid, text, done in tasks:
+        await update.message.reply_html(
+            task_message(text, bool(done)),
+            reply_markup=task_keyboard(tid, bool(done)),
+        )
+
+
+async def task_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    voice_hint = " или наговори голосом 🎤" if voice_available() else ""
+    await update.message.reply_text(
+        f"✅ Что нужно сделать? Напиши задачу одной строкой{voice_hint}.\n\n"
+        f"Или нажми «{BTN_CANCEL}».",
+        reply_markup=cancel_keyboard(),
+    )
+    return TASK_TEXT
+
+
+async def _handle_task_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    text = (text or "").strip()
+    if not text:
+        await update.message.reply_text(
+            "Пустая задача — так нельзя. Попробуй ещё раз.",
+            reply_markup=cancel_keyboard(),
+        )
+        return TASK_TEXT
+    if len(text) > 500:
+        text = text[:500]
+
+    user_id = update.effective_user.id
+    db.upsert_user(user_id)
+    task_id = db.add_task(user_id, text)
+
+    await update.message.reply_html(
+        f"✅ Задача добавлена!\n\n{task_message(text, False)}",
+        reply_markup=main_menu_keyboard(),
+    )
+    await update.message.reply_text(
+        "Что дальше?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Сделано", callback_data=f"task_done:{task_id}")],
+            [
+                InlineKeyboardButton("➕ Ещё задача", callback_data="menu:add_task"),
+                InlineKeyboardButton("📋 Все задачи", callback_data="menu:list_tasks"),
+            ],
+            [InlineKeyboardButton("🗑 Удалить эту", callback_data=f"task_del:{task_id}")],
+        ]),
+    )
+    return ConversationHandler.END
+
+
+async def task_add_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await _handle_task_text(update, context, update.message.text)
+
+
+async def task_add_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = await _transcribe_or_warn(update, context)
+    if text is None:
+        return TASK_TEXT
+    return await _handle_task_text(update, context, text)
+
+
 # --- Голос вне диалога: создаём идею целиком через GPT ---
 
 async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _openai_client:
+    if not voice_available():
         await update.message.reply_text(
-            "🎤 Голосовой ввод сейчас не настроен. Нажми «🎤 Голосовой ввод», чтобы узнать, как включить.",
+            f"🎤 Голосовой ввод сейчас не настроен. Нажми «{BTN_VOICE}», чтобы узнать, как включить.",
             reply_markup=main_menu_keyboard(),
         )
         return
@@ -562,16 +812,20 @@ async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    parsed = await parse_idea_with_gpt(text)
-    if not parsed:
-        await update.message.reply_text(
-            "Не получилось распознать идею из голосового. "
-            "Попробуй ещё раз или нажми «➕ Добавить идею» и введи пошагово.",
-            reply_markup=main_menu_keyboard(),
-        )
-        return
+    brief = None
+    details = None
+    if _openai_client:
+        parsed = await parse_idea_with_gpt(text)
+        if parsed:
+            brief, details = parsed
 
-    brief, details = parsed
+    if not brief:
+        # Fallback (Vosk или GPT отвалился): берём первую фразу как название,
+        # весь текст — как описание.
+        first = text.split(".")[0].strip() or text.strip()
+        brief = first[:120]
+        details = text.strip()
+
     user_id = update.effective_user.id
     db.upsert_user(user_id)
     idea_id = db.add_idea(user_id, brief, details)
@@ -588,7 +842,7 @@ async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _transcribe_or_warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _openai_client:
+    if not voice_available():
         await update.message.reply_text(
             "🎤 Голосовой ввод сейчас не настроен. Напиши текстом, пожалуйста.",
             reply_markup=cancel_keyboard(),
@@ -702,6 +956,73 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "menu:list_tasks":
+        tasks = db.get_user_tasks(user_id)
+        if not tasks:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"Задач пока нет. Нажми «{BTN_ADD_TASK}».",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+        open_count = sum(1 for _, _, d in tasks if not d)
+        done_count = len(tasks) - open_count
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"📋 Задачи: {open_count} открыто, {done_count} сделано.",
+            reply_markup=main_menu_keyboard(),
+        )
+        for tid, text, done in tasks:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=task_message(text, bool(done)),
+                parse_mode=ParseMode.HTML,
+                reply_markup=task_keyboard(tid, bool(done)),
+            )
+        return
+
+    if data == "menu:add_task":
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"Нажми «{BTN_ADD_TASK}» внизу — и добавим новую задачу.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    # Задачи: toggle done / undone / delete
+    if data.startswith("task_done:") or data.startswith("task_undone:") or data.startswith("task_del:"):
+        action, tid_str = data.split(":", 1)
+        try:
+            tid = int(tid_str)
+        except ValueError:
+            return
+        task = db.get_task(tid, user_id)
+        if not task:
+            await query.edit_message_text("⚠️ Задача не найдена или была удалена.")
+            return
+        _, text, _done = task
+        if action == "task_done":
+            db.set_task_done(tid, user_id, True)
+            await query.edit_message_text(
+                task_message(text, True),
+                parse_mode=ParseMode.HTML,
+                reply_markup=task_keyboard(tid, True),
+            )
+        elif action == "task_undone":
+            db.set_task_done(tid, user_id, False)
+            await query.edit_message_text(
+                task_message(text, False),
+                parse_mode=ParseMode.HTML,
+                reply_markup=task_keyboard(tid, False),
+            )
+        elif action == "task_del":
+            db.delete_task(tid, user_id)
+            await query.edit_message_text(
+                f"🗑 Задача удалена:\n\n{task_message(text, False)}",
+                parse_mode=ParseMode.HTML,
+            )
+        return
+
     # Идеи: expand/collapse/delete
     try:
         action, idea_id_str = data.split(":", 1)
@@ -790,6 +1111,27 @@ def main():
         allow_reentry=True,
     )
 
+    task_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("addtask", task_add_start),
+            MessageHandler(filters.Regex(f"^{BTN_ADD_TASK}$"), task_add_start),
+        ],
+        states={
+            TASK_TEXT: [
+                MessageHandler(filters.VOICE | filters.AUDIO, task_add_voice),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{BTN_CANCEL}$"),
+                    task_add_text,
+                ),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex(f"^{BTN_CANCEL}$"), cancel),
+        ],
+        allow_reentry=True,
+    )
+
     add_reminder_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(reminders_add_start, pattern="^rem_add$")],
         states={
@@ -814,12 +1156,15 @@ def main():
     application.add_handler(CommandHandler("reminders", reminders_show))
     application.add_handler(CommandHandler("settime", reminders_show))
     application.add_handler(CommandHandler("voice", voice_instructions))
+    application.add_handler(CommandHandler("tasks", list_tasks))
 
     application.add_handler(add_conv)
+    application.add_handler(task_conv)
     application.add_handler(add_reminder_conv)
 
     # Кнопки главного меню (вне диалогов)
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_LIST}$"), list_ideas))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_LIST_TASKS}$"), list_tasks))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_TEST}$"), test_reminder))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_VOICE}$"), voice_instructions))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_HELP}$"), show_help))

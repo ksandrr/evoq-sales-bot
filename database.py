@@ -60,6 +60,18 @@ def init_db():
             """
         )
 
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                done INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
         # Миграция: если в старой схеме были reminder_hour/reminder_minute —
         # перенесём их в таблицу reminders, чтобы существующие напоминания не пропали.
         user_cols = _table_columns(c, "users")
@@ -175,4 +187,45 @@ def delete_reminder(reminder_id: int, user_id: int):
         c.execute(
             "DELETE FROM reminders WHERE id = ? AND user_id = ?",
             (reminder_id, user_id),
+        )
+
+
+def add_task(user_id: int, text: str) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO tasks (user_id, text, done, created_at) VALUES (?, ?, 0, ?)",
+            (user_id, text, datetime.utcnow().isoformat()),
+        )
+        return cur.lastrowid
+
+
+def get_user_tasks(user_id: int):
+    with _conn() as c:
+        return c.execute(
+            "SELECT id, text, done FROM tasks WHERE user_id = ? ORDER BY done, id",
+            (user_id,),
+        ).fetchall()
+
+
+def get_task(task_id: int, user_id: int):
+    with _conn() as c:
+        return c.execute(
+            "SELECT id, text, done FROM tasks WHERE id = ? AND user_id = ?",
+            (task_id, user_id),
+        ).fetchone()
+
+
+def set_task_done(task_id: int, user_id: int, done: bool):
+    with _conn() as c:
+        c.execute(
+            "UPDATE tasks SET done = ? WHERE id = ? AND user_id = ?",
+            (1 if done else 0, task_id, user_id),
+        )
+
+
+def delete_task(task_id: int, user_id: int):
+    with _conn() as c:
+        c.execute(
+            "DELETE FROM tasks WHERE id = ? AND user_id = ?",
+            (task_id, user_id),
         )
