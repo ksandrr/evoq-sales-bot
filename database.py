@@ -70,8 +70,10 @@ def init_db():
                 text TEXT NOT NULL,
                 title TEXT NOT NULL DEFAULT '',
                 body TEXT NOT NULL DEFAULT '',
+                due_date TEXT NOT NULL DEFAULT '',
                 due_time TEXT NOT NULL DEFAULT '',
                 timezone TEXT NOT NULL DEFAULT '',
+                notified_at TEXT NOT NULL DEFAULT '',
                 done INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             )
@@ -83,10 +85,14 @@ def init_db():
             c.execute("ALTER TABLE tasks ADD COLUMN title TEXT NOT NULL DEFAULT ''")
         if "body" not in task_cols:
             c.execute("ALTER TABLE tasks ADD COLUMN body TEXT NOT NULL DEFAULT ''")
+        if "due_date" not in task_cols:
+            c.execute("ALTER TABLE tasks ADD COLUMN due_date TEXT NOT NULL DEFAULT ''")
         if "due_time" not in task_cols:
             c.execute("ALTER TABLE tasks ADD COLUMN due_time TEXT NOT NULL DEFAULT ''")
         if "timezone" not in task_cols:
             c.execute("ALTER TABLE tasks ADD COLUMN timezone TEXT NOT NULL DEFAULT ''")
+        if "notified_at" not in task_cols:
+            c.execute("ALTER TABLE tasks ADD COLUMN notified_at TEXT NOT NULL DEFAULT ''")
 
         # Миграция: если в старой схеме были reminder_hour/reminder_minute —
         # перенесём их в таблицу reminders, чтобы существующие напоминания не пропали.
@@ -211,6 +217,7 @@ def add_task(
     text: str,
     title: str | None = None,
     body: str | None = None,
+    due_date: str = "",
     due_time: str = "",
     timezone: str = "",
 ) -> int:
@@ -220,10 +227,10 @@ def add_task(
     with _conn() as c:
         cur = c.execute(
             """
-            INSERT INTO tasks (user_id, text, title, body, due_time, timezone, done, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+            INSERT INTO tasks (user_id, text, title, body, due_date, due_time, timezone, notified_at, done, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, '', 0, ?)
             """,
-            (user_id, text, title, body, due_time or "", timezone or "", datetime.utcnow().isoformat()),
+            (user_id, text, title, body, due_date or "", due_time or "", timezone or "", datetime.utcnow().isoformat()),
         )
         return cur.lastrowid
 
@@ -237,6 +244,7 @@ def get_user_tasks(user_id: int):
                 COALESCE(NULLIF(title, ''), text) AS title,
                 done,
                 COALESCE(NULLIF(body, ''), text) AS body,
+                due_date,
                 due_time,
                 timezone
             FROM tasks
@@ -256,6 +264,7 @@ def get_task(task_id: int, user_id: int):
                 COALESCE(NULLIF(title, ''), text) AS title,
                 done,
                 COALESCE(NULLIF(body, ''), text) AS body,
+                due_date,
                 due_time,
                 timezone
             FROM tasks
@@ -270,6 +279,37 @@ def set_task_done(task_id: int, user_id: int, done: bool):
         c.execute(
             "UPDATE tasks SET done = ? WHERE id = ? AND user_id = ?",
             (1 if done else 0, task_id, user_id),
+        )
+
+
+def get_due_tasks():
+    with _conn() as c:
+        return c.execute(
+            """
+            SELECT
+                id,
+                user_id,
+                COALESCE(NULLIF(title, ''), text) AS title,
+                done,
+                COALESCE(NULLIF(body, ''), text) AS body,
+                due_date,
+                due_time,
+                timezone
+            FROM tasks
+            WHERE done = 0
+              AND due_time != ''
+              AND due_date != ''
+              AND notified_at = ''
+            ORDER BY due_date, due_time, id
+            """
+        ).fetchall()
+
+
+def mark_task_notified(task_id: int, user_id: int):
+    with _conn() as c:
+        c.execute(
+            "UPDATE tasks SET notified_at = ? WHERE id = ? AND user_id = ?",
+            (datetime.utcnow().isoformat(), task_id, user_id),
         )
 
 

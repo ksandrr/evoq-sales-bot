@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 import urllib.request
 import zipfile
-from datetime import time
+from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
@@ -374,6 +374,35 @@ RUSSIAN_HOURS = {
     "одиннадцать": 11,
     "двенадцать": 12,
 }
+RUSSIAN_NUMBER_WORDS = {
+    "ноль": 0,
+    "час": 1,
+    "один": 1,
+    "одна": 1,
+    "два": 2,
+    "две": 2,
+    "три": 3,
+    "четыре": 4,
+    "пять": 5,
+    "шесть": 6,
+    "семь": 7,
+    "восемь": 8,
+    "девять": 9,
+    "десять": 10,
+    "одиннадцать": 11,
+    "двенадцать": 12,
+    "тринадцать": 13,
+    "четырнадцать": 14,
+    "пятнадцать": 15,
+    "шестнадцать": 16,
+    "семнадцать": 17,
+    "восемнадцать": 18,
+    "девятнадцать": 19,
+    "двадцать": 20,
+    "тридцать": 30,
+    "сорок": 40,
+    "пятьдесят": 50,
+}
 
 CAPTURE_INTENT_WORDS = (
     "задача", "задачу", "напомни", "напоминание", "поставь задачу",
@@ -404,6 +433,14 @@ TITLE_WORD_NORMALIZATIONS = {
 
 def _compact_spaces(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _today_in_timezone(tz_name: str) -> datetime:
+    try:
+        tz = ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        tz = ZoneInfo("Asia/Omsk")
+    return datetime.now(tz)
 
 
 def _default_timezone() -> str:
@@ -452,6 +489,13 @@ def _strip_capture_noise(text: str) -> str:
         text,
         flags=re.IGNORECASE,
     )
+    number_word = "|".join(sorted(RUSSIAN_NUMBER_WORDS, key=len, reverse=True))
+    text = re.sub(
+        rf"\b(на|к|в)\s+(?:{number_word})(?:\s+(?:{number_word})){{0,3}}\b",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
     text = re.sub(
         r"\b(сегодня|завтра|послезавтра|вечером|утром|днем|днём|ночью|по\s+\w+)\b",
         " ",
@@ -460,6 +504,18 @@ def _strip_capture_noise(text: str) -> str:
     )
     text = re.sub(r"\b(задачу|задача|напоминание|иде[яю])\b", " ", text, flags=re.IGNORECASE)
     return _compact_spaces(text).strip(" .,!?:;")
+
+
+def _parse_ru_number_words(words: list[str]) -> int | None:
+    if not words:
+        return None
+    total = 0
+    for word in words:
+        value = RUSSIAN_NUMBER_WORDS.get(word)
+        if value is None:
+            return None
+        total += value
+    return total
 
 
 def _title_from_action_phrase(text: str) -> str:
@@ -530,6 +586,25 @@ def extract_capture_due_time(text: str) -> str:
             hour = 0
         return f"{hour:02d}:00"
 
+    number_word = "|".join(sorted(RUSSIAN_NUMBER_WORDS, key=len, reverse=True))
+    for m in re.finditer(
+        rf"\b(?:к|на|в)\s+((?:{number_word})(?:\s+(?:{number_word})){{0,3}})(?:\s+(утра|дня|вечера|ночи))?\b",
+        low,
+    ):
+        words = m.group(1).split()
+        part = m.group(2) or ""
+        for split_at in range(len(words), 0, -1):
+            hour = _parse_ru_number_words(words[:split_at])
+            minute = _parse_ru_number_words(words[split_at:]) if split_at < len(words) else 0
+            if hour is None or minute is None:
+                continue
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                if part in {"вечера", "дня"} and hour < 12:
+                    hour += 12
+                if part == "ночи" and hour == 12:
+                    hour = 0
+                return f"{hour:02d}:{minute:02d}"
+
     m = re.search(r"\b(?:к|на|в)\s+([01]?\d|2[0-3])\s*(?:час(?:ов|а)?|ч)?\b", low)
     if m:
         hour = int(m.group(1))
@@ -538,6 +613,34 @@ def extract_capture_due_time(text: str) -> str:
         return f"{hour:02d}:00"
 
     return ""
+
+
+def extract_capture_due_date(text: str, timezone: str) -> str:
+    low = (text or "").lower().replace("ё", "е")
+    now = _today_in_timezone(timezone or _default_timezone())
+    if "послезавтра" in low:
+        return (now + timedelta(days=2)).date().isoformat()
+    if "завтра" in low:
+        return (now + timedelta(days=1)).date().isoformat()
+    if "сегодня" in low:
+        return now.date().isoformat()
+    return ""
+
+
+def resolve_capture_due_date(text: str, timezone: str, due_time: str) -> str:
+    due_date = extract_capture_due_date(text, timezone)
+    if due_date or not due_time:
+        return due_date
+
+    now = _today_in_timezone(timezone or _default_timezone())
+    try:
+        hour, minute = [int(x) for x in due_time.split(":", 1)]
+        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    except ValueError:
+        return ""
+    if candidate + timedelta(minutes=1) <= now:
+        candidate = candidate + timedelta(days=1)
+    return candidate.date().isoformat()
 
 
 def classify_capture_text(text: str) -> dict:
@@ -566,6 +669,7 @@ def classify_capture_text(text: str) -> dict:
         "title": generate_capture_title(normalized, capture_type),
         "body": clean,
         "due_time": due_time,
+        "due_date_hint": "послезавтра" if "послезавтра" in low else "завтра" if "завтра" in low else "сегодня" if "сегодня" in low else "",
         "timezone": timezone,
     }
 
@@ -632,6 +736,13 @@ def generate_capture_title(text: str, capture_type: str) -> str:
         title,
         flags=re.IGNORECASE,
     )
+    number_word = "|".join(sorted(RUSSIAN_NUMBER_WORDS, key=len, reverse=True))
+    title = re.sub(
+        rf"\b(на|к|в)\s+(?:{number_word})(?:\s+(?:{number_word})){{0,3}}\b",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
     title = re.sub(
         r"\b(задачу|задача|напоминание|иде[яю])\b",
         "",
@@ -646,6 +757,7 @@ def generate_capture_title(text: str, capture_type: str) -> str:
     )
     title = re.sub(r"\b(о\s+том\s+)?что\s+(мне\s+)?нужно\s+", "", title, flags=re.IGNORECASE)
     title = re.sub(r"\bмне\s+нужно\s+", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\b(на|к|в)\s*$", "", title, flags=re.IGNORECASE)
     title = _normalize_title_words(title)
     title = _compact_spaces(title).strip(" .,!?:;")
 
@@ -844,6 +956,49 @@ def schedule_user_reminders(application: Application, user_id: int):
         )
 
 
+async def check_task_reminders(context: ContextTypes.DEFAULT_TYPE):
+    for task in db.get_due_tasks():
+        task_id, user_id, title, _done, body, due_date, due_time, timezone = task
+        timezone = timezone or effective_user_timezone(user_id)
+        try:
+            tz = ZoneInfo(timezone)
+        except ZoneInfoNotFoundError:
+            timezone = _default_timezone()
+            tz = ZoneInfo(timezone)
+
+        try:
+            due_at = datetime.fromisoformat(f"{due_date}T{due_time}:00").replace(tzinfo=tz)
+        except ValueError:
+            logger.warning("Некорректный срок задачи id=%s: %s %s", task_id, due_date, due_time)
+            continue
+
+        if datetime.now(tz) < due_at:
+            continue
+
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=task_reminder_message(title, body, due_date, due_time, timezone),
+                parse_mode=ParseMode.HTML,
+                reply_markup=task_keyboard(task_id, False),
+            )
+            db.mark_task_notified(task_id, user_id)
+        except Exception:
+            logger.exception("Не удалось отправить напоминание по задаче %s пользователю %s", task_id, user_id)
+
+
+def schedule_task_reminder_checker(application: Application):
+    for job in list(application.job_queue.jobs()):
+        if job.name == "check_task_reminders":
+            job.schedule_removal()
+    application.job_queue.run_repeating(
+        check_task_reminders,
+        interval=60,
+        first=10,
+        name="check_task_reminders",
+    )
+
+
 # --- Диалог: добавить идею ---
 
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1034,25 +1189,33 @@ async def reminders_add_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # --- Задачи ---
 
-def _task_row_parts(task) -> tuple[int, str, bool, str, str, str]:
-    if len(task) >= 6:
-        task_id, title, done, body, due_time, timezone = task[:6]
+def _task_row_parts(task) -> tuple[int, str, bool, str, str, str, str]:
+    if len(task) >= 7:
+        task_id, title, done, body, due_date, due_time, timezone = task[:7]
     else:
         task_id, title, done = task[:3]
-        body, due_time, timezone = title, "", ""
-    return task_id, title, bool(done), body, due_time, timezone
+        body, due_date, due_time, timezone = title, "", "", ""
+    return task_id, title, bool(done), body, due_date, due_time, timezone
 
 
-def task_message(title: str, done: bool, body: str = "", due_time: str = "", timezone: str = "") -> str:
+def task_message(title: str, done: bool, body: str = "", due_date: str = "", due_time: str = "", timezone: str = "") -> str:
     title = title or body or "Без названия"
     meta = ""
     if due_time:
-        meta = f"\n⏰ {html.escape(due_time)}"
+        date_part = f"{html.escape(due_date)} " if due_date else ""
+        meta = f"\n⏰ {date_part}{html.escape(due_time)}"
         if timezone:
             meta += f" {html.escape(format_timezone_label(timezone))}"
     if done:
         return f"✔️ <s>{html.escape(title)}</s>{meta}"
     return f"⬜ {html.escape(title)}{meta}"
+
+
+def task_reminder_message(title: str, body: str, due_date: str, due_time: str, timezone: str) -> str:
+    return (
+        "🔔 <b>Напоминание по задаче</b>\n\n"
+        f"{task_message(title, False, body, due_date, due_time, timezone)}"
+    )
 
 
 def format_timezone_label(timezone: str) -> str:
@@ -1100,9 +1263,9 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_menu_keyboard(),
     )
     for task in tasks:
-        tid, title, done, body, due_time, timezone = _task_row_parts(task)
+        tid, title, done, body, due_date, due_time, timezone = _task_row_parts(task)
         await update.message.reply_html(
-            task_message(title, done, body, due_time, timezone),
+            task_message(title, done, body, due_date, due_time, timezone),
             reply_markup=task_keyboard(tid, done),
         )
 
@@ -1134,17 +1297,19 @@ async def _handle_task_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     user_id = update.effective_user.id
     db.upsert_user(user_id)
     timezone = capture.get("timezone") or effective_user_timezone(user_id)
+    due_date = resolve_capture_due_date(text, timezone, capture.get("due_time", ""))
     task_id = db.add_task(
         user_id,
         title,
         title=title,
         body=text,
+        due_date=due_date,
         due_time=capture.get("due_time", ""),
         timezone=timezone,
     )
 
     await update.message.reply_html(
-        f"✅ Задача создана\n\n{task_message(title, False, text, capture.get('due_time', ''), timezone)}",
+        f"✅ Задача создана\n\n{task_message(title, False, text, due_date, capture.get('due_time', ''), timezone)}",
         reply_markup=main_menu_keyboard(),
     )
     await update.message.reply_text(
@@ -1197,17 +1362,19 @@ async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
         title = capture["title"]
         due_time = capture.get("due_time", "")
         timezone = capture.get("timezone") or effective_user_timezone(user_id)
+        due_date = resolve_capture_due_date(capture["body"], timezone, due_time)
         task_id = db.add_task(
             user_id,
             title,
             title=title,
             body=capture["body"],
+            due_date=due_date,
             due_time=due_time,
             timezone=timezone,
         )
         response = "🔔 Напоминание создано" if capture_type == "reminder" else "✅ Задача создана"
         await update.message.reply_html(
-            f"{response}\n\n{task_message(title, False, capture['body'], due_time, timezone)}"
+            f"{response}\n\n{task_message(title, False, capture['body'], due_date, due_time, timezone)}"
             f"{recognized_voice_message(capture['body'])}",
             reply_markup=main_menu_keyboard(),
         )
@@ -1383,10 +1550,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=main_menu_keyboard(),
         )
         for task in tasks:
-            tid, title, done, body, due_time, timezone = _task_row_parts(task)
+            tid, title, done, body, due_date, due_time, timezone = _task_row_parts(task)
             await context.bot.send_message(
                 chat_id=user_id,
-                text=task_message(title, done, body, due_time, timezone),
+                text=task_message(title, done, body, due_date, due_time, timezone),
                 parse_mode=ParseMode.HTML,
                 reply_markup=task_keyboard(tid, done),
             )
@@ -1411,25 +1578,25 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not task:
             await query.edit_message_text("⚠️ Задача не найдена или была удалена.")
             return
-        _, title, _done, body, due_time, timezone = _task_row_parts(task)
+        _, title, _done, body, due_date, due_time, timezone = _task_row_parts(task)
         if action == "task_done":
             db.set_task_done(tid, user_id, True)
             await query.edit_message_text(
-                task_message(title, True, body, due_time, timezone),
+                task_message(title, True, body, due_date, due_time, timezone),
                 parse_mode=ParseMode.HTML,
                 reply_markup=task_keyboard(tid, True),
             )
         elif action == "task_undone":
             db.set_task_done(tid, user_id, False)
             await query.edit_message_text(
-                task_message(title, False, body, due_time, timezone),
+                task_message(title, False, body, due_date, due_time, timezone),
                 parse_mode=ParseMode.HTML,
                 reply_markup=task_keyboard(tid, False),
             )
         elif action == "task_del":
             db.delete_task(tid, user_id)
             await query.edit_message_text(
-                f"🗑 Задача удалена:\n\n{task_message(title, False, body, due_time, timezone)}",
+                f"🗑 Задача удалена:\n\n{task_message(title, False, body, due_date, due_time, timezone)}",
                 parse_mode=ParseMode.HTML,
             )
         return
@@ -1478,6 +1645,7 @@ async def post_init(application: Application):
     db.init_db()
     for user_id in db.get_all_user_ids():
         schedule_user_reminders(application, user_id)
+    schedule_task_reminder_checker(application)
     logger.info("Bot started; reminders scheduled.")
 
 
