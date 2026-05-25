@@ -357,6 +357,22 @@ TIMEZONE_ALIASES = {
     "владивосток": "Asia/Vladivostok",
     "владивостоку": "Asia/Vladivostok",
 }
+RUSSIAN_HOURS = {
+    "ноль": 0,
+    "час": 1,
+    "один": 1,
+    "два": 2,
+    "три": 3,
+    "четыре": 4,
+    "пять": 5,
+    "шесть": 6,
+    "семь": 7,
+    "восемь": 8,
+    "девять": 9,
+    "десять": 10,
+    "одиннадцать": 11,
+    "двенадцать": 12,
+}
 
 CAPTURE_INTENT_WORDS = (
     "задача", "задачу", "напомни", "напоминание", "поставь задачу",
@@ -364,6 +380,8 @@ CAPTURE_INTENT_WORDS = (
 )
 IDEA_INTENT_PATTERNS = (
     r"\b(добавь|запиши|сохрани|создай)\s+(мне\s+)?иде[яю]\b",
+    r"\b(точнее|вернее|нет)\s*,?\s*иде[яю]\b",
+    r"\bиде[яю]\b",
     r"^\s*идея\s*[:\-—]",
 )
 DATE_TIME_WORDS = (
@@ -378,6 +396,20 @@ ACTION_WORDS = (
 
 def _compact_spaces(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def normalize_capture_command_text(text: str) -> str:
+    text = _compact_spaces(text).strip(" .,!?:;")
+    text = re.sub(
+        r"^(привет|слушай|так|короче)\s*,?\s*(чат|бот|ботик|ассистент)?\s*,?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"^(чат|бот|ботик|ассистент)\s*,?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(пожалуйста|плиз)\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(точнее|вернее)\s*,?\s*(задачу|иде[яю])\b", r" \2 ", text, flags=re.IGNORECASE)
+    return _compact_spaces(text).strip(" .,!?:;")
 
 
 def extract_capture_timezone(text: str, default_tz: str = "") -> str:
@@ -408,6 +440,20 @@ def extract_capture_due_time(text: str) -> str:
             hour = 0
         return f"{hour:02d}:00"
 
+    hour_words = "|".join(RUSSIAN_HOURS)
+    m = re.search(
+        rf"\b(?:к|на|в)?\s*({hour_words})\s*(?:час(?:ов|а)?|ч)?\s*(утра|дня|вечера|ночи)\b",
+        low,
+    )
+    if m:
+        hour = RUSSIAN_HOURS[m.group(1)]
+        part = m.group(2)
+        if part in {"вечера", "дня"} and hour < 12:
+            hour += 12
+        if part == "ночи" and hour == 12:
+            hour = 0
+        return f"{hour:02d}:00"
+
     m = re.search(r"\b(?:к|на|в)\s+([01]?\d|2[0-3])\s*(?:час(?:ов|а)?|ч)?\b", low)
     if m:
         hour = int(m.group(1))
@@ -420,9 +466,10 @@ def extract_capture_due_time(text: str) -> str:
 
 def classify_capture_text(text: str) -> dict:
     clean = _compact_spaces(text)
-    low = clean.lower().replace("ё", "е")
-    due_time = extract_capture_due_time(clean)
-    timezone = extract_capture_timezone(clean)
+    normalized = normalize_capture_command_text(clean)
+    low = normalized.lower().replace("ё", "е")
+    due_time = extract_capture_due_time(normalized)
+    timezone = extract_capture_timezone(normalized)
     has_idea_intent = any(re.search(pattern, low) for pattern in IDEA_INTENT_PATTERNS)
 
     has_intent = any(word in low for word in CAPTURE_INTENT_WORDS)
@@ -440,7 +487,7 @@ def classify_capture_text(text: str) -> dict:
 
     return {
         "type": capture_type,
-        "title": generate_capture_title(clean, capture_type),
+        "title": generate_capture_title(normalized, capture_type),
         "body": clean,
         "due_time": due_time,
         "timezone": timezone,
@@ -448,8 +495,14 @@ def classify_capture_text(text: str) -> dict:
 
 
 def generate_capture_title(text: str, capture_type: str) -> str:
-    title = _compact_spaces(text).strip(" .,!?:;")
-    title = re.sub(r"^(привет|слушай|так|короче)[,\s]+", "", title, flags=re.IGNORECASE)
+    title = normalize_capture_command_text(text)
+    if capture_type == "idea":
+        title = re.sub(
+            r"^.*\bиде[яю]\b\s*(о\s+том\s*)?(что\s*)?",
+            "",
+            title,
+            flags=re.IGNORECASE,
+        )
     title = re.sub(
         r"^(идея|задача|напоминание)\s*[:\-—]\s*",
         "",
@@ -463,7 +516,25 @@ def generate_capture_title(text: str, capture_type: str) -> str:
         flags=re.IGNORECASE,
     )
     title = re.sub(
+        r"^(сделай|создай|поставь|добавь|запиши|сохрани)\s+(на\s+)?(сегодня|завтра|послезавтра)?\s*(задачу|напоминание)\s+",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(
+        r"^(сделай|создай|поставь|добавь|запиши|сохрани)\s+(на\s+)?(сегодня|завтра|послезавтра)?\s*(?:в\s+\d{1,2}([:.]\d{2})?\s*(час(?:ов|а)?|ч)?\s*(утра|дня|вечера|ночи)?\s*)?(задачу|напоминание)\s+",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(
         r"^(добавь|запиши|сохрани|создай)\s+(мне\s+)?иде[яю]\s+",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(
+        r"^(сделай|создай|поставь|добавь|запиши|сохрани)\s+иде[яю]\s+(о\s+том\s+)?(что\s+)?",
         "",
         title,
         flags=re.IGNORECASE,
@@ -476,13 +547,27 @@ def generate_capture_title(text: str, capture_type: str) -> str:
         title,
         flags=re.IGNORECASE,
     )
+    hour_words = "|".join(RUSSIAN_HOURS)
+    title = re.sub(
+        rf"\b(на|к|в)\s+({hour_words})\s*(час(?:ов|а)?|ч)?\s*(утра|дня|вечера|ночи)?\b",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(
+        r"\b(задачу|задача|напоминание|иде[яю])\b",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
     title = re.sub(
         r"\b(сегодня|завтра|послезавтра|вечером|утром|днем|днём|ночью|по\s+\w+)\b",
         "",
         title,
         flags=re.IGNORECASE,
     )
-    title = re.sub(r"\bчто\s+нужно\s+", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\b(о\s+том\s+)?что\s+(мне\s+)?нужно\s+", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\bмне\s+нужно\s+", "", title, flags=re.IGNORECASE)
     title = re.sub(r"\bмолока\b", "молоко", title, flags=re.IGNORECASE)
     title = _compact_spaces(title).strip(" .,!?:;")
 
