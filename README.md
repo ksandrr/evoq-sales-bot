@@ -36,9 +36,30 @@
 
 Бот использует polling и хранит данные в локальном SQLite‑файле `ideas.db`.
 
+## Деплой на Railway (24/7 без своего ПК)
+
+[Railway](https://railway.app) разворачивает бота прямо из GitHub, есть
+бесплатный стартовый тариф (~500 часов/мес).
+
+1. Зарегистрируйся на https://railway.app через GitHub.
+2. **New Project → Deploy from GitHub repo** → выбери `evoq-sales-bot`.
+3. Railway сам найдёт `requirements.txt`, `Procfile` и `railway.json` и
+   соберёт сервис. Стартовая команда — `python bot.py`.
+4. В разделе **Variables** добавь:
+   - `BOT_TOKEN` — токен от @BotFather
+   - `DB_PATH` — `/data/ideas.db`
+5. В разделе **Settings → Volumes** создай том и примонтируй его на
+   `/data` (иначе при каждом редеплое файл `ideas.db` будет пересоздан
+   и все идеи исчезнут).
+6. Нажми **Deploy**. Через минуту бот заработает — пиши ему в Telegram.
+
+При следующих изменениях в репозитории Railway автоматически пересоберёт
+и перезапустит сервис.
+
 ## Структура
 
 - `bot.py` — точка входа, хендлеры, расписание напоминаний (JobQueue)
-- `database.py` — обёртка над SQLite (идеи и время напоминаний)
+- `database.py` — обёртка над SQLite (путь берётся из `DB_PATH`)
 - `requirements.txt` — зависимости
+- `Procfile`, `railway.json`, `runtime.txt` — конфигурация для Railway
 - `.env.example` — пример конфигурации

@@ -1,8 +1,9 @@
+import os
 import sqlite3
 from datetime import datetime
 from contextlib import contextmanager
 
-DB_PATH = "ideas.db"
+DB_PATH = os.environ.get("DB_PATH", "ideas.db")
 
 
 @contextmanager
@@ -16,6 +17,9 @@ def _conn():
 
 
 def init_db():
+    parent = os.path.dirname(DB_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with _conn() as c:
         c.execute(
             """
