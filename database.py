@@ -4,6 +4,8 @@ from datetime import datetime
 from contextlib import contextmanager
 
 DB_PATH = os.environ.get("DB_PATH", "ideas.db")
+DEFAULT_TIMEZONE = os.environ.get("DEFAULT_TIMEZONE", "Asia/Omsk")
+SQL_DEFAULT_TIMEZONE = DEFAULT_TIMEZONE.replace("'", "''")
 
 
 @contextmanager
@@ -46,7 +48,7 @@ def init_db():
 
         user_cols = _table_columns(c, "users")
         if "timezone" not in user_cols:
-            c.execute("ALTER TABLE users ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'")
+            c.execute(f"ALTER TABLE users ADD COLUMN timezone TEXT NOT NULL DEFAULT '{SQL_DEFAULT_TIMEZONE}'")
 
         c.execute(
             """
@@ -163,7 +165,7 @@ def get_user_timezone(user_id: int) -> str:
             "SELECT timezone FROM users WHERE user_id = ?",
             (user_id,),
         ).fetchone()
-        return row[0] if row and row[0] else "UTC"
+        return row[0] if row and row[0] else DEFAULT_TIMEZONE
 
 
 def set_user_timezone(user_id: int, tz: str):

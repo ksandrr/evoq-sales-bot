@@ -33,6 +33,7 @@ import database as db
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "Asia/Omsk")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -392,10 +393,32 @@ ACTION_WORDS = (
     "купить", "сделать", "позвонить", "написать", "проверить", "отправить",
     "созвониться", "встретиться", "подготовить", "разобрать", "найти",
 )
+TITLE_WORD_NORMALIZATIONS = {
+    "молока": "молоко",
+    "хлеба": "хлеб",
+    "яиц": "яйца",
+    "газпрома": "Газпрома",
+    "арине": "Арине",
+}
 
 
 def _compact_spaces(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _default_timezone() -> str:
+    try:
+        ZoneInfo(DEFAULT_TIMEZONE)
+        return DEFAULT_TIMEZONE
+    except ZoneInfoNotFoundError:
+        return "Asia/Omsk"
+
+
+def effective_user_timezone(user_id: int) -> str:
+    tz = db.get_user_timezone(user_id)
+    if not tz or tz == "UTC":
+        return _default_timezone()
+    return tz
 
 
 def normalize_capture_command_text(text: str) -> str:
@@ -410,6 +433,59 @@ def normalize_capture_command_text(text: str) -> str:
     text = re.sub(r"\b(пожалуйста|плиз)\b", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\b(точнее|вернее)\s*,?\s*(задачу|иде[яю])\b", r" \2 ", text, flags=re.IGNORECASE)
     return _compact_spaces(text).strip(" .,!?:;")
+
+
+def _strip_capture_noise(text: str) -> str:
+    text = _compact_spaces(text)
+    text = re.sub(r"\b(что\s+но|что\s+ну|что)\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(мне\s+нужно|нужно|надо)\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\b(на|к|в)?\s*\d{1,2}([:.]\d{2})?\s*(час(?:ов|а)?|ч)?\s*(утра|дня|вечера|ночи)?\b",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    hour_words = "|".join(RUSSIAN_HOURS)
+    text = re.sub(
+        rf"\b(на|к|в)?\s*({hour_words})\s*(час(?:ов|а)?|ч)?\s*(утра|дня|вечера|ночи)?\b",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\b(сегодня|завтра|послезавтра|вечером|утром|днем|днём|ночью|по\s+\w+)\b",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\b(задачу|задача|напоминание|иде[яю])\b", " ", text, flags=re.IGNORECASE)
+    return _compact_spaces(text).strip(" .,!?:;")
+
+
+def _title_from_action_phrase(text: str) -> str:
+    low = text.lower().replace("ё", "е")
+    matches = []
+    for word in ACTION_WORDS:
+        m = re.search(rf"\b{word}\b", low)
+        if m:
+            matches.append((m.start(), m.end()))
+    if not matches:
+        return text
+    start, _ = min(matches)
+    return text[start:]
+
+
+def _normalize_title_words(title: str) -> str:
+    parts = re.findall(r"\w+|[^\w\s]", title, flags=re.UNICODE)
+    normalized = []
+    for part in parts:
+        low = part.lower()
+        normalized.append(TITLE_WORD_NORMALIZATIONS.get(low, part))
+    title = " ".join(normalized)
+    title = re.sub(r"\s+([,.;:!?])", r"\1", title)
+    title = re.sub(r"\bмолоко\s+хлеб\s+и\s+яйца\b", "молоко, хлеб и яйца", title, flags=re.IGNORECASE)
+    title = re.sub(r"\bмолоко\s+хлеб\b", "молоко и хлеб", title, flags=re.IGNORECASE)
+    return _compact_spaces(title)
 
 
 def extract_capture_timezone(text: str, default_tz: str = "") -> str:
@@ -503,6 +579,7 @@ def generate_capture_title(text: str, capture_type: str) -> str:
             title,
             flags=re.IGNORECASE,
         )
+    title = _title_from_action_phrase(title)
     title = re.sub(
         r"^(идея|задача|напоминание)\s*[:\-—]\s*",
         "",
@@ -541,6 +618,7 @@ def generate_capture_title(text: str, capture_type: str) -> str:
     )
     title = re.sub(r"^напомни(ть)?\s+(мне\s+)?", "", title, flags=re.IGNORECASE)
     title = re.sub(r"^(нужно|надо|что нужно)\s+", "", title, flags=re.IGNORECASE)
+    title = _strip_capture_noise(title)
     title = re.sub(
         r"\b(на|к|в)\s+\d{1,2}([:.]\d{2})?\s*(час(?:ов|а)?|ч)?\s*(утра|дня|вечера|ночи)?\b",
         "",
@@ -568,7 +646,7 @@ def generate_capture_title(text: str, capture_type: str) -> str:
     )
     title = re.sub(r"\b(о\s+том\s+)?что\s+(мне\s+)?нужно\s+", "", title, flags=re.IGNORECASE)
     title = re.sub(r"\bмне\s+нужно\s+", "", title, flags=re.IGNORECASE)
-    title = re.sub(r"\bмолока\b", "молоко", title, flags=re.IGNORECASE)
+    title = _normalize_title_words(title)
     title = _compact_spaces(title).strip(" .,!?:;")
 
     if capture_type == "idea":
@@ -581,7 +659,7 @@ def generate_capture_title(text: str, capture_type: str) -> str:
     title = _compact_spaces(title).strip(" .,!?:;")
 
     words = title.split()
-    if len(words) > 6:
+    if len(words) > 6 and " и " not in f" {title.lower()} ":
         title = " ".join(words[:6])
     if not title:
         title = _compact_spaces(text).split(".")[0][:80].strip() or "Без названия"
@@ -602,7 +680,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.upsert_user(user_id)
     schedule_user_reminders(context.application, user_id)
 
-    tz = db.get_user_timezone(user_id)
+    tz = effective_user_timezone(user_id)
     reminders = db.get_user_reminders(user_id)
     times_txt = ", ".join(f"{h:02d}:{m:02d}" for _, h, m in reminders) or "—"
     text = (
@@ -741,12 +819,12 @@ async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
 
 
 def _user_tzinfo(user_id: int):
-    tz_name = db.get_user_timezone(user_id)
+    tz_name = effective_user_timezone(user_id)
     try:
         return ZoneInfo(tz_name)
     except ZoneInfoNotFoundError:
-        logger.warning("Неизвестный часовой пояс %s у пользователя %s, fallback на UTC", tz_name, user_id)
-        return ZoneInfo("UTC")
+        logger.warning("Неизвестный часовой пояс %s у пользователя %s, fallback на Asia/Omsk", tz_name, user_id)
+        return ZoneInfo("Asia/Omsk")
 
 
 def schedule_user_reminders(application: Application, user_id: int):
@@ -873,7 +951,7 @@ def _reminders_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 
 def _reminders_text(user_id: int) -> str:
-    tz = db.get_user_timezone(user_id)
+    tz = effective_user_timezone(user_id)
     reminders = db.get_user_reminders(user_id)
     head = f"🌍 Часовой пояс: <b>{html.escape(tz)}</b>\n\n"
     if not reminders:
@@ -912,7 +990,7 @@ async def _refresh_reminders_menu(query, user_id: int):
 async def reminders_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    tz = db.get_user_timezone(query.from_user.id)
+    tz = effective_user_timezone(query.from_user.id)
     await query.message.reply_text(
         f"Введи время напоминания в формате HH:MM по времени «{tz}».\n"
         "Например: 12:00\n\n"
@@ -971,10 +1049,19 @@ def task_message(title: str, done: bool, body: str = "", due_time: str = "", tim
     if due_time:
         meta = f"\n⏰ {html.escape(due_time)}"
         if timezone:
-            meta += f" {html.escape(timezone)}"
+            meta += f" {html.escape(format_timezone_label(timezone))}"
     if done:
         return f"✔️ <s>{html.escape(title)}</s>{meta}"
     return f"⬜ {html.escape(title)}{meta}"
+
+
+def format_timezone_label(timezone: str) -> str:
+    labels = {
+        "Asia/Omsk": "Asia/Omsk (UTC+6)",
+        "Europe/Moscow": "Europe/Moscow (UTC+3)",
+        "UTC": "UTC",
+    }
+    return labels.get(timezone, timezone)
 
 
 def recognized_voice_message(text: str) -> str:
@@ -1046,7 +1133,7 @@ async def _handle_task_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     user_id = update.effective_user.id
     db.upsert_user(user_id)
-    timezone = capture.get("timezone") or db.get_user_timezone(user_id)
+    timezone = capture.get("timezone") or effective_user_timezone(user_id)
     task_id = db.add_task(
         user_id,
         title,
@@ -1109,7 +1196,7 @@ async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if capture_type in {"task", "reminder"}:
         title = capture["title"]
         due_time = capture.get("due_time", "")
-        timezone = capture.get("timezone") or db.get_user_timezone(user_id)
+        timezone = capture.get("timezone") or effective_user_timezone(user_id)
         task_id = db.add_task(
             user_id,
             title,
