@@ -236,6 +236,11 @@ async def transcribe_voice(voice_file):
                     model="whisper-1",
                     file=f,
                     language="ru",
+                    prompt=(
+                        "Пользователь диктует короткие заметки на русском для бота. "
+                        "Возможные команды: добавь идею, запиши идею, запиши задачу, "
+                        "напомни, купить молоко, в 9 часов вечера, по Омску."
+                    ),
                 )
             return (transcript.text or "").strip() or None
 
@@ -355,7 +360,11 @@ TIMEZONE_ALIASES = {
 
 CAPTURE_INTENT_WORDS = (
     "задача", "задачу", "напомни", "напоминание", "поставь задачу",
-    "сделай задачу", "поставь напоминание",
+    "сделай задачу", "запиши задачу", "добавь задачу", "поставь напоминание",
+)
+IDEA_INTENT_PATTERNS = (
+    r"\b(добавь|запиши|сохрани|создай)\s+(мне\s+)?иде[яю]\b",
+    r"^\s*идея\s*[:\-—]",
 )
 DATE_TIME_WORDS = (
     "сегодня", "завтра", "послезавтра", "вечером", "утром", "днем", "днём",
@@ -414,13 +423,13 @@ def classify_capture_text(text: str) -> dict:
     low = clean.lower().replace("ё", "е")
     due_time = extract_capture_due_time(clean)
     timezone = extract_capture_timezone(clean)
-    has_idea_prefix = bool(re.match(r"^\s*идея\s*[:\-—]", low))
+    has_idea_intent = any(re.search(pattern, low) for pattern in IDEA_INTENT_PATTERNS)
 
     has_intent = any(word in low for word in CAPTURE_INTENT_WORDS)
     has_date_time = due_time or any(word in low for word in DATE_TIME_WORDS) or bool(re.search(r"\b[кнв]\s+\d", low))
     has_action = any(re.search(rf"\b{word}\b", low) for word in ACTION_WORDS)
 
-    if has_idea_prefix and not has_date_time:
+    if has_idea_intent and not has_date_time:
         capture_type = "idea"
     elif has_intent or has_date_time:
         capture_type = "reminder" if "напом" in low else "task"
@@ -440,6 +449,7 @@ def classify_capture_text(text: str) -> dict:
 
 def generate_capture_title(text: str, capture_type: str) -> str:
     title = _compact_spaces(text).strip(" .,!?:;")
+    title = re.sub(r"^(привет|слушай|так|короче)[,\s]+", "", title, flags=re.IGNORECASE)
     title = re.sub(
         r"^(идея|задача|напоминание)\s*[:\-—]\s*",
         "",
@@ -447,7 +457,13 @@ def generate_capture_title(text: str, capture_type: str) -> str:
         flags=re.IGNORECASE,
     )
     title = re.sub(
-        r"^(сделай|создай|поставь|добавь)\s+(мне\s+)?(задачу|напоминание)\s+",
+        r"^(сделай|создай|поставь|добавь|запиши|сохрани)\s+(мне\s+)?(задачу|напоминание)\s+",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(
+        r"^(добавь|запиши|сохрани|создай)\s+(мне\s+)?иде[яю]\s+",
         "",
         title,
         flags=re.IGNORECASE,
@@ -471,7 +487,6 @@ def generate_capture_title(text: str, capture_type: str) -> str:
     title = _compact_spaces(title).strip(" .,!?:;")
 
     if capture_type == "idea":
-        title = re.sub(r"^сделать\s+", "", title, flags=re.IGNORECASE)
         title = re.sub(r"\bс\s+360-турами\b", "", title, flags=re.IGNORECASE)
         m = re.search(r"\bоффер\s+для\s+застройщиков\b", title, flags=re.IGNORECASE)
         if m:
@@ -877,6 +892,13 @@ def task_message(title: str, done: bool, body: str = "", due_time: str = "", tim
     return f"⬜ {html.escape(title)}{meta}"
 
 
+def recognized_voice_message(text: str) -> str:
+    text = _compact_spaces(text)
+    if len(text) > 500:
+        text = text[:500].rstrip() + "..."
+    return f"\n\n<i>Распознано:</i> {html.escape(text)}" if text else ""
+
+
 def task_keyboard(task_id: int, done: bool) -> InlineKeyboardMarkup:
     toggle_label = "↩️ Не сделано" if done else "✅ Сделано"
     toggle_action = "task_undone" if done else "task_done"
@@ -1013,7 +1035,8 @@ async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         response = "🔔 Напоминание создано" if capture_type == "reminder" else "✅ Задача создана"
         await update.message.reply_html(
-            f"{response}\n\n{task_message(title, False, capture['body'], due_time, timezone)}",
+            f"{response}\n\n{task_message(title, False, capture['body'], due_time, timezone)}"
+            f"{recognized_voice_message(capture['body'])}",
             reply_markup=main_menu_keyboard(),
         )
         await update.message.reply_text(
@@ -1047,7 +1070,7 @@ async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_user_reminders(context.application, user_id)
 
     await update.message.reply_html(
-        f"✅ Идея сохранена\n\n{full_message(brief, details)}",
+        f"✅ Идея сохранена\n\n{full_message(brief, details)}{recognized_voice_message(text)}",
         reply_markup=main_menu_keyboard(),
     )
     await update.message.reply_text(
