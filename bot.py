@@ -34,6 +34,8 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "Asia/Omsk")
+OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
+OPENAI_PARSE_MODEL = os.getenv("OPENAI_PARSE_MODEL", "gpt-4o-mini")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -48,7 +50,10 @@ if OPENAI_API_KEY:
         from openai import OpenAI
 
         _openai_client = OpenAI(api_key=OPENAI_API_KEY)
-        logger.info("OpenAI клиент инициализирован — голосовые сообщения будут распознаваться через Whisper.")
+        logger.info(
+            "OpenAI клиент инициализирован — голосовые сообщения будут распознаваться через %s.",
+            OPENAI_TRANSCRIBE_MODEL,
+        )
     except ImportError:
         logger.warning("Установлен OPENAI_API_KEY, но пакет openai не установлен.")
 else:
@@ -132,6 +137,7 @@ def voice_available() -> bool:
 BRIEF, DETAILS = range(2)
 ADD_REMINDER_TIME = 200
 TASK_TEXT = 300
+CLARIFY_REMINDER_TIME = 400
 
 REMINDER_JOB_PREFIX = "reminder:"
 
@@ -144,6 +150,19 @@ BTN_REMINDERS = "⏰ Напоминания"
 BTN_TEST = "🔔 Тест"
 BTN_HELP = "ℹ️ Помощь"
 BTN_CANCEL = "✖️ Отмена"
+MENU_BUTTON_PATTERN = "^(" + "|".join(
+    re.escape(label)
+    for label in (
+        BTN_ADD,
+        BTN_LIST,
+        BTN_ADD_TASK,
+        BTN_LIST_TASKS,
+        BTN_REMINDERS,
+        BTN_TEST,
+        BTN_HELP,
+        BTN_CANCEL,
+    )
+) + ")$"
 
 # Преднастроенные часовые пояса (можно выбрать одной кнопкой)
 PRESET_TIMEZONES = [
@@ -231,22 +250,35 @@ async def transcribe_voice(voice_file):
         await voice_file.download_to_drive(tmp_path)
 
         if _openai_client:
-            with open(tmp_path, "rb") as f:
-                transcript = await _async_call(
-                    _openai_client.audio.transcriptions.create,
-                    model="whisper-1",
-                    file=f,
-                    language="ru",
-                    prompt=(
-                        "Пользователь диктует короткие заметки на русском для бота. "
-                        "Возможные команды: добавь идею, запиши идею, запиши задачу, "
-                        "напомни, купить молоко, в 9 часов вечера, по Омску."
-                    ),
-                )
-            return (transcript.text or "").strip() or None
+            try:
+                with open(tmp_path, "rb") as f:
+                    transcript = await _async_call(
+                        _openai_client.audio.transcriptions.create,
+                        model=OPENAI_TRANSCRIBE_MODEL,
+                        file=f,
+                        language="ru",
+                        prompt=(
+                            "Пользователь на ходу диктует хаотичные заметки на русском для Telegram-бота. "
+                            "Возможны запинки и мусорные вводные: слушай, короче, бот, привет, ну, типа. "
+                            "Важные слова сохраняй точно: EVOQ, Vosk, OpenAI, Railway, Telegram, GitHub. "
+                            "Возможные команды: добавь идею, запиши мысль, сделай задачу, напомни, "
+                            "сегодня вечером в десять, завтра утром часов в десять, по Омску."
+                        ),
+                    )
+                text = (transcript.text or "").strip()
+                if text:
+                    engine = f"openai:{OPENAI_TRANSCRIBE_MODEL}"
+                    logger.info("voice transcription engine=%s", engine)
+                    return {"text": text, "engine": engine}
+            except Exception:
+                logger.exception("OpenAI transcription failed; falling back to Vosk")
 
         text = await _async_call(_vosk_transcribe_file, tmp_path)
-        return (text or "").strip() or None
+        text = (text or "").strip()
+        if text:
+            logger.info("voice transcription engine=vosk")
+            return {"text": text, "engine": "vosk"}
+        return None
     finally:
         try:
             os.unlink(tmp_path)
@@ -320,7 +352,7 @@ async def parse_idea_with_gpt(text: str):
     try:
         response = await _async_call(
             _openai_client.chat.completions.create,
-            model="gpt-4o-mini",
+            model=OPENAI_PARSE_MODEL,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": text},
@@ -346,29 +378,37 @@ async def parse_capture_with_gpt(text: str, default_timezone: str):
 
     now = _today_in_timezone(default_timezone)
     system = (
-        "Ты извлекаешь из русской голосовой расшифровки запись для бота идей и задач. "
-        "Верни только JSON без markdown. Поля: "
+        "Ты понимаешь хаотичную русскую речь пользователя для Telegram-бота идей, задач и напоминаний. "
+        "Пользователь может идти по улице, запинаться и говорить мусорные вводные: бот, слушай, короче, так, ну, типа, привет. "
+        "Удали этот шум и извлеки смысл как человек. Верни только JSON без markdown с полями: "
         "type: idea | task | reminder; "
-        "title: короткое название 2-6 слов, без обращений ('чат', 'привет'), без команд "
-        "('сделай задачу', 'добавь идею'), без даты и времени; "
-        "body: нормализованное описание или исходный смысл; "
+        "title: нормальное короткое название 2-7 слов, не обрывок распознанной речи, без обращений, команд, даты и времени; "
+        "body: очищенное описание по смыслу; "
         "due_date: YYYY-MM-DD или пустая строка; "
         "due_time: HH:MM в 24-часовом формате или пустая строка; "
-        "timezone: IANA timezone или пустая строка. "
-        "Если пользователь явно сказал 'идея', 'добавь идею', 'точнее идею' — type=idea, "
-        "если нет явной даты/времени-напоминания. Если есть 'задача', 'напомни' или время — type=task/reminder. "
-        "Исправляй падежи для title: 'молока' -> 'молоко', 'хлеба' -> 'хлеб', 'яиц' -> 'яйца'. "
-        "Для списков покупок делай title вроде 'Купить молоко и хлеб' или 'Купить молоко, хлеб и яйца'. "
+        "timezone: IANA timezone или пустая строка; "
+        "confidence: число 0.0-1.0; "
+        "time_confidence: число 0.0-1.0; "
+        "needs_time_clarification: true или false; "
+        "clarification_reason: короткая причина или пустая строка. "
+        "Если пользователь говорит 'это не задача, просто мысль' — type=idea. "
+        "Если говорит 'запиши идею', 'мысль', 'надо бы подумать' без конкретного действия — type=idea. "
+        "Если говорит 'сделай задачу', 'надо проверить', 'нужно сделать' — type=task. "
+        "Если говорит 'напомни', 'поставь напоминание' или явно указывает дату/время для уведомления — type=reminder. "
+        "Если есть дата/время, вычисли due_date/due_time; 'вечером в десять' значит 22:00, не 10:00. "
         "Если сказано 'сегодня/завтра/послезавтра', вычисли due_date. "
         "Если есть время, но нет даты, выбери ближайшую будущую дату в указанном timezone. "
         "Если timezone не указан, используй default_timezone. "
+        "Если для reminder нет точной даты или времени, либо время неоднозначное, выставь needs_time_clarification=true "
+        "и time_confidence ниже 0.75. "
+        "Слова EVOQ, Vosk, OpenAI, Railway, Telegram, GitHub сохраняй корректно в title/body. "
         f"Сегодня: {now.date().isoformat()}. Текущее время: {now.strftime('%H:%M')}. "
         f"default_timezone: {default_timezone}."
     )
     try:
         response = await _async_call(
             _openai_client.chat.completions.create,
-            model="gpt-4o-mini",
+            model=OPENAI_PARSE_MODEL,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": text},
@@ -387,11 +427,19 @@ async def parse_capture_with_gpt(text: str, default_timezone: str):
         due_date = _compact_spaces(data.get("due_date") or "")
         due_time = _compact_spaces(data.get("due_time") or "")
         timezone = _compact_spaces(data.get("timezone") or "")
+        confidence = _coerce_confidence(data.get("confidence"), 0.8)
+        time_confidence = _coerce_confidence(data.get("time_confidence"), 0.0 if capture_type == "reminder" else 1.0)
+        needs_time_clarification = bool(data.get("needs_time_clarification", False))
+        clarification_reason = _compact_spaces(data.get("clarification_reason") or "")
 
         if not title:
             return None
         if due_time and not re.match(r"^\d{2}:\d{2}$", due_time):
             due_time = extract_capture_due_time(due_time)
+        rule_due_time = extract_capture_due_time(text)
+        if rule_due_time and (not due_time or _has_explicit_daypart(text)):
+            due_time = rule_due_time
+            time_confidence = max(time_confidence, _rule_time_confidence(text, rule_due_time))
         if due_date and not re.match(r"^\d{4}-\d{2}-\d{2}$", due_date):
             due_date = ""
         if timezone:
@@ -407,6 +455,10 @@ async def parse_capture_with_gpt(text: str, default_timezone: str):
             "due_date": due_date,
             "due_time": due_time,
             "timezone": timezone,
+            "confidence": confidence,
+            "time_confidence": time_confidence,
+            "needs_time_clarification": needs_time_clarification,
+            "clarification_reason": clarification_reason,
             "source": "gpt",
         }
     except Exception:
@@ -483,9 +535,12 @@ CAPTURE_INTENT_WORDS = (
     "сделай задачу", "запиши задачу", "добавь задачу", "поставь напоминание",
 )
 IDEA_INTENT_PATTERNS = (
+    r"\b(это\s+)?не\s+задача\b.*\b(мысль|иде[яю])\b",
     r"\b(добавь|запиши|сохрани|создай)\s+(мне\s+)?иде[яю]\b",
+    r"\b(запиши|сохрани)\s+(мысль|заметку)\b",
+    r"\bнадо\s+бы\s+подумать\b",
     r"\b(точнее|вернее|нет)\s*,?\s*иде[яю]\b",
-    r"\bиде[яю]\b",
+    r"\b(иде[яю]|мысль)\b",
     r"^\s*идея\s*[:\-—]",
 )
 DATE_TIME_WORDS = (
@@ -494,7 +549,7 @@ DATE_TIME_WORDS = (
 )
 ACTION_WORDS = (
     "купить", "сделать", "позвонить", "написать", "проверить", "отправить",
-    "созвониться", "встретиться", "подготовить", "разобрать", "найти",
+    "созвониться", "встретиться", "подготовить", "разобрать", "найти", "понять",
 )
 TITLE_WORD_NORMALIZATIONS = {
     "молока": "молоко",
@@ -507,6 +562,30 @@ TITLE_WORD_NORMALIZATIONS = {
 
 def _compact_spaces(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def _coerce_confidence(value, default: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(0.0, min(1.0, number))
+
+
+def _has_explicit_daypart(text: str) -> bool:
+    low = (text or "").lower().replace("ё", "е")
+    return bool(re.search(r"\b(утра|утром|дня|днем|вечера|вечером|ночи|ночью)\b", low))
+
+
+def _rule_time_confidence(text: str, due_time: str = "") -> float:
+    low = (text or "").lower().replace("ё", "е")
+    if re.search(r"\b\d{1,2}[:.]\d{2}\b", low):
+        return 0.95
+    if _has_explicit_daypart(low):
+        return 0.9
+    if due_time:
+        return 0.6
+    return 0.0
 
 
 def _today_in_timezone(tz_name: str) -> datetime:
@@ -535,13 +614,13 @@ def effective_user_timezone(user_id: int) -> str:
 def normalize_capture_command_text(text: str) -> str:
     text = _compact_spaces(text).strip(" .,!?:;")
     text = re.sub(
-        r"^(привет|слушай|так|короче)\s*,?\s*(чат|бот|ботик|ассистент)?\s*,?\s*",
+        r"^(привет|слушай|так|короче|ну|типа)\s*,?\s*(чат|бот|ботик|ассистент)?\s*,?\s*",
         "",
         text,
         flags=re.IGNORECASE,
     )
     text = re.sub(r"^(чат|бот|ботик|ассистент)\s*,?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\b(пожалуйста|плиз)\b", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(пожалуйста|плиз|ну|типа)\b", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\b(точнее|вернее)\s*,?\s*(задачу|иде[яю])\b", r" \2 ", text, flags=re.IGNORECASE)
     return _compact_spaces(text).strip(" .,!?:;")
 
@@ -592,6 +671,29 @@ def _parse_ru_number_words(words: list[str]) -> int | None:
     return total
 
 
+def _infer_daypart(text: str) -> str:
+    low = (text or "").lower().replace("ё", "е")
+    if re.search(r"\b(вечера|вечером)\b", low):
+        return "вечера"
+    if re.search(r"\b(дня|днем)\b", low):
+        return "дня"
+    if re.search(r"\b(утра|утром)\b", low):
+        return "утра"
+    if re.search(r"\b(ночи|ночью)\b", low):
+        return "ночи"
+    return ""
+
+
+def _apply_daypart_to_hour(hour: int, part: str) -> int:
+    if part == "вечера" and hour < 12:
+        return hour + 12
+    if part == "дня" and 1 <= hour < 12:
+        return hour + 12
+    if part == "ночи" and hour == 12:
+        return 0
+    return hour
+
+
 def _title_from_action_phrase(text: str) -> str:
     low = text.lower().replace("ё", "е")
     matches = []
@@ -640,10 +742,7 @@ def extract_capture_due_time(text: str) -> str:
     if m:
         hour = int(m.group(1))
         part = m.group(2)
-        if part in {"вечера", "дня"} and hour < 12:
-            hour += 12
-        if part == "ночи" and hour == 12:
-            hour = 0
+        hour = _apply_daypart_to_hour(hour, part)
         return f"{hour:02d}:00"
 
     hour_words = "|".join(RUSSIAN_HOURS)
@@ -654,10 +753,7 @@ def extract_capture_due_time(text: str) -> str:
     if m:
         hour = RUSSIAN_HOURS[m.group(1)]
         part = m.group(2)
-        if part in {"вечера", "дня"} and hour < 12:
-            hour += 12
-        if part == "ночи" and hour == 12:
-            hour = 0
+        hour = _apply_daypart_to_hour(hour, part)
         return f"{hour:02d}:00"
 
     number_word = "|".join(sorted(RUSSIAN_NUMBER_WORDS, key=len, reverse=True))
@@ -666,24 +762,20 @@ def extract_capture_due_time(text: str) -> str:
         low,
     ):
         words = m.group(1).split()
-        part = m.group(2) or ""
+        part = m.group(2) or _infer_daypart(low)
         for split_at in range(len(words), 0, -1):
             hour = _parse_ru_number_words(words[:split_at])
             minute = _parse_ru_number_words(words[split_at:]) if split_at < len(words) else 0
             if hour is None or minute is None:
                 continue
             if 0 <= hour <= 23 and 0 <= minute <= 59:
-                if part in {"вечера", "дня"} and hour < 12:
-                    hour += 12
-                if part == "ночи" and hour == 12:
-                    hour = 0
+                hour = _apply_daypart_to_hour(hour, part)
                 return f"{hour:02d}:{minute:02d}"
 
     m = re.search(r"\b(?:к|на|в)\s+([01]?\d|2[0-3])\s*(?:час(?:ов|а)?|ч)?\b", low)
     if m:
         hour = int(m.group(1))
-        if "вечер" in low and hour < 12:
-            hour += 12
+        hour = _apply_daypart_to_hour(hour, _infer_daypart(low))
         return f"{hour:02d}:00"
 
     return ""
@@ -729,7 +821,9 @@ def classify_capture_text(text: str) -> dict:
     has_date_time = due_time or any(word in low for word in DATE_TIME_WORDS) or bool(re.search(r"\b[кнв]\s+\d", low))
     has_action = any(re.search(rf"\b{word}\b", low) for word in ACTION_WORDS)
 
-    if has_idea_intent and not has_date_time:
+    if re.search(r"\b(это\s+)?не\s+задача\b.*\b(мысль|иде[яю])\b", low):
+        capture_type = "idea"
+    elif has_idea_intent and not has_date_time:
         capture_type = "idea"
     elif has_intent or has_date_time:
         capture_type = "reminder" if "напом" in low else "task"
@@ -737,6 +831,12 @@ def classify_capture_text(text: str) -> dict:
         capture_type = "task"
     else:
         capture_type = "idea"
+
+    time_confidence = _rule_time_confidence(normalized, due_time)
+    needs_time_clarification = (
+        capture_type == "reminder"
+        and (not due_time or time_confidence < 0.75)
+    )
 
     return {
         "type": capture_type,
@@ -746,6 +846,10 @@ def classify_capture_text(text: str) -> dict:
         "due_time": due_time,
         "due_date_hint": "послезавтра" if "послезавтра" in low else "завтра" if "завтра" in low else "сегодня" if "сегодня" in low else "",
         "timezone": timezone,
+        "confidence": 0.75,
+        "time_confidence": time_confidence,
+        "needs_time_clarification": needs_time_clarification,
+        "clarification_reason": "не хватает точного времени" if needs_time_clarification else "",
         "source": "rules",
     }
 
@@ -765,6 +869,16 @@ async def classify_capture(update: Update, text: str, forced_type: str | None = 
     timezone = capture.get("timezone") or default_timezone
     due_time = capture.get("due_time", "")
     due_date = capture.get("due_date", "")
+    if not due_time:
+        rule_due_time = extract_capture_due_time(text)
+        if rule_due_time:
+            due_time = rule_due_time
+            capture["time_confidence"] = max(
+                _coerce_confidence(capture.get("time_confidence"), 0.0),
+                _rule_time_confidence(text, due_time),
+            )
+    if not due_date:
+        due_date = extract_capture_due_date(capture.get("body") or text, timezone)
     if due_time and not due_date:
         due_date = resolve_capture_due_date(capture.get("body") or text, timezone, due_time)
 
@@ -773,6 +887,23 @@ async def classify_capture(update: Update, text: str, forced_type: str | None = 
     capture["due_time"] = due_time
     capture["body"] = capture.get("body") or text
     capture["title"] = _compact_spaces(capture.get("title") or generate_capture_title(text, capture["type"]))
+    capture["confidence"] = _coerce_confidence(capture.get("confidence"), 0.75)
+    capture["time_confidence"] = _coerce_confidence(capture.get("time_confidence"), _rule_time_confidence(text, due_time))
+    capture["needs_time_clarification"] = bool(capture.get("needs_time_clarification", False))
+    if capture["type"] == "reminder":
+        missing = []
+        if not due_date:
+            missing.append("даты")
+        if not due_time:
+            missing.append("времени")
+        if missing:
+            capture["needs_time_clarification"] = True
+            capture["clarification_reason"] = "не хватает " + " и ".join(missing)
+        elif capture["time_confidence"] < 0.75:
+            capture["needs_time_clarification"] = True
+            capture["clarification_reason"] = capture.get("clarification_reason") or "время распознано неоднозначно"
+    else:
+        capture["needs_time_clarification"] = False
     return capture
 
 
@@ -911,7 +1042,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _openai_client:
-        voice_status = "включён (OpenAI Whisper) — можно наговорить идею или задачу голосом"
+        voice_status = f"включён (OpenAI {OPENAI_TRANSCRIBE_MODEL}) — можно наговорить идею, задачу или напоминание голосом"
     elif _vosk_available():
         voice_status = "включён (Vosk, оффлайн) — можно наговорить идею или задачу голосом"
     else:
@@ -934,9 +1065,10 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def voice_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if _openai_client:
         text = (
-            "🎤 <b>Голосовой ввод включён (OpenAI Whisper).</b>\n\n"
+            f"🎤 <b>Голосовой ввод включён (OpenAI: {html.escape(OPENAI_TRANSCRIBE_MODEL)}).</b>\n\n"
+            f"🧠 Парсинг смысла: <b>{html.escape(OPENAI_PARSE_MODEL)}</b>.\n\n"
             "Просто запиши голосовое прямо в чате:\n"
-            "• Вне диалогов — создастся идея (GPT сам разобьёт на название и описание).\n"
+            "• Вне диалогов — бот поймёт, это идея, задача или напоминание.\n"
             f"• В режиме «{BTN_ADD_TASK}» — текст голоса сохранится как задача.\n"
             f"• На шагах «{BTN_ADD}» (название/описание) — текст голоса подставится в шаг."
         )
@@ -949,16 +1081,17 @@ async def voice_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"• На шагах «{BTN_ADD}» — голос подставится в текущий шаг.\n"
             "• Вне диалогов голос создаст идею (название = первая фраза, описание = весь текст).\n\n"
             "Если хочешь лучшее качество — добавь <code>OPENAI_API_KEY</code> в Railway Variables, "
-            "и бот автоматически переключится на Whisper."
+            f"и бот автоматически переключится на OpenAI ({html.escape(OPENAI_TRANSCRIBE_MODEL)})."
         )
     else:
         text = (
             "🎤 <b>Голосовой ввод выключен.</b>\n\n"
             "Доступно два варианта:\n\n"
-            "<b>1. OpenAI Whisper (рекомендуется, платно но дёшево):</b>\n"
+            "<b>1. OpenAI STT (рекомендуется, платно но дёшево):</b>\n"
             "• https://platform.openai.com → Billing → пополни $5.\n"
             "• API keys → Create new secret key.\n"
-            "• Railway → Variables → добавь <code>OPENAI_API_KEY</code>.\n\n"
+            "• Railway → Variables → добавь <code>OPENAI_API_KEY</code>, "
+            "<code>OPENAI_TRANSCRIBE_MODEL</code> и <code>OPENAI_PARSE_MODEL</code>.\n\n"
             "<b>2. Vosk (бесплатно, оффлайн, качество ниже):</b>\n"
             "• Установи пакет vosk (он уже в requirements.txt).\n"
             "• На сервере нужен ffmpeg (nixpacks.toml в репо уже его ставит).\n"
@@ -1347,6 +1480,19 @@ def task_keyboard(task_id: int, done: bool) -> InlineKeyboardMarkup:
     ])
 
 
+def post_task_save_keyboard(task_id: int, include_add: bool = True) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("✅ Сделано", callback_data=f"task_done:{task_id}")]]
+    if include_add:
+        rows.append([
+            InlineKeyboardButton("➕ Ещё задача", callback_data="menu:add_task"),
+            InlineKeyboardButton("📋 Все задачи", callback_data="menu:list_tasks"),
+        ])
+    else:
+        rows.append([InlineKeyboardButton("📋 Все задачи", callback_data="menu:list_tasks")])
+    rows.append([InlineKeyboardButton("🗑 Удалить эту", callback_data=f"task_del:{task_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
 async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     tasks = db.get_user_tasks(user_id)
@@ -1415,14 +1561,7 @@ async def _handle_task_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     )
     await update.message.reply_text(
         "Что дальше?",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Сделано", callback_data=f"task_done:{task_id}")],
-            [
-                InlineKeyboardButton("➕ Ещё задача", callback_data="menu:add_task"),
-                InlineKeyboardButton("📋 Все задачи", callback_data="menu:list_tasks"),
-            ],
-            [InlineKeyboardButton("🗑 Удалить эту", callback_data=f"task_del:{task_id}")],
-        ]),
+        reply_markup=post_task_save_keyboard(task_id),
     )
     return ConversationHandler.END
 
@@ -1439,6 +1578,150 @@ async def task_add_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --- Голос вне диалога: классифицируем в идею / задачу / напоминание ---
+
+def _needs_reminder_time_clarification(capture: dict) -> bool:
+    return (
+        capture.get("type") == "reminder"
+        and (
+            not capture.get("due_date")
+            or not capture.get("due_time")
+            or _coerce_confidence(capture.get("time_confidence"), 0.0) < 0.75
+            or bool(capture.get("needs_time_clarification"))
+        )
+    )
+
+
+def _clarify_time_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Сохранить без времени", callback_data="clarify_save_without_time")],
+        [InlineKeyboardButton("Отмена", callback_data="clarify_cancel")],
+    ])
+
+
+async def _ask_reminder_time_clarification(update: Update, context: ContextTypes.DEFAULT_TYPE, with_buttons: bool = False):
+    reply_markup = _clarify_time_keyboard() if with_buttons else cancel_keyboard()
+    await update.message.reply_text(
+        "Не понял, на какое время поставить напоминание.\n"
+        "Запиши коротко только дату и время, например: «сегодня в 22:00» или «завтра в 10 утра».",
+        reply_markup=reply_markup,
+    )
+
+
+def _log_voice_capture(raw_text: str, capture: dict, speech_engine: str):
+    logger.info(
+        "voice_capture raw_transcript=%r type=%s title=%r body=%r due_date=%s due_time=%s timezone=%s "
+        "source=%s speech_engine=%s confidence=%.2f time_confidence=%.2f needs_time_clarification=%s",
+        raw_text,
+        capture.get("type", ""),
+        capture.get("title", ""),
+        capture.get("body", ""),
+        capture.get("due_date", ""),
+        capture.get("due_time", ""),
+        capture.get("timezone", ""),
+        capture.get("source", ""),
+        speech_engine,
+        _coerce_confidence(capture.get("confidence"), 0.0),
+        _coerce_confidence(capture.get("time_confidence"), 0.0),
+        bool(capture.get("needs_time_clarification")),
+    )
+
+
+def _create_task_from_capture(user_id: int, capture: dict) -> int:
+    title = capture["title"]
+    return db.add_task(
+        user_id,
+        title,
+        title=title,
+        body=capture.get("body") or title,
+        due_date=capture.get("due_date", ""),
+        due_time=capture.get("due_time", ""),
+        timezone=capture.get("timezone", ""),
+    )
+
+
+async def _send_created_task(update: Update, capture: dict, task_id: int, recognized_text: str = "", reminder: bool = False):
+    title = capture["title"]
+    due_date = capture.get("due_date", "")
+    due_time = capture.get("due_time", "")
+    timezone = capture.get("timezone", "")
+    response = "🔔 Напоминание создано" if reminder else "✅ Задача создана"
+    await update.message.reply_html(
+        f"{response}\n\n{task_message(title, False, capture.get('body') or title, due_date, due_time, timezone)}"
+        f"{recognized_voice_message(recognized_text)}",
+        reply_markup=main_menu_keyboard(),
+    )
+    await update.message.reply_text(
+        "Что дальше?",
+        reply_markup=post_task_save_keyboard(task_id, include_add=not reminder),
+    )
+
+
+async def _extract_clarified_due(update: Update, text: str, pending: dict) -> dict:
+    user_id = update.effective_user.id
+    default_timezone = effective_user_timezone(user_id)
+    parsed = await parse_capture_with_gpt(text, default_timezone)
+    timezone = (parsed or {}).get("timezone") or pending.get("timezone") or default_timezone
+    due_time = (parsed or {}).get("due_time") or extract_capture_due_time(text)
+    due_date = (parsed or {}).get("due_date") or extract_capture_due_date(text, timezone)
+    if due_time and not due_date:
+        due_date = resolve_capture_due_date(text, timezone, due_time)
+
+    time_confidence = _coerce_confidence(
+        (parsed or {}).get("time_confidence"),
+        _rule_time_confidence(text, due_time),
+    )
+    needs_clarification = not due_date or not due_time or time_confidence < 0.75 or bool(
+        (parsed or {}).get("needs_time_clarification", False)
+    )
+    return {
+        "due_date": due_date,
+        "due_time": due_time,
+        "timezone": timezone,
+        "time_confidence": time_confidence,
+        "needs_time_clarification": needs_clarification,
+        "source": (parsed or {}).get("source", "rules"),
+    }
+
+
+async def _finish_pending_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE, due: dict | None = None, without_time: bool = False):
+    message = update.message or (update.callback_query.message if update.callback_query else None)
+    pending = context.user_data.get("pending_reminder_capture")
+    if not pending:
+        if message:
+            await message.reply_text("Не нашёл черновик напоминания. Попробуй создать его заново.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    user_id = update.effective_user.id
+    db.upsert_user(user_id)
+    capture = dict(pending)
+    if due:
+        capture.update({
+            "due_date": due.get("due_date", ""),
+            "due_time": due.get("due_time", ""),
+            "timezone": due.get("timezone") or capture.get("timezone") or effective_user_timezone(user_id),
+            "time_confidence": due.get("time_confidence", 1.0),
+            "needs_time_clarification": False,
+        })
+    elif without_time:
+        capture.update({"due_date": "", "due_time": "", "needs_time_clarification": False})
+
+    task_id = _create_task_from_capture(user_id, capture)
+    context.user_data.pop("pending_reminder_capture", None)
+    context.user_data.pop("pending_reminder_attempts", None)
+
+    if without_time:
+        await message.reply_html(
+            f"✅ Сохранено без времени\n\n{task_message(capture['title'], False, capture.get('body') or capture['title'])}",
+            reply_markup=main_menu_keyboard(),
+        )
+        await message.reply_text(
+            "Что дальше?",
+            reply_markup=post_task_save_keyboard(task_id, include_add=False),
+        )
+    else:
+        await _send_created_task(update, capture, task_id, reminder=True)
+    return ConversationHandler.END
+
 
 async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not voice_available():
@@ -1458,39 +1741,19 @@ async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     capture = await classify_capture(update, text)
     capture_type = capture["type"]
+    speech_engine = context.user_data.pop("_last_speech_engine", "")
+    _log_voice_capture(text, capture, speech_engine)
+
+    if _needs_reminder_time_clarification(capture):
+        context.user_data["pending_reminder_capture"] = capture
+        context.user_data["pending_reminder_attempts"] = 0
+        await _ask_reminder_time_clarification(update, context)
+        return CLARIFY_REMINDER_TIME
 
     if capture_type in {"task", "reminder"}:
-        title = capture["title"]
-        due_time = capture.get("due_time", "")
-        timezone = capture.get("timezone") or effective_user_timezone(user_id)
-        due_date = capture.get("due_date", "")
-        task_id = db.add_task(
-            user_id,
-            title,
-            title=title,
-            body=capture["body"],
-            due_date=due_date,
-            due_time=due_time,
-            timezone=timezone,
-        )
-        response = "🔔 Напоминание создано" if capture_type == "reminder" else "✅ Задача создана"
-        await update.message.reply_html(
-            f"{response}\n\n{task_message(title, False, capture['body'], due_date, due_time, timezone)}"
-            f"{recognized_voice_message(capture['body'])}",
-            reply_markup=main_menu_keyboard(),
-        )
-        await update.message.reply_text(
-            "Что дальше?",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Сделано", callback_data=f"task_done:{task_id}")],
-                [
-                    InlineKeyboardButton("➕ Ещё задача", callback_data="menu:add_task"),
-                    InlineKeyboardButton("📋 Все задачи", callback_data="menu:list_tasks"),
-                ],
-                [InlineKeyboardButton("🗑 Удалить эту", callback_data=f"task_del:{task_id}")],
-            ]),
-        )
-        return
+        task_id = _create_task_from_capture(user_id, capture)
+        await _send_created_task(update, capture, task_id, recognized_text=text, reminder=capture_type == "reminder")
+        return ConversationHandler.END
 
     brief = capture["title"]
     details = capture["body"]
@@ -1517,6 +1780,69 @@ async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Что дальше?",
         reply_markup=post_save_keyboard(idea_id),
     )
+    return ConversationHandler.END
+
+
+async def text_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text:
+        return ConversationHandler.END
+
+    user_id = update.effective_user.id
+    db.upsert_user(user_id)
+
+    capture = await classify_capture(update, text)
+    capture_type = capture["type"]
+    logger.info(
+        "text_capture raw_text=%r type=%s title=%r body=%r due_date=%s due_time=%s timezone=%s source=%s confidence=%.2f time_confidence=%.2f needs_time_clarification=%s",
+        text,
+        capture.get("type", ""),
+        capture.get("title", ""),
+        capture.get("body", ""),
+        capture.get("due_date", ""),
+        capture.get("due_time", ""),
+        capture.get("timezone", ""),
+        capture.get("source", ""),
+        _coerce_confidence(capture.get("confidence"), 0.0),
+        _coerce_confidence(capture.get("time_confidence"), 0.0),
+        bool(capture.get("needs_time_clarification")),
+    )
+
+    if _needs_reminder_time_clarification(capture):
+        context.user_data["pending_reminder_capture"] = capture
+        context.user_data["pending_reminder_attempts"] = 0
+        await _ask_reminder_time_clarification(update, context)
+        return CLARIFY_REMINDER_TIME
+
+    if capture_type in {"task", "reminder"}:
+        task_id = _create_task_from_capture(user_id, capture)
+        await _send_created_task(update, capture, task_id, reminder=capture_type == "reminder")
+        return ConversationHandler.END
+
+    brief = capture["title"]
+    details = capture["body"]
+    if _openai_client and capture.get("source") != "gpt":
+        parsed = await parse_idea_with_gpt(text)
+        if parsed:
+            brief, details = parsed
+
+    if not brief:
+        first = text.split(".")[0].strip() or text
+        brief = first[:120]
+        details = text
+
+    idea_id = db.add_idea(user_id, brief, details)
+    schedule_user_reminders(context.application, user_id)
+
+    await update.message.reply_html(
+        f"✅ Идея сохранена\n\n{full_message(brief, details)}",
+        reply_markup=main_menu_keyboard(),
+    )
+    await update.message.reply_text(
+        "Что дальше?",
+        reply_markup=post_save_keyboard(idea_id),
+    )
+    return ConversationHandler.END
 
 
 async def _transcribe_or_warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1534,7 +1860,7 @@ async def _transcribe_or_warn(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     try:
         file = await voice.get_file()
-        text = await transcribe_voice(file)
+        result = await transcribe_voice(file)
     except Exception:
         logger.exception("Не удалось распознать голосовое")
         await update.message.reply_text(
@@ -1543,6 +1869,14 @@ async def _transcribe_or_warn(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return None
 
+    if isinstance(result, dict):
+        text = result.get("text")
+        speech_engine = result.get("engine", "")
+    else:
+        text = result
+        speech_engine = ""
+    context.user_data["_last_speech_engine"] = speech_engine
+
     if not text:
         await update.message.reply_text(
             "Голос распознался как пустой. Попробуй ещё раз или введи текстом.",
@@ -1550,7 +1884,65 @@ async def _transcribe_or_warn(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return None
 
+    logger.info("voice_transcribed raw_transcript=%r speech_engine=%s", text, speech_engine)
     return text
+
+
+async def _handle_clarified_time_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    text = (text or "").strip()
+    if not text:
+        await _ask_reminder_time_clarification(update, context)
+        return CLARIFY_REMINDER_TIME
+
+    pending = context.user_data.get("pending_reminder_capture")
+    if not pending:
+        await update.message.reply_text("Черновик напоминания потерялся. Попробуй создать его заново.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    due = await _extract_clarified_due(update, text, pending)
+    logger.info(
+        "reminder_time_clarification raw_text=%r due_date=%s due_time=%s timezone=%s source=%s time_confidence=%.2f needs_time_clarification=%s",
+        text,
+        due.get("due_date", ""),
+        due.get("due_time", ""),
+        due.get("timezone", ""),
+        due.get("source", ""),
+        due.get("time_confidence", 0.0),
+        due.get("needs_time_clarification", False),
+    )
+    if not due["needs_time_clarification"]:
+        return await _finish_pending_reminder(update, context, due=due)
+
+    attempts = int(context.user_data.get("pending_reminder_attempts", 0)) + 1
+    context.user_data["pending_reminder_attempts"] = attempts
+    await _ask_reminder_time_clarification(update, context, with_buttons=attempts >= 1)
+    return CLARIFY_REMINDER_TIME
+
+
+async def clarify_reminder_time_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await _handle_clarified_time_text(update, context, update.message.text)
+
+
+async def clarify_reminder_time_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = await _transcribe_or_warn(update, context)
+    if text is None:
+        return CLARIFY_REMINDER_TIME
+    speech_engine = context.user_data.pop("_last_speech_engine", "")
+    logger.info("reminder_time_clarification_voice raw_transcript=%r speech_engine=%s", text, speech_engine)
+    return await _handle_clarified_time_text(update, context, text)
+
+
+async def clarify_reminder_time_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "clarify_cancel":
+        context.user_data.pop("pending_reminder_capture", None)
+        context.user_data.pop("pending_reminder_attempts", None)
+        await query.message.reply_text("❌ Отменено.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+    if query.data == "clarify_save_without_time":
+        return await _finish_pending_reminder(update, context, without_time=True)
+    return CLARIFY_REMINDER_TIME
 
 
 # --- Inline-кнопки (общий обработчик) ---
@@ -1829,6 +2221,31 @@ def main():
         allow_reentry=True,
     )
 
+    capture_conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.VOICE | filters.AUDIO, voice_top_level),
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND & ~filters.Regex(MENU_BUTTON_PATTERN),
+                text_top_level,
+            ),
+        ],
+        states={
+            CLARIFY_REMINDER_TIME: [
+                CallbackQueryHandler(clarify_reminder_time_callback, pattern="^clarify_(save_without_time|cancel)$"),
+                MessageHandler(filters.VOICE | filters.AUDIO, clarify_reminder_time_voice),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{BTN_CANCEL}$"),
+                    clarify_reminder_time_text,
+                ),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex(f"^{BTN_CANCEL}$"), cancel),
+        ],
+        allow_reentry=True,
+    )
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", show_help))
     application.add_handler(CommandHandler("list", list_ideas))
@@ -1841,6 +2258,7 @@ def main():
     application.add_handler(add_conv)
     application.add_handler(task_conv)
     application.add_handler(add_reminder_conv)
+    application.add_handler(capture_conv)
 
     # Кнопки главного меню (вне диалогов)
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_LIST}$"), list_ideas))
@@ -1848,9 +2266,6 @@ def main():
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_TEST}$"), test_reminder))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_HELP}$"), show_help))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_REMINDERS}$"), reminders_show))
-
-    # Голосовые вне диалогов — классифицируем в идею / задачу / напоминание.
-    application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, voice_top_level))
 
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_error_handler(error_handler)

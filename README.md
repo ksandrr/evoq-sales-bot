@@ -1,71 +1,125 @@
 # evoq-sales-bot
 
-Телеграм‑бот для записи идей с ежедневными напоминаниями.
-Каждая идея состоит из краткого описания и подробного. По напоминанию
-бот присылает краткую версию, а кнопкой «Подробнее» можно развернуть
-полное описание.
+Telegram-бот для быстрых идей, задач и напоминаний. Можно писать текстом или надиктовывать голосом: бот распознаёт речь, чистит лишние вводные, определяет тип записи и сохраняет результат в SQLite.
 
 ## Возможности
 
-- Главное меню — кнопками внизу чата (не нужно вводить команды).
-- **➕ Добавить идею** — пошагово введи краткое название и подробное описание.
-- **📚 Мои идеи** — список всех идей. У каждой кнопка «📖 Подробнее» и «🗑 Удалить».
-- **⏰ Время напоминаний** — задать своё время (UTC, по умолчанию 10:00).
-- **🔔 Тест напоминания** — посмотреть, как выглядит ежедневное уведомление.
-- 🎤 **Голосовые сообщения** — если задан `OPENAI_API_KEY`, можно надиктовать
-  идею целиком (бот сам выделит название и описание через Whisper + GPT-4o-mini).
-- Ежедневные напоминания приходят автоматически в указанное время:
-  бот пишет «🌅 Напоминаю про твои идеи (N):» и затем шлёт каждую идею
-  отдельным сообщением с кнопкой «📖 Подробнее».
+- Идеи: короткое название и подробное описание.
+- Задачи: список дел с кнопками «сделано» и «удалить».
+- Напоминания по задачам: дата, время и часовой пояс.
+- Ежедневные напоминания по идеям.
+- Голосовой ввод через OpenAI STT, с Vosk как бесплатным fallback.
+- GPT-парсинг смысла: идея / задача / напоминание, нормальный title/body, дата и время.
 
-Также поддерживаются классические команды: `/add`, `/list`, `/settime`, `/test`, `/help`, `/cancel`.
+## Голосовой режим
 
-## Установка
+Рекомендованный режим — OpenAI. Он лучше понимает живую русскую речь, запинки и продуктовые слова вроде EVOQ, Vosk, OpenAI, Railway, Telegram, GitHub.
 
-1. Создай бота у [@BotFather](https://t.me/BotFather) и получи токен.
-2. Скопируй конфиг и положи туда токен:
+Переменные окружения:
+
+- `OPENAI_API_KEY` — задаётся только на сервере или в окружении. Не коммитьте ключ в репозиторий.
+- `OPENAI_TRANSCRIBE_MODEL` — модель распознавания речи. По умолчанию `gpt-4o-mini-transcribe`.
+- `OPENAI_PARSE_MODEL` — модель парсинга смысла. По умолчанию `gpt-4o-mini`.
+
+Допустимые STT-модели:
+
+- `gpt-4o-mini-transcribe` — дешевле, используется по умолчанию.
+- `gpt-4o-transcribe` — дороже, обычно лучше качество.
+- `whisper-1` — legacy/fallback.
+
+Если `OPENAI_API_KEY` не задан или OpenAI transcription упал, бот пробует Vosk. Vosk бесплатный и работает оффлайн, но качество заметно ниже, особенно на хаотичной живой речи.
+
+Команда `/voice` показывает текущий режим: OpenAI с выбранной моделью или Vosk.
+
+## Безопасность секретов
+
+- `.env` должен оставаться в `.gitignore`.
+- Не добавляйте значение `OPENAI_API_KEY` в README, `.env.example`, код, коммиты или логи.
+- На Railway/Linux/systemd задавайте ключ только через environment/secret manager.
+
+## Локальный запуск
+
+1. Создайте бота у [@BotFather](https://t.me/BotFather) и получите `BOT_TOKEN`.
+2. Создайте `.env` локально:
+
    ```bash
    cp .env.example .env
-   # отредактируй BOT_TOKEN в .env
    ```
-3. Поставь зависимости (нужен Python 3.10+):
+
+3. Заполните `BOT_TOKEN` в `.env`. OpenAI-ключ лучше задавать через окружение вашей машины или секреты сервера.
+4. Установите зависимости:
+
    ```bash
    python -m venv .venv
    source .venv/bin/activate
    pip install -r requirements.txt
    ```
-4. Запусти:
+
+5. Запустите:
+
    ```bash
    python bot.py
    ```
 
-Бот использует polling и хранит данные в локальном SQLite‑файле `ideas.db`.
+По умолчанию SQLite хранится в `ideas.db` рядом с `bot.py`. Для продакшена задайте `DB_PATH`.
 
-## Деплой на Railway (24/7 без своего ПК)
+## Railway
 
-[Railway](https://railway.app) разворачивает бота прямо из GitHub, есть
-бесплатный стартовый тариф (~500 часов/мес).
+Railway разворачивает сервис из GitHub. Стартовая команда — `python bot.py`.
 
-1. Зарегистрируйся на https://railway.app через GitHub.
-2. **New Project → Deploy from GitHub repo** → выбери `evoq-sales-bot`.
-3. Railway сам найдёт `requirements.txt`, `Procfile` и `railway.json` и
-   соберёт сервис. Стартовая команда — `python bot.py`.
-4. В разделе **Variables** добавь:
-   - `BOT_TOKEN` — токен от @BotFather
-   - `DB_PATH` — `/data/ideas.db`
-   - `OPENAI_API_KEY` *(опционально)* — для распознавания голосовых сообщений
-5. В разделе **Settings → Volumes** создай том и примонтируй его на
-   `/data` (иначе при каждом редеплое файл `ideas.db` будет пересоздан
-   и все идеи исчезнут).
-6. Нажми **Deploy**. Через минуту бот заработает — пиши ему в Telegram.
+Переменные Railway:
 
-При следующих изменениях в репозитории Railway автоматически пересоберёт
-и перезапустит сервис.
+- `BOT_TOKEN`
+- `DB_PATH=/data/ideas.db`
+- `OPENAI_API_KEY` через Variables/Secrets
+- `OPENAI_TRANSCRIBE_MODEL=gpt-4o-mini-transcribe`
+- `OPENAI_PARSE_MODEL=gpt-4o-mini`
+
+Создайте Volume и примонтируйте его в `/data`, иначе SQLite-файл будет пересоздаваться при деплоях.
+
+## Linux server
+
+Пример обновления существующего деплоя:
+
+```bash
+cd /path/to/evoq-sales-bot
+git fetch origin
+git checkout tembo/telegram-idea-bot-daily-reminders
+git pull --ff-only origin tembo/telegram-idea-bot-daily-reminders
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Добавьте переменные окружения в тот механизм, которым запущен бот: systemd `EnvironmentFile`, Docker secrets/env, screen/tmux wrapper или панель хостинга. Не храните секреты в Git.
+
+Для systemd после изменения env:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart evoq-sales-bot
+sudo journalctl -u evoq-sales-bot -n 100 -f
+```
+
+Если бот запущен в `screen`/`tmux`, остановите старый процесс и запустите `python bot.py` в активированном venv с нужными переменными окружения.
+
+## Проверки
+
+```bash
+python -m unittest discover -s tests
+python -m py_compile bot.py database.py
+```
+
+Ручные проверки в Telegram:
+
+- «это не задача, просто мысль, надо сделать быстрый режим записи идей» → idea.
+- «сделай задачу проверить логи Railway и понять какой движок используется» → task.
+- «напомни сегодня вечером в десять проверить список задач» → reminder на 22:00.
 
 ## Структура
 
-- `bot.py` — точка входа, хендлеры, расписание напоминаний (JobQueue)
-- `database.py` — обёртка над SQLite (путь берётся из `DB_PATH`)
-- `requirements.txt` — зависимости
-- `Procfile`, `railway.json`, `runtime.txt` — конфигурация для Railway
-- `.env.example` — пример конфигурации
+- `bot.py` — Telegram handlers, voice/STT, GPT/rules parsing, reminders.
+- `database.py` — SQLite wrapper and compatible migrations.
+- `requirements.txt` — Python dependencies.
+- `Procfile`, `railway.json`, `runtime.txt`, `nixpacks.toml` — Railway config.
+- `.env.example` — безопасный пример локальной конфигурации без секретов.
