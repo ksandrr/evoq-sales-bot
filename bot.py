@@ -3,6 +3,7 @@ import json
 import html
 import logging
 import re
+import shutil
 import subprocess
 import tempfile
 import urllib.request
@@ -50,7 +51,7 @@ class SecretRedactionFilter(logging.Filter):
         message = record.getMessage()
         if BOT_TOKEN:
             message = message.replace(BOT_TOKEN, "<BOT_TOKEN_REDACTED>")
-        message = re.sub(r"sk-[A-Za-z0-9_-]+", "<OPENAI_KEY_REDACTED>", message)
+        message = re.sub(r"\bsk-(?:proj|live|test|svcacct|admin|org)-[A-Za-z0-9_-]+", "<OPENAI_KEY_REDACTED>", message)
         if message != record.getMessage():
             record.msg = message
             record.args = ()
@@ -83,6 +84,7 @@ VOSK_MODEL_URL = os.getenv(
 )
 _vosk_model = None
 _vosk_checked = False
+_openai_transcription_disabled = False
 
 
 def _vosk_model_dir() -> str:
@@ -98,7 +100,11 @@ def _download_vosk_model(target_dir: str):
     logger.info("Скачиваем Vosk модель: %s", VOSK_MODEL_URL)
     work_dir = tempfile.mkdtemp(prefix="vosk-dl-")
     zip_path = os.path.join(work_dir, "model.zip")
-    urllib.request.urlretrieve(VOSK_MODEL_URL, zip_path)
+    with urllib.request.urlopen(VOSK_MODEL_URL, timeout=60) as response:
+        with open(zip_path, "wb") as f:
+            shutil.copyfileobj(response, f)
+    if os.path.getsize(zip_path) < 1_000_000:
+        raise RuntimeError("Vosk model download is too small; likely a network/proxy error")
     with zipfile.ZipFile(zip_path) as z:
         z.extractall(work_dir)
     for name in os.listdir(work_dir):
@@ -258,6 +264,7 @@ def full_message(brief: str, details: str) -> str:
 # --- Голос: распознавание и парсинг ---
 
 async def transcribe_voice(voice_file):
+    global _openai_transcription_disabled
     if not voice_available():
         return None
 
@@ -266,7 +273,7 @@ async def transcribe_voice(voice_file):
     try:
         await voice_file.download_to_drive(tmp_path)
 
-        if _openai_client:
+        if _openai_client and not _openai_transcription_disabled:
             try:
                 with open(tmp_path, "rb") as f:
                     transcript = await _async_call(
@@ -287,8 +294,10 @@ async def transcribe_voice(voice_file):
                     engine = f"openai:{OPENAI_TRANSCRIBE_MODEL}"
                     logger.info("voice transcription engine=%s", engine)
                     return {"text": text, "engine": engine}
-            except Exception:
+            except Exception as exc:
                 logger.exception("OpenAI transcription failed; falling back to Vosk")
+                if "unsupported_country_region_territory" in str(exc):
+                    _openai_transcription_disabled = True
 
         text = await _async_call(_vosk_transcribe_file, tmp_path)
         text = (text or "").strip()
@@ -1877,7 +1886,17 @@ async def _transcribe_or_warn(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     try:
         file = await voice.get_file()
-        result = await transcribe_voice(file)
+        import asyncio
+
+        result = await asyncio.wait_for(transcribe_voice(file), timeout=90)
+    except TimeoutError:
+        logger.exception("Voice transcription timed out")
+        await update.message.reply_text(
+            "Голосовое не удалось распознать за разумное время. Сейчас OpenAI с сервера недоступен, "
+            "а Vosk fallback не успел сработать. Попробуй текстом, пожалуйста.",
+            reply_markup=cancel_keyboard(),
+        )
+        return None
     except Exception:
         logger.exception("Не удалось распознать голосовое")
         await update.message.reply_text(
