@@ -314,7 +314,8 @@ async def transcribe_voice(voice_file):
                     return {"text": text, "engine": engine}
             except Exception as exc:
                 logger.exception("OpenAI transcription failed; falling back to Vosk")
-                if "unsupported_country_region_territory" in str(exc):
+                exc_text = str(exc)
+                if "unsupported_country_region_territory" in exc_text:
                     _openai_transcription_disabled = True
                     _openai_transcription_disabled_reason = "openai_region_blocked"
                     if not _vosk_model_ready():
@@ -323,6 +324,14 @@ async def transcribe_voice(voice_file):
                             "engine": f"openai:{OPENAI_TRANSCRIBE_MODEL}",
                             "error": "openai_region_blocked",
                         }
+                elif not _vosk_model_ready():
+                    _openai_transcription_disabled = True
+                    _openai_transcription_disabled_reason = "openai_audio_unavailable"
+                    return {
+                        "text": "",
+                        "engine": f"openai:{OPENAI_TRANSCRIBE_MODEL}",
+                        "error": "openai_audio_unavailable",
+                    }
 
         text = await _async_call(_vosk_transcribe_file, tmp_path)
         text = (text or "").strip()
@@ -1541,6 +1550,13 @@ def transcription_error_text(error: str) -> str:
             "«регион не поддерживается», а локальная Vosk-модель не готова.\n\n"
             "Текстовые идеи, задачи и напоминания работают. Голос включим после рабочего proxy/VPN "
             "для api.openai.com или после ручной установки Vosk-модели."
+        )
+    if error == "openai_audio_unavailable":
+        return (
+            "Сейчас голос не распознаётся: custom OpenAI endpoint подключён, но audio transcription "
+            "у провайдера временно не проходит.\n\n"
+            "Текстовые идеи, задачи и напоминания работают. Голос включим, когда провайдер починит "
+            "audio endpoint или когда поставим локальную Vosk-модель."
         )
     if error == "transcription_timeout":
         return (
