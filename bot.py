@@ -1336,7 +1336,7 @@ async def add_brief_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def add_brief_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = await _transcribe_or_warn(update, context)
+    text = await _transcribe_or_warn(update, context, failure_reply_markup=main_menu_keyboard())
     if text is None:
         return BRIEF
     return await _handle_brief_text(update, context, text)
@@ -1921,11 +1921,12 @@ async def text_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-async def _transcribe_or_warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _transcribe_or_warn(update: Update, context: ContextTypes.DEFAULT_TYPE, failure_reply_markup=None):
+    failure_reply_markup = failure_reply_markup or cancel_keyboard()
     if not voice_available():
         await update.message.reply_text(
             "🎤 Голосовой ввод сейчас не настроен. Напиши текстом, пожалуйста.",
-            reply_markup=cancel_keyboard(),
+            reply_markup=failure_reply_markup,
         )
         return None
 
@@ -1941,14 +1942,14 @@ async def _transcribe_or_warn(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.exception("Voice transcription timed out")
         await update.message.reply_text(
             transcription_error_text("transcription_timeout"),
-            reply_markup=cancel_keyboard(),
+            reply_markup=failure_reply_markup,
         )
         return None
     except Exception:
         logger.exception("Не удалось распознать голосовое")
         await update.message.reply_text(
             "Не удалось распознать голосовое. Попробуй ещё раз или введи текстом.",
-            reply_markup=cancel_keyboard(),
+            reply_markup=failure_reply_markup,
         )
         return None
 
@@ -1966,7 +1967,7 @@ async def _transcribe_or_warn(update: Update, context: ContextTypes.DEFAULT_TYPE
         message = transcription_error_text(error) if error else "Голос распознался как пустой. Попробуй ещё раз или введи текстом."
         await update.message.reply_text(
             message,
-            reply_markup=cancel_keyboard(),
+            reply_markup=failure_reply_markup,
         )
         return None
 
