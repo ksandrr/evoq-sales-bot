@@ -36,6 +36,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "Asia/Omsk")
+OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL") or "").strip()
 OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
 OPENAI_PARSE_MODEL = os.getenv("OPENAI_PARSE_MODEL", "gpt-4o-mini")
 
@@ -68,9 +69,13 @@ if OPENAI_API_KEY:
     try:
         from openai import OpenAI
 
-        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        client_kwargs = {"api_key": OPENAI_API_KEY}
+        if OPENAI_BASE_URL:
+            client_kwargs["base_url"] = OPENAI_BASE_URL
+        _openai_client = OpenAI(**client_kwargs)
         logger.info(
-            "OpenAI клиент инициализирован — голосовые сообщения будут распознаваться через %s.",
+            "OpenAI клиент инициализирован — base_url=%s, голосовые сообщения будут распознаваться через %s.",
+            OPENAI_BASE_URL or "https://api.openai.com/v1",
             OPENAI_TRANSCRIBE_MODEL,
         )
     except ImportError:

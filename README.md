@@ -18,6 +18,7 @@ Telegram-бот для быстрых идей, задач и напоминан
 Переменные окружения:
 
 - `OPENAI_API_KEY` — задаётся только на сервере или в окружении. Не коммитьте ключ в репозиторий.
+- `OPENAI_BASE_URL` — custom endpoint провайдера. Если не задан, используется стандартный `https://api.openai.com/v1`.
 - `OPENAI_TRANSCRIBE_MODEL` — модель распознавания речи. По умолчанию `gpt-4o-mini-transcribe`.
 - `OPENAI_PARSE_MODEL` — модель парсинга смысла. По умолчанию `gpt-4o-mini`.
 
@@ -72,6 +73,7 @@ Railway разворачивает сервис из GitHub. Стартовая 
 - `BOT_TOKEN`
 - `DB_PATH=/data/ideas.db`
 - `OPENAI_API_KEY` через Variables/Secrets
+- `OPENAI_BASE_URL` при использовании custom endpoint
 - `OPENAI_TRANSCRIBE_MODEL=gpt-4o-mini-transcribe`
 - `OPENAI_PARSE_MODEL=gpt-4o-mini`
 
