@@ -1,4 +1,5 @@
 import os
+import asyncio
 import json
 import html
 import logging
@@ -85,6 +86,7 @@ VOSK_MODEL_URL = os.getenv(
 _vosk_model = None
 _vosk_checked = False
 _openai_transcription_disabled = False
+_openai_transcription_disabled_reason = ""
 
 
 def _vosk_model_dir() -> str:
@@ -94,6 +96,10 @@ def _vosk_model_dir() -> str:
     if os.path.isdir("/data"):
         return "/data/vosk-model"
     return "/tmp/vosk-model"
+
+
+def _vosk_model_ready() -> bool:
+    return os.path.isdir(_vosk_model_dir())
 
 
 def _download_vosk_model(target_dir: str):
@@ -264,7 +270,7 @@ def full_message(brief: str, details: str) -> str:
 # --- Голос: распознавание и парсинг ---
 
 async def transcribe_voice(voice_file):
-    global _openai_transcription_disabled
+    global _openai_transcription_disabled, _openai_transcription_disabled_reason
     if not voice_available():
         return None
 
@@ -272,6 +278,13 @@ async def transcribe_voice(voice_file):
         tmp_path = tmp.name
     try:
         await voice_file.download_to_drive(tmp_path)
+
+        if _openai_transcription_disabled and not _vosk_model_ready():
+            return {
+                "text": "",
+                "engine": f"openai:{OPENAI_TRANSCRIBE_MODEL}",
+                "error": _openai_transcription_disabled_reason or "openai_unavailable",
+            }
 
         if _openai_client and not _openai_transcription_disabled:
             try:
@@ -298,12 +311,25 @@ async def transcribe_voice(voice_file):
                 logger.exception("OpenAI transcription failed; falling back to Vosk")
                 if "unsupported_country_region_territory" in str(exc):
                     _openai_transcription_disabled = True
+                    _openai_transcription_disabled_reason = "openai_region_blocked"
+                    if not _vosk_model_ready():
+                        return {
+                            "text": "",
+                            "engine": f"openai:{OPENAI_TRANSCRIBE_MODEL}",
+                            "error": "openai_region_blocked",
+                        }
 
         text = await _async_call(_vosk_transcribe_file, tmp_path)
         text = (text or "").strip()
         if text:
             logger.info("voice transcription engine=vosk")
             return {"text": text, "engine": "vosk"}
+        if _openai_transcription_disabled:
+            return {
+                "text": "",
+                "engine": "vosk",
+                "error": _openai_transcription_disabled_reason or "stt_unavailable",
+            }
         return None
     finally:
         try:
@@ -1089,7 +1115,15 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def voice_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if _openai_client:
+    if _openai_client and _openai_transcription_disabled:
+        text = (
+            f"🎤 <b>Голосовой ввод настроен через OpenAI ({html.escape(OPENAI_TRANSCRIBE_MODEL)}), "
+            "но сейчас недоступен с этого сервера.</b>\n\n"
+            "OpenAI отвечает, что регион сервера не поддерживается. Текстовые идеи, задачи и напоминания работают.\n\n"
+            "Чтобы вернуть голос, нужен рабочий proxy/VPN для <code>api.openai.com</code> "
+            "или вручную установленная Vosk-модель."
+        )
+    elif _openai_client:
         text = (
             f"🎤 <b>Голосовой ввод включён (OpenAI: {html.escape(OPENAI_TRANSCRIBE_MODEL)}).</b>\n\n"
             f"🧠 Парсинг смысла: <b>{html.escape(OPENAI_PARSE_MODEL)}</b>.\n\n"
@@ -1495,6 +1529,22 @@ def recognized_voice_message(text: str) -> str:
     return f"\n\n<i>Распознано:</i> {html.escape(text)}" if text else ""
 
 
+def transcription_error_text(error: str) -> str:
+    if error == "openai_region_blocked":
+        return (
+            "Сейчас голос не распознаётся: OpenAI с этого сервера отвечает "
+            "«регион не поддерживается», а локальная Vosk-модель не готова.\n\n"
+            "Текстовые идеи, задачи и напоминания работают. Голос включим после рабочего proxy/VPN "
+            "для api.openai.com или после ручной установки Vosk-модели."
+        )
+    if error == "transcription_timeout":
+        return (
+            "Голосовое не удалось распознать за разумное время. "
+            "Текстовые идеи, задачи и напоминания сейчас работают."
+        )
+    return "Не удалось распознать голосовое. Попробуй текстом, пожалуйста."
+
+
 def task_keyboard(task_id: int, done: bool) -> InlineKeyboardMarkup:
     toggle_label = "↩️ Не сделано" if done else "✅ Сделано"
     toggle_action = "task_undone" if done else "task_done"
@@ -1886,14 +1936,11 @@ async def _transcribe_or_warn(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     try:
         file = await voice.get_file()
-        import asyncio
-
-        result = await asyncio.wait_for(transcribe_voice(file), timeout=90)
-    except TimeoutError:
+        result = await asyncio.wait_for(transcribe_voice(file), timeout=45)
+    except asyncio.TimeoutError:
         logger.exception("Voice transcription timed out")
         await update.message.reply_text(
-            "Голосовое не удалось распознать за разумное время. Сейчас OpenAI с сервера недоступен, "
-            "а Vosk fallback не успел сработать. Попробуй текстом, пожалуйста.",
+            transcription_error_text("transcription_timeout"),
             reply_markup=cancel_keyboard(),
         )
         return None
@@ -1908,14 +1955,17 @@ async def _transcribe_or_warn(update: Update, context: ContextTypes.DEFAULT_TYPE
     if isinstance(result, dict):
         text = result.get("text")
         speech_engine = result.get("engine", "")
+        error = result.get("error", "")
     else:
         text = result
         speech_engine = ""
+        error = ""
     context.user_data["_last_speech_engine"] = speech_engine
 
     if not text:
+        message = transcription_error_text(error) if error else "Голос распознался как пустой. Попробуй ещё раз или введи текстом."
         await update.message.reply_text(
-            "Голос распознался как пустой. Попробуй ещё раз или введи текстом.",
+            message,
             reply_markup=cancel_keyboard(),
         )
         return None
@@ -2188,6 +2238,7 @@ def main():
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
+        .concurrent_updates(True)
         .build()
     )
 
