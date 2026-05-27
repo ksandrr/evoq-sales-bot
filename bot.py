@@ -42,6 +42,23 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+class SecretRedactionFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if BOT_TOKEN:
+            message = message.replace(BOT_TOKEN, "<BOT_TOKEN_REDACTED>")
+        message = re.sub(r"sk-[A-Za-z0-9_-]+", "<OPENAI_KEY_REDACTED>", message)
+        if message != record.getMessage():
+            record.msg = message
+            record.args = ()
+        return True
+
+
+for handler in logging.getLogger().handlers:
+    handler.addFilter(SecretRedactionFilter())
 
 # OpenAI клиент (опционально — для голосовых)
 _openai_client = None
