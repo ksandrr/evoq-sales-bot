@@ -96,6 +96,23 @@ class CaptureTitleFallbackTests(unittest.TestCase):
         self.assertEqual(capture["title"], "Сходить")
         self.assertNotIn(",", capture["title"])
 
+    def test_future_iphone_idea_gets_meaningful_title(self):
+        capture = bot.classify_capture_text(
+            "Чат, запиши идею на... просто запиши идею, "
+            "что нужно купить iPhone в будущем. Запиши эту идею."
+        )
+
+        self.assertEqual(capture["type"], "idea")
+        self.assertEqual(capture["title"], "Идея покупки iPhone в будущем")
+
+    def test_future_iphone_idea_normalizes_russian_word(self):
+        capture = bot.classify_capture_text(
+            "Бот, запиши идею насчёт того, что нужно купить айфон в будущем"
+        )
+
+        self.assertEqual(capture["type"], "idea")
+        self.assertEqual(capture["title"], "Идея покупки iPhone в будущем")
+
 
 class _FakeCompletions:
     def __init__(self, content):
@@ -157,17 +174,7 @@ class GptJsonParsingTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
-class SttSafetyTests(unittest.TestCase):
-    def test_custom_endpoint_forces_expensive_transcribe_model_to_mini(self):
-        self.assertEqual(
-            bot._effective_openai_transcribe_model("gpt-4o-transcribe", "https://custom.example/v1"),
-            ("gpt-4o-mini-transcribe", True),
-        )
-        self.assertEqual(
-            bot._effective_openai_transcribe_model("gpt-4o-transcribe", "https://api.openai.com/v1"),
-            ("gpt-4o-transcribe", False),
-        )
-
+class VoiceVoskOnlyTests(unittest.TestCase):
     def test_custom_endpoint_client_disables_sdk_retries(self):
         self.assertEqual(
             bot._openai_client_kwargs("test-key", "https://custom.example/v1")["max_retries"],
@@ -193,7 +200,40 @@ class SttSafetyTests(unittest.TestCase):
         self.assertNotIn("response_format", kwargs)
         self.assertNotIn("temperature", kwargs)
 
-    def test_rate_limit_returns_error_without_second_transcription_call(self):
+    def test_gpt_55_custom_request_omits_json_mode_and_temperature(self):
+        old_base_url = bot.OPENAI_BASE_URL
+        bot.OPENAI_BASE_URL = "https://custom.example/v1"
+        try:
+            kwargs = bot._chat_json_request_kwargs(
+                "gpt-5.5-low",
+                [{"role": "user", "content": "ping"}],
+                0.1,
+            )
+        finally:
+            bot.OPENAI_BASE_URL = old_base_url
+
+        self.assertNotIn("response_format", kwargs)
+        self.assertNotIn("temperature", kwargs)
+
+    def test_voice_available_requires_vosk_and_ffmpeg(self):
+        old_vosk_available = bot._vosk_available
+        old_which = bot.shutil.which
+        try:
+            bot._vosk_available = lambda: True
+            bot.shutil.which = lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None
+            self.assertTrue(bot.voice_available())
+
+            bot.shutil.which = lambda _name: None
+            self.assertFalse(bot.voice_available())
+
+            bot._vosk_available = lambda: False
+            bot.shutil.which = lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None
+            self.assertFalse(bot.voice_available())
+        finally:
+            bot._vosk_available = old_vosk_available
+            bot.shutil.which = old_which
+
+    def test_transcribe_voice_uses_vosk_even_when_openai_client_exists(self):
         class _FakeVoiceFile:
             async def download_to_drive(self, path):
                 with open(path, "wb") as f:
@@ -205,33 +245,30 @@ class SttSafetyTests(unittest.TestCase):
 
             def create(self, **kwargs):
                 self.calls += 1
-                raise RuntimeError("upstream_rate_limited")
+                raise AssertionError("OpenAI STT must not be called")
 
         transcriptions = _FakeTranscriptions()
         old_client = bot._openai_client
-        old_convert = bot._convert_audio_for_openai
-        old_vosk_ready = bot._vosk_model_ready
-        old_disabled = bot._openai_transcription_disabled
-        old_reason = bot._openai_transcription_disabled_reason
+        old_voice_available = bot.voice_available
+        old_get_vosk_model = bot._get_vosk_model
+        old_vosk_transcribe_file = bot._vosk_transcribe_file
         bot._openai_client = types.SimpleNamespace(
             audio=types.SimpleNamespace(transcriptions=transcriptions)
         )
-        bot._convert_audio_for_openai = lambda _path: None
-        bot._vosk_model_ready = lambda: False
-        bot._openai_transcription_disabled = False
-        bot._openai_transcription_disabled_reason = ""
+        bot.voice_available = lambda: True
+        bot._get_vosk_model = lambda: object()
+        bot._vosk_transcribe_file = lambda _path: "распознанный текст"
         try:
             result = asyncio.run(bot.transcribe_voice(_FakeVoiceFile()))
         finally:
             bot._openai_client = old_client
-            bot._convert_audio_for_openai = old_convert
-            bot._vosk_model_ready = old_vosk_ready
-            bot._openai_transcription_disabled = old_disabled
-            bot._openai_transcription_disabled_reason = old_reason
+            bot.voice_available = old_voice_available
+            bot._get_vosk_model = old_get_vosk_model
+            bot._vosk_transcribe_file = old_vosk_transcribe_file
 
-        self.assertEqual(transcriptions.calls, 1)
-        self.assertEqual(result["error"], "openai_rate_limited")
-        self.assertEqual(result["engine"], f"openai:{bot.OPENAI_TRANSCRIBE_MODEL}")
+        self.assertEqual(transcriptions.calls, 0)
+        self.assertEqual(result["text"], "распознанный текст")
+        self.assertEqual(result["engine"], "vosk")
 
 
 if __name__ == "__main__":
