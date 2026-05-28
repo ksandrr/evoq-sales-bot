@@ -98,7 +98,7 @@ else:
 # Vosk — оффлайн-распознавание (fallback, если OpenAI не настроен).
 VOSK_MODEL_URL = os.getenv(
     "VOSK_MODEL_URL",
-    "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip",
+    "https://huggingface.co/rhasspy/vosk-models/resolve/main/ru/vosk-model-small-ru-0.22.zip",
 )
 _vosk_model = None
 _vosk_checked = False
@@ -110,7 +110,7 @@ def _vosk_model_dir() -> str:
         return explicit
     if os.path.isdir("/data"):
         return "/data/vosk-model"
-    return "/tmp/vosk-model"
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "vosk-model")
 
 
 def _vosk_model_ready() -> bool:

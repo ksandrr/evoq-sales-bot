@@ -1,5 +1,6 @@
 import unittest
 import asyncio
+import os
 import sys
 import types
 
@@ -232,6 +233,18 @@ class VoiceVoskOnlyTests(unittest.TestCase):
         finally:
             bot._vosk_available = old_vosk_available
             bot.shutil.which = old_which
+
+    def test_default_vosk_model_dir_is_project_data(self):
+        old_path = os.environ.pop("VOSK_MODEL_PATH", None)
+        old_isdir = bot.os.path.isdir
+        try:
+            bot.os.path.isdir = lambda path: False if path == "/data" else old_isdir(path)
+            expected = os.path.join(os.path.dirname(os.path.abspath(bot.__file__)), "data", "vosk-model")
+            self.assertEqual(bot._vosk_model_dir(), expected)
+        finally:
+            if old_path is not None:
+                os.environ["VOSK_MODEL_PATH"] = old_path
+            bot.os.path.isdir = old_isdir
 
     def test_transcribe_voice_uses_vosk_even_when_openai_client_exists(self):
         class _FakeVoiceFile:
