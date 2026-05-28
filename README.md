@@ -13,14 +13,14 @@ Telegram-бот для быстрых идей, задач и напоминан
 
 ## Голосовой режим
 
-Рекомендованный режим — OpenAI. Он лучше понимает живую русскую речь, запинки и продуктовые слова вроде EVOQ, Vosk, OpenAI, Railway, Telegram, GitHub.
+Рекомендованный режим — OpenAI. Он лучше понимает живую русскую речь, запинки и продуктовые слова вроде EVOQ, Vosk, OpenAI, Telegram, GitHub.
 
 Переменные окружения:
 
 - `OPENAI_API_KEY` — задаётся только на сервере или в окружении. Не коммитьте ключ в репозиторий.
 - `OPENAI_BASE_URL` — custom endpoint провайдера. Если не задан, используется стандартный `https://api.openai.com/v1`.
 - `OPENAI_TRANSCRIBE_MODEL` — модель распознавания речи. По умолчанию `gpt-4o-mini-transcribe`.
-- `OPENAI_PARSE_MODEL` — модель парсинга смысла. По умолчанию `gpt-4o-mini`.
+- `OPENAI_PARSE_MODEL` — модель парсинга смысла. По умолчанию `gpt-4o-mini`; для custom endpoint можно поставить `gpt-5.4-mini`.
 
 Допустимые STT-модели:
 
@@ -36,7 +36,7 @@ Telegram-бот для быстрых идей, задач и напоминан
 
 - `.env` должен оставаться в `.gitignore`.
 - Не добавляйте значение `OPENAI_API_KEY` в README, `.env.example`, код, коммиты или логи.
-- На Railway/Linux/systemd задавайте ключ только через environment/secret manager.
+- На Linux/systemd задавайте ключ только через environment/secret manager.
 
 ## Локальный запуск
 
@@ -64,21 +64,6 @@ Telegram-бот для быстрых идей, задач и напоминан
 
 По умолчанию SQLite хранится в `ideas.db` рядом с `bot.py`. Для продакшена задайте `DB_PATH`.
 
-## Railway
-
-Railway разворачивает сервис из GitHub. Стартовая команда — `python bot.py`.
-
-Переменные Railway:
-
-- `BOT_TOKEN`
-- `DB_PATH=/data/ideas.db`
-- `OPENAI_API_KEY` через Variables/Secrets
-- `OPENAI_BASE_URL` при использовании custom endpoint
-- `OPENAI_TRANSCRIBE_MODEL=gpt-4o-mini-transcribe`
-- `OPENAI_PARSE_MODEL=gpt-4o-mini`
-
-Создайте Volume и примонтируйте его в `/data`, иначе SQLite-файл будет пересоздаваться при деплоях.
-
 ## Linux server
 
 Пример обновления существующего деплоя:
@@ -94,6 +79,26 @@ pip install -r requirements.txt
 ```
 
 Добавьте переменные окружения в тот механизм, которым запущен бот: systemd `EnvironmentFile`, Docker secrets/env, screen/tmux wrapper или панель хостинга. Не храните секреты в Git.
+
+Минимальный пример для systemd `EnvironmentFile`:
+
+```bash
+BOT_TOKEN=...
+DB_PATH=/var/lib/evoq-sales-bot/ideas.db
+OPENAI_API_KEY=...
+OPENAI_BASE_URL=https://codex.sale/v1
+OPENAI_TRANSCRIBE_MODEL=gpt-4o-mini-transcribe
+OPENAI_PARSE_MODEL=gpt-5.4-mini
+DEFAULT_TIMEZONE=Asia/Omsk
+```
+
+Модели меняются именно здесь:
+
+- аудио/транскрибация: `OPENAI_TRANSCRIBE_MODEL`;
+- смысловой GPT-парсинг задач/идей/напоминаний: `OPENAI_PARSE_MODEL`;
+- провайдер/API endpoint: `OPENAI_BASE_URL`.
+
+После изменения env обязательно перезапустите процесс бота.
 
 Для systemd после изменения env:
 
@@ -115,7 +120,7 @@ python -m py_compile bot.py database.py
 Ручные проверки в Telegram:
 
 - «это не задача, просто мысль, надо сделать быстрый режим записи идей» → idea.
-- «сделай задачу проверить логи Railway и понять какой движок используется» → task.
+- «сделай задачу проверить логи Linux-сервера и понять какой движок используется» → task.
 - «напомни сегодня вечером в десять проверить список задач» → reminder на 22:00.
 
 ## Структура
@@ -123,5 +128,4 @@ python -m py_compile bot.py database.py
 - `bot.py` — Telegram handlers, voice/STT, GPT/rules parsing, reminders.
 - `database.py` — SQLite wrapper and compatible migrations.
 - `requirements.txt` — Python dependencies.
-- `Procfile`, `railway.json`, `runtime.txt`, `nixpacks.toml` — Railway config.
 - `.env.example` — безопасный пример локальной конфигурации без секретов.

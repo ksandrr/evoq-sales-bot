@@ -37,8 +37,26 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "Asia/Omsk")
 OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL") or "").strip()
-OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
+REQUESTED_OPENAI_TRANSCRIBE_MODEL = (os.getenv("OPENAI_TRANSCRIBE_MODEL") or "gpt-4o-mini-transcribe").strip()
+OPENAI_TRANSCRIBE_MODEL = REQUESTED_OPENAI_TRANSCRIBE_MODEL
 OPENAI_PARSE_MODEL = os.getenv("OPENAI_PARSE_MODEL", "gpt-4o-mini")
+
+
+def _is_custom_openai_base_url(base_url: str) -> bool:
+    return bool(base_url and base_url.rstrip("/") != "https://api.openai.com/v1")
+
+
+def _effective_openai_transcribe_model(requested_model: str, base_url: str) -> tuple[str, bool]:
+    requested_model = (requested_model or "gpt-4o-mini-transcribe").strip()
+    if _is_custom_openai_base_url(base_url) and requested_model.lower() == "gpt-4o-transcribe":
+        return "gpt-4o-mini-transcribe", True
+    return requested_model, False
+
+
+OPENAI_TRANSCRIBE_MODEL, _TRANSCRIBE_MODEL_FORCED_TO_MINI = _effective_openai_transcribe_model(
+    REQUESTED_OPENAI_TRANSCRIBE_MODEL,
+    OPENAI_BASE_URL,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -46,6 +64,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+if _TRANSCRIBE_MODEL_FORCED_TO_MINI:
+    logger.warning(
+        "Custom OpenAI endpoint requested expensive STT model %s; forcing %s.",
+        REQUESTED_OPENAI_TRANSCRIBE_MODEL,
+        OPENAI_TRANSCRIBE_MODEL,
+    )
 
 
 class SecretRedactionFilter(logging.Filter):
@@ -64,16 +88,23 @@ class SecretRedactionFilter(logging.Filter):
 for handler in logging.getLogger().handlers:
     handler.addFilter(SecretRedactionFilter())
 
+
+def _openai_client_kwargs(api_key: str, base_url: str) -> dict:
+    kwargs = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    if _is_custom_openai_base_url(base_url):
+        kwargs["max_retries"] = 0
+    return kwargs
+
+
 # OpenAI клиент (опционально — для голосовых)
 _openai_client = None
 if OPENAI_API_KEY:
     try:
         from openai import OpenAI
 
-        client_kwargs = {"api_key": OPENAI_API_KEY}
-        if OPENAI_BASE_URL:
-            client_kwargs["base_url"] = OPENAI_BASE_URL
-        _openai_client = OpenAI(**client_kwargs)
+        _openai_client = OpenAI(**_openai_client_kwargs(OPENAI_API_KEY, OPENAI_BASE_URL))
         logger.info(
             "OpenAI клиент инициализирован — base_url=%s, голосовые сообщения будут распознаваться через %s.",
             OPENAI_BASE_URL or "https://api.openai.com/v1",
@@ -275,15 +306,44 @@ def full_message(brief: str, details: str) -> str:
 
 # --- Голос: распознавание и парсинг ---
 
+def _safe_file_size(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    code = str(getattr(exc, "code", "") or "").lower()
+    text = str(exc).lower()
+    return (
+        status_code == 429
+        or "rate_limit" in code
+        or "rate_limit" in text
+        or "rate limit" in text
+        or "rate-limited" in text
+        or "upstream_rate_limited" in text
+    )
+
+
+def _is_upstream_bad_request(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    code = str(getattr(exc, "code", "") or "").lower()
+    text = str(exc).lower()
+    return status_code == 400 or "bad_request" in code or "upstream_bad_request" in text
+
+
 def _convert_audio_for_openai(input_path: str) -> str | None:
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        wav_path = tmp.name
+    with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
+        webm_path = tmp.name
     success = False
     try:
         result = subprocess.run(
             [
                 "ffmpeg", "-nostdin", "-y", "-i", input_path,
-                "-vn", "-ar", "16000", "-ac", "1", "-f", "wav", wav_path,
+                "-vn", "-ac", "1", "-c:a", "libopus", "-b:a", "24k",
+                "-application", "voip", "-f", "webm", webm_path,
             ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -293,7 +353,7 @@ def _convert_audio_for_openai(input_path: str) -> str | None:
             logger.warning("ffmpeg OpenAI audio conversion failed with code %s: %s", result.returncode, result.stderr.decode(errors="ignore")[:300])
             return None
         success = True
-        return wav_path
+        return webm_path
     except FileNotFoundError:
         logger.warning("ffmpeg not found; sending original Telegram audio to OpenAI transcription")
         return None
@@ -301,9 +361,9 @@ def _convert_audio_for_openai(input_path: str) -> str | None:
         logger.warning("ffmpeg OpenAI audio conversion timed out")
         return None
     finally:
-        if not success and os.path.exists(wav_path):
+        if not success and os.path.exists(webm_path):
             try:
-                os.unlink(wav_path)
+                os.unlink(webm_path)
             except OSError:
                 pass
 
@@ -318,6 +378,7 @@ async def transcribe_voice(voice_file):
     openai_audio_path = None
     try:
         await voice_file.download_to_drive(tmp_path)
+        original_bytes = _safe_file_size(tmp_path)
 
         if _openai_transcription_disabled and not _vosk_model_ready():
             return {
@@ -330,10 +391,14 @@ async def transcribe_voice(voice_file):
             try:
                 openai_audio_path = await _async_call(_convert_audio_for_openai, tmp_path)
                 transcription_path = openai_audio_path or tmp_path
+                outgoing_bytes = _safe_file_size(transcription_path)
+                input_format = "webm-opus" if openai_audio_path else "telegram-original"
                 logger.info(
-                    "OpenAI transcription input=%s model=%s",
-                    "wav" if openai_audio_path else "telegram-original",
+                    "OpenAI transcription input=%s model=%s original_bytes=%s outgoing_bytes=%s",
+                    input_format,
                     OPENAI_TRANSCRIBE_MODEL,
+                    original_bytes,
+                    outgoing_bytes,
                 )
                 with open(transcription_path, "rb") as f:
                     transcript = await _async_call(
@@ -344,7 +409,7 @@ async def transcribe_voice(voice_file):
                         prompt=(
                             "Пользователь на ходу диктует хаотичные заметки на русском для Telegram-бота. "
                             "Возможны запинки и мусорные вводные: слушай, короче, бот, привет, ну, типа. "
-                            "Важные слова сохраняй точно: EVOQ, Vosk, OpenAI, Railway, Telegram, GitHub. "
+                            "Важные слова сохраняй точно: EVOQ, Vosk, OpenAI, Telegram, GitHub. "
                             "Возможные команды: добавь идею, запиши мысль, сделай задачу, напомни, "
                             "сегодня вечером в десять, завтра утром часов в десять, по Омску."
                         ),
@@ -355,9 +420,17 @@ async def transcribe_voice(voice_file):
                     logger.info("voice transcription engine=%s", engine)
                     return {"text": text, "engine": engine}
             except Exception as exc:
-                logger.exception("OpenAI transcription failed; falling back to Vosk")
                 exc_text = str(exc)
-                if "unsupported_country_region_territory" in exc_text:
+                if _is_rate_limit_error(exc):
+                    logger.warning("OpenAI transcription rate limited; falling back to Vosk if available: %s", exc)
+                    if not _vosk_model_ready():
+                        return {
+                            "text": "",
+                            "engine": f"openai:{OPENAI_TRANSCRIBE_MODEL}",
+                            "error": "openai_rate_limited",
+                        }
+                elif "unsupported_country_region_territory" in exc_text:
+                    logger.exception("OpenAI transcription failed; falling back to Vosk")
                     _openai_transcription_disabled = True
                     _openai_transcription_disabled_reason = "openai_region_blocked"
                     if not _vosk_model_ready():
@@ -367,6 +440,7 @@ async def transcribe_voice(voice_file):
                             "error": "openai_region_blocked",
                         }
                 elif not _vosk_model_ready():
+                    logger.exception("OpenAI transcription failed; falling back to Vosk")
                     _openai_transcription_disabled = True
                     _openai_transcription_disabled_reason = "openai_audio_unavailable"
                     return {
@@ -374,6 +448,8 @@ async def transcribe_voice(voice_file):
                         "engine": f"openai:{OPENAI_TRANSCRIBE_MODEL}",
                         "error": "openai_audio_unavailable",
                     }
+                else:
+                    logger.exception("OpenAI transcription failed; falling back to Vosk")
 
         text = await _async_call(_vosk_transcribe_file, tmp_path)
         text = (text or "").strip()
@@ -450,6 +526,54 @@ def _vosk_transcribe_file(ogg_path: str):
             pass
 
 
+def _uses_custom_openai_endpoint() -> bool:
+    return _is_custom_openai_base_url(OPENAI_BASE_URL)
+
+
+def _chat_json_request_kwargs(model: str, messages: list[dict], temperature: float) -> dict:
+    kwargs = {
+        "model": model,
+        "messages": messages,
+    }
+    if not (_uses_custom_openai_endpoint() and model.lower() == "gpt-5.4-mini"):
+        kwargs["temperature"] = temperature
+    if not _uses_custom_openai_endpoint():
+        kwargs["response_format"] = {"type": "json_object"}
+    return kwargs
+
+
+def _extract_json_object(raw: str) -> dict | None:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    fence = re.search(r"```(?:json)?\s*(.*?)\s*```", raw, flags=re.IGNORECASE | re.DOTALL)
+    if fence:
+        try:
+            data = json.loads(fence.group(1).strip())
+            return data if isinstance(data, dict) else None
+        except json.JSONDecodeError:
+            pass
+
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(raw):
+        if char != "{":
+            continue
+        try:
+            data, _ = decoder.raw_decode(raw[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
 async def parse_idea_with_gpt(text: str):
     if not _openai_client:
         return None
@@ -462,25 +586,37 @@ async def parse_idea_with_gpt(text: str):
         "описание-расширение. Если только описание — придумай короткое название по смыслу. "
         "Отвечай на русском."
     )
+    request_kwargs = _chat_json_request_kwargs(
+        OPENAI_PARSE_MODEL,
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": text},
+        ],
+        0.3,
+    )
     try:
         response = await _async_call(
             _openai_client.chat.completions.create,
-            model=OPENAI_PARSE_MODEL,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": text},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.3,
+            **request_kwargs,
         )
         raw = response.choices[0].message.content
-        data = json.loads(raw)
+        data = _extract_json_object(raw)
+        if not data:
+            return None
         brief = (data.get("brief") or "").strip()
         details = (data.get("details") or "").strip()
         if not brief or not details:
             return None
         return brief[:200], details
-    except Exception:
+    except Exception as exc:
+        if _is_upstream_bad_request(exc):
+            logger.warning(
+                "GPT idea parsing upstream bad request model=%s request_keys=%s error=%s",
+                OPENAI_PARSE_MODEL,
+                sorted(request_kwargs),
+                exc,
+            )
+            return None
         logger.exception("GPT парсинг идеи упал")
         return None
 
@@ -514,23 +650,27 @@ async def parse_capture_with_gpt(text: str, default_timezone: str):
         "Если timezone не указан, используй default_timezone. "
         "Если для reminder нет точной даты или времени, либо время неоднозначное, выставь needs_time_clarification=true "
         "и time_confidence ниже 0.75. "
-        "Слова EVOQ, Vosk, OpenAI, Railway, Telegram, GitHub сохраняй корректно в title/body. "
+        "Слова EVOQ, Vosk, OpenAI, Telegram, GitHub сохраняй корректно в title/body. "
         f"Сегодня: {now.date().isoformat()}. Текущее время: {now.strftime('%H:%M')}. "
         f"default_timezone: {default_timezone}."
+    )
+    request_kwargs = _chat_json_request_kwargs(
+        OPENAI_PARSE_MODEL,
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": text},
+        ],
+        0.1,
     )
     try:
         response = await _async_call(
             _openai_client.chat.completions.create,
-            model=OPENAI_PARSE_MODEL,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": text},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.1,
+            **request_kwargs,
         )
         raw = response.choices[0].message.content
-        data = json.loads(raw)
+        data = _extract_json_object(raw)
+        if not data:
+            return None
         capture_type = (data.get("type") or "").strip().lower()
         if capture_type not in {"idea", "task", "reminder"}:
             return None
@@ -574,7 +714,15 @@ async def parse_capture_with_gpt(text: str, default_timezone: str):
             "clarification_reason": clarification_reason,
             "source": "gpt",
         }
-    except Exception:
+    except Exception as exc:
+        if _is_upstream_bad_request(exc):
+            logger.warning(
+                "GPT capture parsing upstream bad request model=%s request_keys=%s error=%s",
+                OPENAI_PARSE_MODEL,
+                sorted(request_kwargs),
+                exc,
+            )
+            return None
         logger.exception("GPT capture parsing failed")
         return None
 
@@ -663,6 +811,7 @@ DATE_TIME_WORDS = (
 ACTION_WORDS = (
     "купить", "сделать", "позвонить", "написать", "проверить", "отправить",
     "созвониться", "встретиться", "подготовить", "разобрать", "найти", "понять",
+    "сходить", "записаться", "записать",
 )
 TITLE_WORD_NORMALIZATIONS = {
     "молока": "молоко",
@@ -724,15 +873,20 @@ def effective_user_timezone(user_id: int) -> str:
     return tz
 
 
-def normalize_capture_command_text(text: str) -> str:
+def _strip_leading_capture_noise(text: str) -> str:
+    noise = r"(?:привет|слушай|смотри|так|короче|ну|типа|бот|чат|ботик|ассистент|мне)"
     text = _compact_spaces(text).strip(" .,!?:;")
-    text = re.sub(
-        r"^(привет|слушай|так|короче|ну|типа)\s*,?\s*(чат|бот|ботик|ассистент)?\s*,?\s*",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(r"^(чат|бот|ботик|ассистент)\s*,?\s*", "", text, flags=re.IGNORECASE)
+    for _ in range(12):
+        cleaned = re.sub(rf"^{noise}\b\s*,?\s*", "", text, flags=re.IGNORECASE)
+        cleaned = _compact_spaces(cleaned).strip(" .,!?:;")
+        if cleaned == text:
+            break
+        text = cleaned
+    return text
+
+
+def normalize_capture_command_text(text: str) -> str:
+    text = _strip_leading_capture_noise(text)
     text = re.sub(r"\b(пожалуйста|плиз|ну|типа)\b", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\b(точнее|вернее)\s*,?\s*(задачу|иде[яю])\b", r" \2 ", text, flags=re.IGNORECASE)
     return _compact_spaces(text).strip(" .,!?:;")
@@ -740,6 +894,8 @@ def normalize_capture_command_text(text: str) -> str:
 
 def _strip_capture_noise(text: str) -> str:
     text = _compact_spaces(text)
+    text = _strip_leading_capture_noise(text)
+    text = re.sub(r"^(записать|запиши)\s+(на|к|в)\s*,?\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\b(что\s+но|что\s+ну|что)\b", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"\b(мне\s+нужно|нужно|надо)\b", " ", text, flags=re.IGNORECASE)
     text = re.sub(
@@ -1022,6 +1178,9 @@ async def classify_capture(update: Update, text: str, forced_type: str | None = 
 
 def generate_capture_title(text: str, capture_type: str) -> str:
     title = normalize_capture_command_text(text)
+    m = re.search(r"\b(?:о\s+том\s+)?что\s+(?:мне\s+)?(?:нужно|надо)\s+(.+)", title, flags=re.IGNORECASE)
+    if m:
+        title = m.group(1)
     if capture_type == "idea":
         title = re.sub(
             r"^.*\bиде[яю]\b\s*(о\s+том\s*)?(что\s*)?",
@@ -1038,6 +1197,12 @@ def generate_capture_title(text: str, capture_type: str) -> str:
     )
     title = re.sub(
         r"^(сделай|создай|поставь|добавь|запиши|сохрани)\s+(мне\s+)?(задачу|напоминание)\s+",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(
+        r"^(записать|запиши)\s+(мне\s+)?(задачу|напоминание)\s+",
         "",
         title,
         flags=re.IGNORECASE,
@@ -1103,6 +1268,7 @@ def generate_capture_title(text: str, capture_type: str) -> str:
     )
     title = re.sub(r"\b(о\s+том\s+)?что\s+(мне\s+)?нужно\s+", "", title, flags=re.IGNORECASE)
     title = re.sub(r"\bмне\s+нужно\s+", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"^(записать|запиши)\s+(на|к|в)\s*,?\s*", "", title, flags=re.IGNORECASE)
     title = re.sub(r"\b(на|к|в)\s*$", "", title, flags=re.IGNORECASE)
     title = _normalize_title_words(title)
     title = _compact_spaces(title).strip(" .,!?:;")
@@ -1201,7 +1367,7 @@ async def voice_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"• «{BTN_ADD_TASK}» — наговори задачу, она сохранится как есть.\n"
             f"• На шагах «{BTN_ADD}» — голос подставится в текущий шаг.\n"
             "• Вне диалогов голос создаст идею (название = первая фраза, описание = весь текст).\n\n"
-            "Если хочешь лучшее качество — добавь <code>OPENAI_API_KEY</code> в Railway Variables, "
+            "Если хочешь лучшее качество — добавь <code>OPENAI_API_KEY</code> в env на Linux-сервере, "
             f"и бот автоматически переключится на OpenAI ({html.escape(OPENAI_TRANSCRIBE_MODEL)})."
         )
     else:
@@ -1211,13 +1377,13 @@ async def voice_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "<b>1. OpenAI STT (рекомендуется, платно но дёшево):</b>\n"
             "• https://platform.openai.com → Billing → пополни $5.\n"
             "• API keys → Create new secret key.\n"
-            "• Railway → Variables → добавь <code>OPENAI_API_KEY</code>, "
-            "<code>OPENAI_TRANSCRIBE_MODEL</code> и <code>OPENAI_PARSE_MODEL</code>.\n\n"
+            "• На Linux-сервере добавь <code>OPENAI_API_KEY</code>, "
+            "<code>OPENAI_TRANSCRIBE_MODEL</code> и <code>OPENAI_PARSE_MODEL</code> в env/systemd EnvironmentFile.\n\n"
             "<b>2. Vosk (бесплатно, оффлайн, качество ниже):</b>\n"
             "• Установи пакет vosk (он уже в requirements.txt).\n"
-            "• На сервере нужен ffmpeg (nixpacks.toml в репо уже его ставит).\n"
+            "• На сервере нужен ffmpeg: <code>sudo apt install ffmpeg</code>.\n"
             "• Vosk сам скачает русскую модель (~45 МБ) при первом голосовом.\n\n"
-            "Railway сам перезапустит бота — голос заработает."
+            "После изменения env перезапусти сервис бота."
         )
     await update.message.reply_html(text, reply_markup=main_menu_keyboard(), disable_web_page_preview=True)
 
@@ -1604,6 +1770,11 @@ def transcription_error_text(error: str) -> str:
             "у провайдера временно не проходит.\n\n"
             "Текстовые идеи, задачи и напоминания работают. Голос включим, когда провайдер починит "
             "audio endpoint или когда поставим локальную Vosk-модель."
+        )
+    if error == "openai_rate_limited":
+        return (
+            "Провайдер временно ограничил распознавание голоса. "
+            "Попробуй ещё раз позже или напиши текстом, чтобы не тратить лишние токены."
         )
     if error == "transcription_timeout":
         return (
