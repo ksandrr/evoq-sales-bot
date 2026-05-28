@@ -54,6 +54,7 @@ class SecretRedactionFilter(logging.Filter):
         if BOT_TOKEN:
             message = message.replace(BOT_TOKEN, "<BOT_TOKEN_REDACTED>")
         message = re.sub(r"\bsk-(?:proj|live|test|svcacct|admin|org)-[A-Za-z0-9_-]+", "<OPENAI_KEY_REDACTED>", message)
+        message = re.sub(r"\bsk-[A-Za-z0-9_-]{20,}\b", "<OPENAI_KEY_REDACTED>", message)
         if message != record.getMessage():
             record.msg = message
             record.args = ()
@@ -274,6 +275,39 @@ def full_message(brief: str, details: str) -> str:
 
 # --- Голос: распознавание и парсинг ---
 
+def _convert_audio_for_openai(input_path: str) -> str | None:
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        wav_path = tmp.name
+    success = False
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-nostdin", "-y", "-i", input_path,
+                "-vn", "-ar", "16000", "-ac", "1", "-f", "wav", wav_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            logger.warning("ffmpeg OpenAI audio conversion failed with code %s: %s", result.returncode, result.stderr.decode(errors="ignore")[:300])
+            return None
+        success = True
+        return wav_path
+    except FileNotFoundError:
+        logger.warning("ffmpeg not found; sending original Telegram audio to OpenAI transcription")
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning("ffmpeg OpenAI audio conversion timed out")
+        return None
+    finally:
+        if not success and os.path.exists(wav_path):
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
+
+
 async def transcribe_voice(voice_file):
     global _openai_transcription_disabled, _openai_transcription_disabled_reason
     if not voice_available():
@@ -281,6 +315,7 @@ async def transcribe_voice(voice_file):
 
     with tempfile.NamedTemporaryFile(suffix=".oga", delete=False) as tmp:
         tmp_path = tmp.name
+    openai_audio_path = None
     try:
         await voice_file.download_to_drive(tmp_path)
 
@@ -293,7 +328,14 @@ async def transcribe_voice(voice_file):
 
         if _openai_client and not _openai_transcription_disabled:
             try:
-                with open(tmp_path, "rb") as f:
+                openai_audio_path = await _async_call(_convert_audio_for_openai, tmp_path)
+                transcription_path = openai_audio_path or tmp_path
+                logger.info(
+                    "OpenAI transcription input=%s model=%s",
+                    "wav" if openai_audio_path else "telegram-original",
+                    OPENAI_TRANSCRIBE_MODEL,
+                )
+                with open(transcription_path, "rb") as f:
                     transcript = await _async_call(
                         _openai_client.audio.transcriptions.create,
                         model=OPENAI_TRANSCRIBE_MODEL,
@@ -350,6 +392,11 @@ async def transcribe_voice(voice_file):
             os.unlink(tmp_path)
         except OSError:
             pass
+        if openai_audio_path:
+            try:
+                os.unlink(openai_audio_path)
+            except OSError:
+                pass
 
 
 def _vosk_transcribe_file(ogg_path: str):
