@@ -19,7 +19,7 @@ Telegram-бот для быстрых идей, задач и напоминан
 
 - `OPENAI_API_KEY` — задаётся только на сервере или в окружении. Не коммитьте ключ в репозиторий.
 - `OPENAI_BASE_URL` — custom endpoint провайдера. Если не задан, используется стандартный `https://api.openai.com/v1`.
-- `OPENAI_PARSE_MODEL` — модель парсинга смысла. По умолчанию `gpt-5.5-low`; для custom endpoint можно менять на другую доступную GPT-модель.
+- `OPENAI_PARSE_MODEL` — модель парсинга смысла. По умолчанию `gpt-5.5`; для custom endpoint можно менять на другую доступную GPT-модель.
 - `VOSK_MODEL_PATH` — опциональный путь к заранее скачанной Vosk-модели.
 - `VOSK_MODEL_URL` — опциональная ссылка на модель для автоскачивания.
 
@@ -86,7 +86,7 @@ BOT_TOKEN=...
 DB_PATH=/var/lib/evoq-sales-bot/ideas.db
 OPENAI_API_KEY=...
 OPENAI_BASE_URL=https://codex.sale/v1
-OPENAI_PARSE_MODEL=gpt-5.5-low
+OPENAI_PARSE_MODEL=gpt-5.5
 DEFAULT_TIMEZONE=Asia/Omsk
 ```
 

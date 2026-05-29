@@ -206,7 +206,7 @@ class VoiceVoskOnlyTests(unittest.TestCase):
         bot.OPENAI_BASE_URL = "https://custom.example/v1"
         try:
             kwargs = bot._chat_json_request_kwargs(
-                "gpt-5.5-low",
+                "gpt-5.5",
                 [{"role": "user", "content": "ping"}],
                 0.1,
             )
