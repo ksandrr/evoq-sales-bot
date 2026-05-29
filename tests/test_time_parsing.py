@@ -175,6 +175,32 @@ class GptJsonParsingTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
+class DisplayDescriptionTests(unittest.TestCase):
+    def test_gpt_description_is_shown_without_raw_recognition_label(self):
+        message = bot.gpt_description_message(
+            {
+                "source": "gpt",
+                "title": "Написать Екатерине Михайловне",
+                "body": "Нужно сегодня в 12:00 написать Екатерине Михайловне.",
+            }
+        )
+
+        self.assertIn("Описание:", message)
+        self.assertIn("Екатерине Михайловне", message)
+        self.assertNotIn("Распознано:", message)
+
+    def test_rules_description_is_hidden(self):
+        message = bot.gpt_description_message(
+            {
+                "source": "rules",
+                "title": "Написать Екатерине Михайловне",
+                "body": "вот привет запиши задачу по поводу того что нужно...",
+            }
+        )
+
+        self.assertEqual(message, "")
+
+
 class VoiceVoskOnlyTests(unittest.TestCase):
     def test_custom_endpoint_client_disables_sdk_retries(self):
         self.assertEqual(

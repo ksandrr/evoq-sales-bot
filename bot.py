@@ -425,7 +425,7 @@ async def parse_idea_with_gpt(text: str):
     system = (
         "Ты ассистент, который из произвольного сообщения пользователя извлекает идею. "
         "Верни JSON с двумя полями: brief (короткое название идеи, до 100 символов, "
-        "одна строка, без точки в конце) и details (подробное описание, как пользователь рассказал, "
+        "одна строка, без точки в конце) и details (краткое описание идеи в 1-2 предложениях, "
         "можно слегка причесать). Если в сообщении только название — придумай адекватное "
         "описание-расширение. Если только описание — придумай короткое название по смыслу. "
         "Отвечай на русском."
@@ -476,7 +476,7 @@ async def parse_capture_with_gpt(text: str, default_timezone: str):
         "Удали этот шум и извлеки смысл как человек. Верни только JSON без markdown с полями: "
         "type: idea | task | reminder; "
         "title: нормальное короткое название 2-7 слов, не обрывок распознанной речи, без обращений, команд, даты и времени; "
-        "body: очищенное описание по смыслу; "
+        "body: краткое очищенное описание по смыслу в 1-2 предложениях, без сырой расшифровки и команд пользователя; "
         "due_date: YYYY-MM-DD или пустая строка; "
         "due_time: HH:MM в 24-часовом формате или пустая строка; "
         "timezone: IANA timezone или пустая строка; "
@@ -1618,11 +1618,16 @@ def format_timezone_label(timezone: str) -> str:
     return labels.get(timezone, timezone)
 
 
-def recognized_voice_message(text: str) -> str:
-    text = _compact_spaces(text)
-    if len(text) > 500:
-        text = text[:500].rstrip() + "..."
-    return f"\n\n<i>Распознано:</i> {html.escape(text)}" if text else ""
+def gpt_description_message(capture: dict) -> str:
+    if capture.get("source") != "gpt":
+        return ""
+    body = _compact_spaces(capture.get("body") or "")
+    title = _compact_spaces(capture.get("title") or "")
+    if not body or body.casefold() == title.casefold():
+        return ""
+    if len(body) > 600:
+        body = body[:600].rstrip() + "..."
+    return f"\n\n<b>Описание:</b> {html.escape(body)}"
 
 
 def transcription_error_text(error: str) -> str:
@@ -1741,7 +1746,8 @@ async def _handle_task_text(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     )
 
     await update.message.reply_html(
-        f"✅ Задача создана\n\n{task_message(title, False, capture.get('body') or text, due_date, capture.get('due_time', ''), timezone)}",
+        f"✅ Задача создана\n\n{task_message(title, False, capture.get('body') or text, due_date, capture.get('due_time', ''), timezone)}"
+        f"{gpt_description_message(capture)}",
         reply_markup=main_menu_keyboard(),
     )
     await update.message.reply_text(
@@ -1832,7 +1838,7 @@ async def _send_created_task(update: Update, capture: dict, task_id: int, recogn
     response = "🔔 Напоминание создано" if reminder else "✅ Задача создана"
     await update.message.reply_html(
         f"{response}\n\n{task_message(title, False, capture.get('body') or title, due_date, due_time, timezone)}"
-        f"{recognized_voice_message(recognized_text)}",
+        f"{gpt_description_message(capture)}",
         reply_markup=main_menu_keyboard(),
     )
     await update.message.reply_text(
@@ -1958,7 +1964,7 @@ async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_user_reminders(context.application, user_id)
 
     await update.message.reply_html(
-        f"✅ Идея сохранена\n\n{full_message(brief, details)}{recognized_voice_message(text)}",
+        f"✅ Идея сохранена\n\n{full_message(brief, details)}",
         reply_markup=main_menu_keyboard(),
     )
     await update.message.reply_text(
