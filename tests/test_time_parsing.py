@@ -1,8 +1,8 @@
-import unittest
 import asyncio
 import os
 import sys
 import types
+import unittest
 
 
 class _Dummy:
@@ -56,6 +56,7 @@ telegram_ext.filters = _Dummy()
 sys.modules.setdefault("telegram.ext", telegram_ext)
 
 import bot
+
 
 extract_capture_due_time = bot.extract_capture_due_time
 
@@ -123,11 +124,7 @@ class _FakeCompletions:
     def create(self, **kwargs):
         self.kwargs = kwargs
         return types.SimpleNamespace(
-            choices=[
-                types.SimpleNamespace(
-                    message=types.SimpleNamespace(content=self.content)
-                )
-            ]
+            choices=[types.SimpleNamespace(message=types.SimpleNamespace(content=self.content))]
         )
 
 
@@ -171,7 +168,6 @@ class GptJsonParsingTests(unittest.TestCase):
 
     def test_bad_json_returns_none(self):
         result, _ = self._parse_with_fake_client("это не json", "https://custom.example/v1")
-
         self.assertIsNone(result)
 
 
@@ -201,7 +197,7 @@ class DisplayDescriptionTests(unittest.TestCase):
         self.assertEqual(message, "")
 
 
-class VoiceVoskOnlyTests(unittest.TestCase):
+class VoiceAndWeeekTests(unittest.TestCase):
     def test_custom_endpoint_client_disables_sdk_retries(self):
         self.assertEqual(
             bot._openai_client_kwargs("test-key", "https://custom.example/v1")["max_retries"],
@@ -242,10 +238,26 @@ class VoiceVoskOnlyTests(unittest.TestCase):
         self.assertNotIn("response_format", kwargs)
         self.assertNotIn("temperature", kwargs)
 
-    def test_voice_available_requires_vosk_and_ffmpeg(self):
+    def test_voice_available_accepts_openai_stt_without_vosk(self):
+        old_stt_available = bot._openai_stt_available
         old_vosk_available = bot._vosk_available
         old_which = bot.shutil.which
         try:
+            bot._openai_stt_available = lambda: True
+            bot._vosk_available = lambda: False
+            bot.shutil.which = lambda _name: None
+            self.assertTrue(bot.voice_available())
+        finally:
+            bot._openai_stt_available = old_stt_available
+            bot._vosk_available = old_vosk_available
+            bot.shutil.which = old_which
+
+    def test_voice_available_requires_vosk_and_ffmpeg_without_openai_stt(self):
+        old_stt_available = bot._openai_stt_available
+        old_vosk_available = bot._vosk_available
+        old_which = bot.shutil.which
+        try:
+            bot._openai_stt_available = lambda: False
             bot._vosk_available = lambda: True
             bot.shutil.which = lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None
             self.assertTrue(bot.voice_available())
@@ -257,6 +269,7 @@ class VoiceVoskOnlyTests(unittest.TestCase):
             bot.shutil.which = lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None
             self.assertFalse(bot.voice_available())
         finally:
+            bot._openai_stt_available = old_stt_available
             bot._vosk_available = old_vosk_available
             bot.shutil.which = old_which
 
@@ -272,42 +285,94 @@ class VoiceVoskOnlyTests(unittest.TestCase):
                 os.environ["VOSK_MODEL_PATH"] = old_path
             bot.os.path.isdir = old_isdir
 
-    def test_transcribe_voice_uses_vosk_even_when_openai_client_exists(self):
+    def test_transcribe_voice_prefers_openai_stt(self):
         class _FakeVoiceFile:
             async def download_to_drive(self, path):
                 with open(path, "wb") as f:
                     f.write(b"fake audio")
 
-        class _FakeTranscriptions:
+        class _FakeSttTranscriptions:
             def __init__(self):
                 self.calls = 0
 
             def create(self, **kwargs):
                 self.calls += 1
-                raise AssertionError("OpenAI STT must not be called")
+                return types.SimpleNamespace(text="openai transcript")
 
-        transcriptions = _FakeTranscriptions()
-        old_client = bot._openai_client
-        old_voice_available = bot.voice_available
-        old_get_vosk_model = bot._get_vosk_model
-        old_vosk_transcribe_file = bot._vosk_transcribe_file
-        bot._openai_client = types.SimpleNamespace(
+        transcriptions = _FakeSttTranscriptions()
+        old_stt_client = bot._openai_stt_client
+        old_stt_available = bot._openai_stt_available
+        old_vosk_available = bot._vosk_available
+        bot._openai_stt_client = types.SimpleNamespace(
             audio=types.SimpleNamespace(transcriptions=transcriptions)
         )
-        bot.voice_available = lambda: True
-        bot._get_vosk_model = lambda: object()
-        bot._vosk_transcribe_file = lambda _path: "распознанный текст"
+        bot._openai_stt_available = lambda: True
+        bot._vosk_available = lambda: False
         try:
             result = asyncio.run(bot.transcribe_voice(_FakeVoiceFile()))
         finally:
-            bot._openai_client = old_client
-            bot.voice_available = old_voice_available
+            bot._openai_stt_client = old_stt_client
+            bot._openai_stt_available = old_stt_available
+            bot._vosk_available = old_vosk_available
+
+        self.assertEqual(transcriptions.calls, 1)
+        self.assertEqual(result["text"], "openai transcript")
+        self.assertEqual(result["engine"], bot._openai_stt_engine_label())
+
+    def test_transcribe_voice_falls_back_to_vosk_after_openai_failure(self):
+        class _FakeVoiceFile:
+            async def download_to_drive(self, path):
+                with open(path, "wb") as f:
+                    f.write(b"fake audio")
+
+        class _BrokenSttTranscriptions:
+            def create(self, **kwargs):
+                raise RuntimeError("upstream temporarily unavailable")
+
+        old_stt_client = bot._openai_stt_client
+        old_stt_available = bot._openai_stt_available
+        old_vosk_available = bot._vosk_available
+        old_which = bot.shutil.which
+        old_get_vosk_model = bot._get_vosk_model
+        old_vosk_transcribe_file = bot._vosk_transcribe_file
+        bot._openai_stt_client = types.SimpleNamespace(
+            audio=types.SimpleNamespace(transcriptions=_BrokenSttTranscriptions())
+        )
+        bot._openai_stt_available = lambda: True
+        bot._vosk_available = lambda: True
+        bot.shutil.which = lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None
+        bot._get_vosk_model = lambda: object()
+        bot._vosk_transcribe_file = lambda _path: "vosk transcript"
+        try:
+            result = asyncio.run(bot.transcribe_voice(_FakeVoiceFile()))
+        finally:
+            bot._openai_stt_client = old_stt_client
+            bot._openai_stt_available = old_stt_available
+            bot._vosk_available = old_vosk_available
+            bot.shutil.which = old_which
             bot._get_vosk_model = old_get_vosk_model
             bot._vosk_transcribe_file = old_vosk_transcribe_file
 
-        self.assertEqual(transcriptions.calls, 0)
-        self.assertEqual(result["text"], "распознанный текст")
+        self.assertEqual(result["text"], "vosk transcript")
         self.assertEqual(result["engine"], "vosk")
+
+    def test_weeek_request_detection_and_prefix_strip(self):
+        text = "Бот, добавь задачу в ВИК: написать Кате по смете"
+        self.assertTrue(bot.is_weeek_request(text))
+        self.assertEqual(bot.strip_weeek_request_prefix(text), "написать Кате по смете")
+
+    def test_weeek_column_hint_normalization(self):
+        self.assertEqual(bot.normalize_weeek_column_hint("поставь это к работе"), "to_work")
+        self.assertEqual(bot.normalize_weeek_column_hint("эту задачу давай в работу"), "in_work")
+
+    def test_weeek_title_adds_see_description_suffix(self):
+        title = bot.build_weeek_task_title(
+            {
+                "title": "Подготовить оффер",
+                "body": "Подготовить оффер для застройщиков и отдельно описать условия запуска.",
+            }
+        )
+        self.assertEqual(title, "Подготовить оффер — см. описание")
 
 
 if __name__ == "__main__":
