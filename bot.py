@@ -2106,6 +2106,13 @@ async def weeek_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _start_weeek_capture(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_text: str):
+    if not weeek_available():
+        await update.message.reply_text(
+            "Поймал запрос на задачу в Weeek, но интеграция Weeek сейчас не настроена в запущенном сервисе. "
+            "Проверь WEEEK_API_TOKEN/WEEEK_API_BASE_URL и перезапусти бота.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return ConversationHandler.END
     clean_text = strip_weeek_request_prefix(raw_text)
     if not clean_text:
         await update.message.reply_text(
