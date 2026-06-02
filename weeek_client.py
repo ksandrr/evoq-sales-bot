@@ -1,4 +1,5 @@
 import json
+import re
 from dataclasses import dataclass
 
 import httpx
@@ -162,6 +163,76 @@ class WeeekClient:
             raise last_error
         return []
 
+    async def list_tasks(self, project_id: str = "", board_id: str = "", search: str = "") -> list[WeeekOption]:
+        params = self._base_list_params()
+        if project_id:
+            params["projectId"] = project_id
+        if board_id:
+            params["boardId"] = board_id
+        if search:
+            params["search"] = search
+        payload = await self._request("GET", "/tm/tasks", params=params)
+        items = self._extract_items(payload)
+        filtered = []
+        for item in items:
+            item_project_id = str(item.get("projectId") or item.get("project", {}).get("id") or "")
+            item_board_id = str(item.get("boardId") or item.get("board", {}).get("id") or "")
+            if project_id and item_project_id and item_project_id != str(project_id):
+                continue
+            if board_id and item_board_id and item_board_id != str(board_id):
+                continue
+            filtered.append(item)
+        items = filtered or items
+        options = []
+        for item in items:
+            option = self._coerce_option(item, "Task")
+            if option:
+                options.append(option)
+        return options
+
+    def _task_payload(
+        self,
+        *,
+        title: str,
+        description: str,
+        board_id: str,
+        column_id: str,
+        project_id: str = "",
+        due_date: str = "",
+        due_time: str = "",
+        parent_id: str = "",
+    ) -> dict:
+        location = {}
+        if project_id:
+            location["projectId"] = int(project_id) if str(project_id).isdigit() else project_id
+        if board_id:
+            location["boardId"] = int(board_id) if str(board_id).isdigit() else board_id
+        if column_id:
+            location["boardColumnId"] = int(column_id) if str(column_id).isdigit() else column_id
+
+        payload = {
+            "title": title,
+            "description": description,
+            "locations": [location] if location else [],
+            "boardId": board_id,
+            "boardColumnId": column_id,
+            "type": "action",
+        }
+        if project_id:
+            payload["projectId"] = project_id
+        if due_date:
+            payload["dueDate"] = due_date
+            payload["day"] = due_date
+        if due_time:
+            payload["dueTime"] = due_time
+            if due_date and re.match(r"^\d{4}-\d{2}-\d{2}$", due_date) and re.match(r"^\d{2}:\d{2}$", due_time):
+                payload["dueDateTime"] = f"{due_date}T{due_time}:00"
+        if parent_id:
+            payload["parentId"] = int(parent_id) if str(parent_id).isdigit() else parent_id
+        if self.workspace_id:
+            payload["workspaceId"] = self.workspace_id
+        return payload
+
     async def create_task(
         self,
         *,
@@ -173,21 +244,55 @@ class WeeekClient:
         due_date: str = "",
         due_time: str = "",
     ) -> dict:
-        payload = {
-            "title": title,
-            "description": description,
-            "boardId": board_id,
-            "boardColumnId": column_id,
-        }
-        if project_id:
-            payload["projectId"] = project_id
-        if due_date:
-            payload["dueDate"] = due_date
-        if due_time:
-            payload["dueTime"] = due_time
-        if self.workspace_id:
-            payload["workspaceId"] = self.workspace_id
+        payload = self._task_payload(
+            title=title,
+            description=description,
+            board_id=board_id,
+            column_id=column_id,
+            project_id=project_id,
+            due_date=due_date,
+            due_time=due_time,
+        )
         response = await self._request("POST", "/tm/tasks", json_body=payload)
         if isinstance(response, dict):
+            return response
+        return {"raw": response}
+
+    async def create_subtask(
+        self,
+        *,
+        title: str,
+        description: str,
+        board_id: str,
+        column_id: str,
+        parent_task_id: str,
+        project_id: str = "",
+        due_date: str = "",
+        due_time: str = "",
+    ) -> dict:
+        payload = self._task_payload(
+            title=title,
+            description=description,
+            board_id=board_id,
+            column_id=column_id,
+            project_id=project_id,
+            due_date=due_date,
+            due_time=due_time,
+            parent_id=parent_task_id,
+        )
+        response = await self._request("POST", "/tm/tasks", json_body=payload)
+        if isinstance(response, dict):
+            task = response.get("task")
+            if isinstance(task, dict) and not task.get("parentId"):
+                task_id = task.get("id") or response.get("id") or response.get("taskId")
+                if task_id:
+                    try:
+                        await self._request(
+                            "POST",
+                            f"/tm/tasks/{task_id}/parent",
+                            json_body={"parentId": int(parent_task_id) if str(parent_task_id).isdigit() else parent_task_id},
+                        )
+                    except WeeekApiError:
+                        pass
             return response
         return {"raw": response}

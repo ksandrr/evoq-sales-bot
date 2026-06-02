@@ -29,6 +29,10 @@ dotenv = types.ModuleType("dotenv")
 dotenv.load_dotenv = lambda *args, **kwargs: None
 sys.modules.setdefault("dotenv", dotenv)
 
+httpx = types.ModuleType("httpx")
+httpx.AsyncClient = _Dummy
+sys.modules.setdefault("httpx", httpx)
+
 telegram = types.ModuleType("telegram")
 telegram.InlineKeyboardButton = _Dummy
 telegram.InlineKeyboardMarkup = _Dummy
@@ -373,6 +377,47 @@ class VoiceAndWeeekTests(unittest.TestCase):
             }
         )
         self.assertEqual(title, "Подготовить оффер — см. описание")
+
+
+class RouteAndSubtaskTests(unittest.TestCase):
+    def test_transcription_message_shows_fallback_label(self):
+        old_stt_available = bot._openai_stt_available
+        try:
+            bot._openai_stt_available = lambda: True
+            message = bot.transcription_message("сходить к Комарову", "vosk")
+        finally:
+            bot._openai_stt_available = old_stt_available
+
+        self.assertIn("fallback", message)
+        self.assertIn("Комарову", message)
+
+    def test_detect_top_level_route_weeek_task(self):
+        route = bot.detect_top_level_route("добавь задачу в ВИК в личное к работе написать Кате")
+        self.assertEqual(route["target"], "weeek_task")
+        self.assertEqual(route["project"]["project_id"], "6")
+        self.assertEqual(route["column_hint"], "to_work")
+
+    def test_detect_top_level_route_weeek_subtask(self):
+        route = bot.detect_top_level_route('в Vibecoding добавь подзадачу к задаче "Разобраться, как парсить аудиторию"')
+        self.assertEqual(route["target"], "weeek_subtask")
+        self.assertEqual(route["project"]["project_id"], "5")
+        self.assertIn("разобраться", route["parent_task_candidate"].lower())
+
+    def test_detect_top_level_route_local_task(self):
+        route = bot.detect_top_level_route("добавь задачу завтра в 10 написать Кате")
+        self.assertEqual(route["target"], "local_task")
+
+    def test_match_parent_task_exact_and_fuzzy(self):
+        tasks = [
+            {"id": "1", "name": "Разобраться, как парсить аудиторию"},
+            {"id": "2", "name": "Добавить план быстрого теста"},
+        ]
+        exact, source_exact = bot._match_parent_task(tasks, "Разобраться, как парсить аудиторию")
+        fuzzy, source_fuzzy = bot._match_parent_task(tasks, "разобраться как парсить аудиторию")
+        self.assertEqual(exact["id"], "1")
+        self.assertEqual(source_exact, "exact")
+        self.assertEqual(fuzzy["id"], "1")
+        self.assertIn(source_fuzzy, {"normalized", "fuzzy"})
 
 
 if __name__ == "__main__":
