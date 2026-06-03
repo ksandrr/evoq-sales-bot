@@ -152,7 +152,7 @@ class GptJsonParsingTests(unittest.TestCase):
 
         self.assertEqual(result["title"], "Сходить к стоматологу")
         self.assertEqual(kwargs["response_format"], {"type": "json_object"})
-        self.assertIn("temperature", kwargs)
+        self.assertNotIn("temperature", kwargs)
 
     def test_text_wrapped_json_is_parsed(self):
         result, _ = self._parse_with_fake_client(
@@ -199,7 +199,7 @@ class VoiceAndWeeekTests(unittest.TestCase):
         self.assertFalse(hasattr(bot, "OPENAI_STT_BASE_URL"))
         self.assertFalse(hasattr(bot, "OPENAI_STT_API_KEY"))
 
-    def test_official_request_kwargs_include_json_mode_and_temperature(self):
+    def test_official_request_kwargs_include_json_mode_without_temperature(self):
         kwargs = bot._chat_json_request_kwargs(
             "gpt-5.5",
             [{"role": "user", "content": "ping"}],
@@ -207,7 +207,7 @@ class VoiceAndWeeekTests(unittest.TestCase):
         )
 
         self.assertEqual(kwargs["response_format"], {"type": "json_object"})
-        self.assertEqual(kwargs["temperature"], 0.1)
+        self.assertNotIn("temperature", kwargs)
         self.assertNotIn("base_url", kwargs)
 
     def test_voice_available_accepts_openai_stt_without_vosk(self):
@@ -275,17 +275,20 @@ class VoiceAndWeeekTests(unittest.TestCase):
         old_stt_client = bot._openai_stt_client
         old_stt_available = bot._openai_stt_available
         old_vosk_available = bot._vosk_available
+        old_convert = bot._convert_audio_for_openai_stt
         bot._openai_stt_client = types.SimpleNamespace(
             audio=types.SimpleNamespace(transcriptions=transcriptions)
         )
         bot._openai_stt_available = lambda: True
         bot._vosk_available = lambda: False
+        bot._convert_audio_for_openai_stt = lambda path: path
         try:
             result = asyncio.run(bot.transcribe_voice(_FakeVoiceFile()))
         finally:
             bot._openai_stt_client = old_stt_client
             bot._openai_stt_available = old_stt_available
             bot._vosk_available = old_vosk_available
+            bot._convert_audio_for_openai_stt = old_convert
 
         self.assertEqual(transcriptions.calls, 1)
         self.assertEqual(result["text"], "openai transcript")
@@ -321,6 +324,7 @@ class VoiceAndWeeekTests(unittest.TestCase):
         old_which = bot.shutil.which
         old_get_vosk_model = bot._get_vosk_model
         old_vosk_transcribe_file = bot._vosk_transcribe_file
+        old_convert = bot._convert_audio_for_openai_stt
         bot._openai_stt_client = types.SimpleNamespace(
             audio=types.SimpleNamespace(transcriptions=_BrokenSttTranscriptions())
         )
@@ -329,6 +333,7 @@ class VoiceAndWeeekTests(unittest.TestCase):
         bot.shutil.which = lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None
         bot._get_vosk_model = lambda: object()
         bot._vosk_transcribe_file = lambda _path: "vosk transcript"
+        bot._convert_audio_for_openai_stt = lambda path: path
         try:
             result = asyncio.run(bot.transcribe_voice(_FakeVoiceFile()))
         finally:
@@ -338,6 +343,7 @@ class VoiceAndWeeekTests(unittest.TestCase):
             bot.shutil.which = old_which
             bot._get_vosk_model = old_get_vosk_model
             bot._vosk_transcribe_file = old_vosk_transcribe_file
+            bot._convert_audio_for_openai_stt = old_convert
 
         self.assertEqual(result["text"], "vosk transcript")
         self.assertEqual(result["engine"], "vosk")
@@ -359,6 +365,18 @@ class VoiceAndWeeekTests(unittest.TestCase):
             }
         )
         self.assertEqual(title, "Подготовить оффер — см. описание")
+
+
+    def test_weeek_done_column_is_filtered_from_picker(self):
+        columns = [
+            {"id": "1", "name": "К работе", "raw": {}},
+            {"id": "2", "name": "В работе", "raw": {}},
+            {"id": "3", "name": "Готово", "raw": {}},
+        ]
+
+        filtered = bot._sort_weeek_columns(columns, "")
+
+        self.assertEqual([item["name"] for item in filtered], ["В работе", "К работе"])
 
 
 class RouteAndSubtaskTests(unittest.TestCase):

@@ -3171,6 +3171,938 @@ async def post_init(application: Application):
     logger.info("Bot started; reminders scheduled.")
 
 
+def _log_event(event: str, **fields):
+    parts = []
+    for key, value in fields.items():
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, str):
+            parts.append(f"{key}={value!r}")
+        else:
+            parts.append(f"{key}={value}")
+    logger.info("%s %s", event, " ".join(parts).strip())
+
+
+def _voice_message_meta(update: Update) -> dict:
+    message = update.message or (update.callback_query.message if update.callback_query else None)
+    voice = (message.voice if message else None) or (message.audio if message else None)
+    return {
+        "chat_id": getattr(update.effective_chat, "id", ""),
+        "user_id": getattr(update.effective_user, "id", ""),
+        "message_id": getattr(message, "message_id", ""),
+        "file_id": getattr(voice, "file_id", ""),
+        "duration": getattr(voice, "duration", ""),
+        "file_size": getattr(voice, "file_size", ""),
+    }
+
+
+def _set_active_flow(context: ContextTypes.DEFAULT_TYPE, flow: str):
+    context.user_data["_active_flow"] = flow
+
+
+def _clear_active_flow(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("_active_flow", None)
+
+
+def _reset_transient_flow_state(context: ContextTypes.DEFAULT_TYPE):
+    for key in (
+        "brief",
+        "weeek_draft",
+        "pending_reminder_capture",
+        "pending_reminder_attempts",
+        "_active_flow",
+    ):
+        context.user_data.pop(key, None)
+
+
+def _convert_audio_for_openai_stt(audio_path: str) -> str:
+    wav_path = audio_path + ".wav"
+    try:
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y", "-i", audio_path,
+                "-ar", "16000", "-ac", "1", "-f", "wav", wav_path,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("ffmpeg_missing") from exc
+    if result.returncode != 0:
+        stderr = result.stderr.decode(errors="ignore")[:300]
+        raise RuntimeError(f"ffmpeg_convert_failed:{stderr}")
+    _log_event("voice_converted_for_openai", source_path=audio_path, converted_path=wav_path)
+    return wav_path
+
+
+def _chat_json_request_kwargs(model: str, messages: list[dict], temperature: float) -> dict:
+    return {
+        "model": model,
+        "messages": messages,
+        "response_format": {"type": "json_object"},
+    }
+
+
+def _openai_transcribe_file(audio_path: str) -> str:
+    converted_path = _convert_audio_for_openai_stt(audio_path)
+    try:
+        with open(converted_path, "rb") as audio_file:
+            response = _openai_stt_client.audio.transcriptions.create(
+                model=OPENAI_STT_MODEL,
+                file=audio_file,
+            )
+        return _compact_spaces(getattr(response, "text", "") or "")
+    finally:
+        try:
+            os.unlink(converted_path)
+        except OSError:
+            pass
+
+
+async def transcribe_voice(voice_file, update: Update | None = None):
+    if not voice_available():
+        if not _vosk_available() and not _openai_stt_available():
+            return {"text": "", "engine": "", "error": "voice_unavailable"}
+        if not shutil.which("ffmpeg"):
+            return {"text": "", "engine": "vosk", "error": "ffmpeg_missing"}
+        return {"text": "", "engine": "vosk", "error": "vosk_unavailable"}
+
+    meta = _voice_message_meta(update) if update else {}
+    with tempfile.NamedTemporaryFile(suffix=".oga", delete=False) as tmp:
+        tmp_path = tmp.name
+    try:
+        await voice_file.download_to_drive(tmp_path)
+        _log_event("voice_downloaded", path=tmp_path, **meta)
+        if _openai_stt_available():
+            try:
+                _log_event("openai_stt_request_started", model=OPENAI_STT_MODEL, **meta)
+                text = await _async_call(_openai_transcribe_file, tmp_path)
+                if text:
+                    _log_event("openai_stt_request_succeeded", model=OPENAI_STT_MODEL, transcript=text, **meta)
+                    logger.info("voice transcription engine=%s", _openai_stt_engine_label())
+                    return {"text": text, "engine": _openai_stt_engine_label()}
+            except Exception as exc:
+                openai_error = _openai_stt_error_code(exc)
+                logger.warning(
+                    "primary_stt_failed code=%s model=%s official_api=true fallback=vosk error=%s",
+                    openai_error,
+                    OPENAI_STT_MODEL,
+                    exc,
+                )
+            else:
+                openai_error = "openai_stt_empty"
+        else:
+            openai_error = ""
+
+        if not _vosk_available():
+            return {"text": "", "engine": _openai_stt_engine_label(), "error": openai_error or "vosk_unavailable"}
+        if not shutil.which("ffmpeg"):
+            return {"text": "", "engine": "vosk", "error": openai_error or "ffmpeg_missing"}
+
+        _log_event("vosk_fallback_started", reason=openai_error or "primary_unavailable", **meta)
+        model = await _async_call(_get_vosk_model)
+        if model is None:
+            return {"text": "", "engine": "vosk", "error": openai_error or "vosk_model_unavailable"}
+        text = await _async_call(_vosk_transcribe_file, tmp_path)
+        text = (text or "").strip()
+        if text:
+            _log_event("vosk_fallback_succeeded", transcript=text, **meta)
+            logger.info("voice transcription engine=vosk")
+            return {"text": text, "engine": "vosk"}
+        return {"text": "", "engine": "vosk", "error": openai_error or "vosk_empty"}
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def build_weeek_task_title(capture: dict) -> str:
+    title = _compact_spaces(capture.get("title") or "")
+    body = _compact_spaces(capture.get("body") or "")
+    if not title:
+        title = "Новая задача"
+    if body and body.casefold() != title.casefold() and "см. описание" not in title.lower():
+        title = f"{title} — см. описание"
+    return title[:120]
+
+
+def weeek_preview_message(draft: dict) -> str:
+    capture = draft.get("capture") or {}
+    project = draft.get("project_name") or "—"
+    board = draft.get("board_name") or "—"
+    column = draft.get("column_name") or "—"
+    title = build_weeek_task_title(capture)
+    body = _compact_spaces(capture.get("body") or "")
+    due_date = capture.get("due_date") or ""
+    due_time = capture.get("due_time") or ""
+    timezone = capture.get("timezone") or ""
+    parent_task = draft.get("parent_task_name") or ""
+    transcript = _compact_spaces(capture.get("transcript_clean") or capture.get("transcript") or "")
+
+    parts = [
+        "🧩 <b>Черновик задачи для Weeek</b>",
+        "",
+        f"<b>Название:</b> {html.escape(title)}",
+        f"<b>Проект:</b> {html.escape(project)}",
+        f"<b>Доска:</b> {html.escape(board)}",
+        f"<b>Колонка:</b> {html.escape(column)}",
+    ]
+    if parent_task:
+        parts.append(f"<b>Родительская задача:</b> {html.escape(parent_task)}")
+    if due_date or due_time:
+        parts.append(f"<b>Срок:</b> {html.escape((due_date + ' ' + due_time).strip())}")
+    if timezone:
+        parts.append(f"<b>Часовой пояс:</b> {html.escape(timezone)}")
+    if body:
+        parts.extend(["", f"<b>Описание:</b> {html.escape(body)}"])
+    if transcript:
+        parts.extend(["", f"<b>Транскрипция:</b> {html.escape(transcript)}"])
+    return "\n".join(parts)
+
+
+def weeek_preview_keyboard(draft: dict | None = None) -> InlineKeyboardMarkup:
+    draft = draft or {}
+    rows = [[InlineKeyboardButton("✅ Создать в Weeek", callback_data="weeek_create")]]
+    if draft.get("target") == "weeek_subtask":
+        rows.append([InlineKeyboardButton("🔁 Выбрать родителя заново", callback_data="weeek_repick_parent")])
+    rows.append([InlineKeyboardButton("🔁 Выбрать колонку заново", callback_data="weeek_repick_column")])
+    rows.append([InlineKeyboardButton("✖️ Отмена", callback_data="weeek_cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def weeek_preview_message_ex(draft: dict) -> str:
+    return weeek_preview_message(draft)
+
+
+def weeek_preview_keyboard_ex(draft: dict | None = None) -> InlineKeyboardMarkup:
+    return weeek_preview_keyboard(draft)
+
+
+def _is_done_weeek_column(column: dict) -> bool:
+    name = _normalize_text(column.get("name") or "")
+    raw = column.get("raw") or {}
+    slug = _normalize_text(str(raw.get("slug") or raw.get("key") or raw.get("code") or raw.get("status") or ""))
+    return any(token in name or token == slug for token in ("готово", "сделано", "done", "complete", "completed"))
+
+
+def _sort_weeek_columns(columns: list[dict], hint: str) -> list[dict]:
+    filtered = [column for column in columns if not _is_done_weeek_column(column)]
+    if not filtered:
+        filtered = list(columns)
+
+    def score(column: dict) -> tuple[int, str]:
+        name = _normalize_text(column.get("name") or "")
+        raw = column.get("raw") or {}
+        slug = _normalize_text(str(raw.get("slug") or raw.get("key") or raw.get("code") or raw.get("status") or ""))
+        if hint and (hint in name or hint == slug):
+            return (0, name)
+        if hint == "to_work" and any(token in name or token == slug for token in ("к работе", "to work", "todo", "backlog", "queue")):
+            return (0, name)
+        if hint == "in_work" and any(token in name or token == slug for token in ("в работе", "in work", "progress", "doing")):
+            return (0, name)
+        return (1, name)
+
+    return sorted(filtered, key=score)
+
+
+async def _send_weeek_project_picker(message, context: ContextTypes.DEFAULT_TYPE):
+    client = get_weeek_client()
+    projects = await client.list_projects()
+    if not projects:
+        await message.reply_text(
+            "Не смог найти проекты в Weeek. Проверь WEEEK_API_TOKEN, WEEEK_API_BASE_URL и доступы у токена.",
+            reply_markup=main_menu_keyboard(),
+        )
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        return ConversationHandler.END
+
+    draft = _get_weeek_draft(context)
+    draft["projects"] = [{"id": option.id, "name": option.name, "raw": option.raw} for option in projects]
+    _log_event("weeek_projects_loaded", count=len(draft["projects"]))
+    await message.reply_text(
+        "Выбери проект для задачи в Weeek:",
+        reply_markup=_weeek_options_keyboard(draft["projects"], "weeek_project"),
+    )
+    return WEEEK_PROJECT
+
+
+async def _send_weeek_board_picker(message, context: ContextTypes.DEFAULT_TYPE):
+    draft = _get_weeek_draft(context)
+    project_id = draft.get("project_id")
+    client = get_weeek_client()
+    boards = await client.list_boards(project_id)
+    if not boards:
+        await message.reply_text(
+            "Для выбранного проекта не нашёл доски Weeek. Проверь структуру проекта в Weeek.",
+            reply_markup=main_menu_keyboard(),
+        )
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        return ConversationHandler.END
+
+    draft["boards"] = [{"id": option.id, "name": option.name, "raw": option.raw} for option in boards]
+    _log_event("weeek_boards_loaded", count=len(draft["boards"]), project_id=project_id)
+    await message.reply_text(
+        "Теперь выбери доску:",
+        reply_markup=_weeek_options_keyboard(draft["boards"], "weeek_board"),
+    )
+    return WEEEK_BOARD
+
+
+async def _send_weeek_column_picker(message, context: ContextTypes.DEFAULT_TYPE):
+    draft = _get_weeek_draft(context)
+    board_id = draft.get("board_id")
+    client = get_weeek_client()
+    columns = await client.list_columns(board_id)
+    if not columns:
+        await message.reply_text(
+            "Не смог получить колонки этой доски Weeek. Возможно, API вернул непривычный формат.",
+            reply_markup=main_menu_keyboard(),
+        )
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        return ConversationHandler.END
+
+    mapped = [{"id": option.id, "name": option.name, "raw": option.raw} for option in columns]
+    _log_event("weeek_columns_loaded", board_id=board_id, columns=[item["name"] for item in mapped])
+    filtered = _sort_weeek_columns(mapped, draft.get("column_hint", ""))
+    draft["columns"] = filtered
+    _log_event("weeek_columns_filtered", board_id=board_id, columns=[item["name"] for item in filtered])
+    hint = draft.get("column_hint", "")
+    if hint:
+        matched = [column for column in filtered if _column_matches_hint(column.get("name", ""), hint)]
+        if len(matched) == 1:
+            draft["column_id"] = matched[0]["id"]
+            draft["column_name"] = matched[0]["name"]
+            _log_event("weeek_column_auto_selected", board_id=board_id, column_id=matched[0]["id"], column_name=matched[0]["name"], hint=hint)
+            return await _show_weeek_preview(message, context)
+    await message.reply_text(
+        "И последним шагом выбери колонку:",
+        reply_markup=_weeek_options_keyboard(filtered, "weeek_column"),
+    )
+    return WEEEK_COLUMN
+
+
+async def _send_weeek_parent_picker(message, context: ContextTypes.DEFAULT_TYPE):
+    draft = _get_weeek_draft(context)
+    client = get_weeek_client()
+    tasks = await client.list_tasks(draft.get("project_id", ""), draft.get("board_id", ""))
+    if not tasks:
+        await message.reply_text(
+            "Не смог получить список задач в этой доске Weeek.",
+            reply_markup=main_menu_keyboard(),
+        )
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        return ConversationHandler.END
+
+    mapped = [{"id": option.id, "name": option.name, "raw": option.raw} for option in tasks]
+    draft["parent_tasks"] = mapped
+    candidate = draft.get("parent_task_candidate") or ""
+    parent_task, match_source = _match_parent_task(mapped, candidate)
+    if parent_task:
+        draft["parent_task_id"] = parent_task["id"]
+        draft["parent_task_name"] = parent_task["name"]
+        draft["parent_task_match_source"] = match_source
+        logger.info("weeek_subtask parent_task_match_source=%s parent_task=%r", match_source, parent_task["name"])
+        return await _send_weeek_column_picker(message, context)
+
+    if candidate:
+        await message.reply_text(
+            "Не смог точно подобрать родительскую задачу. Выбери её вручную:",
+            reply_markup=_weeek_options_keyboard(mapped, "weeek_parent"),
+        )
+    else:
+        await message.reply_text(
+            "Выбери родительскую задачу:",
+            reply_markup=_weeek_options_keyboard(mapped, "weeek_parent"),
+        )
+    return WEEEK_PARENT
+
+
+async def _show_weeek_preview(message, context: ContextTypes.DEFAULT_TYPE):
+    draft = _get_weeek_draft(context)
+    _set_active_flow(context, "weeek_preview")
+    _log_event(
+        "weeek_preview_rendered",
+        project_id=draft.get("project_id", ""),
+        board_id=draft.get("board_id", ""),
+        column_id=draft.get("column_id", ""),
+        target=draft.get("target", ""),
+        title=(draft.get("capture") or {}).get("title", ""),
+    )
+    await message.reply_html(
+        weeek_preview_message(draft),
+        reply_markup=weeek_preview_keyboard(draft),
+    )
+    return WEEEK_PREVIEW
+
+
+async def _start_weeek_capture(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_text: str, return_state: bool = False):
+    if not weeek_available():
+        await update.message.reply_text(
+            "Интеграция с Weeek пока не настроена. Проверь WEEEK_API_TOKEN.",
+            reply_markup=main_menu_keyboard(),
+        )
+        _clear_active_flow(context)
+        return ConversationHandler.END
+
+    clean_text = strip_weeek_request_prefix(raw_text)
+    if not clean_text:
+        clean_text = normalize_capture_command_text(raw_text)
+        clean_text = re.sub(r"^(?:в\s+)?(?:weeek|вик)\s+", "", clean_text, flags=re.IGNORECASE)
+        clean_text = _compact_spaces(clean_text).strip(" .,!?:;")
+    if not clean_text:
+        await update.message.reply_text(
+            "Напиши или наговори, что именно нужно сделать в Weeek.",
+            reply_markup=cancel_keyboard(),
+        )
+        return WEEEK_CAPTURE if return_state else ConversationHandler.END
+
+    route = detect_top_level_route(raw_text)
+    capture = await classify_capture(update, clean_text, forced_type="task")
+    capture["transcript"] = raw_text
+    capture["transcript_clean"] = capture.get("transcript_clean") or clean_text
+    capture["speech_engine"] = context.user_data.get("_last_speech_engine", "")
+
+    draft = _get_weeek_draft(context)
+    draft.clear()
+    draft.update(
+        {
+            "capture": capture,
+            "target": route.get("target") or capture.get("target") or "weeek_task",
+            "column_hint": route.get("column_hint") or capture.get("column_hint") or normalize_weeek_column_hint(raw_text),
+            "parent_task_candidate": route.get("parent_task_candidate") or capture.get("parent_task_candidate") or "",
+        }
+    )
+    auto_project = route.get("project") or match_weeek_target(capture.get("project_name_candidate") or "")
+    if auto_project:
+        draft.update(auto_project)
+
+    _set_active_flow(context, "weeek_capture")
+    _log_event(
+        "weeek_capture_started",
+        transcript=raw_text,
+        transcript_clean=clean_text,
+        target=draft.get("target", ""),
+        project_candidate=(auto_project or {}).get("project_name", ""),
+        column_hint=draft.get("column_hint", ""),
+        speech_engine=capture.get("speech_engine", ""),
+    )
+
+    if auto_project:
+        if draft.get("target") == "weeek_subtask":
+            next_state = await _send_weeek_parent_picker(update.message, context)
+        else:
+            next_state = await _send_weeek_column_picker(update.message, context)
+    else:
+        next_state = await _send_weeek_project_picker(update.message, context)
+    return next_state if return_state else ConversationHandler.END
+
+
+async def _transcribe_or_warn(update: Update, context: ContextTypes.DEFAULT_TYPE, failure_reply_markup=None):
+    failure_reply_markup = failure_reply_markup or cancel_keyboard()
+    if not voice_available():
+        await update.message.reply_text(
+            "🎤 Голосовой ввод сейчас не настроен. Напиши текстом, пожалуйста.",
+            reply_markup=failure_reply_markup,
+        )
+        return None
+
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+    voice = update.message.voice or update.message.audio
+    if not voice:
+        return None
+
+    try:
+        file = await voice.get_file()
+        result = await asyncio.wait_for(transcribe_voice(file, update=update), timeout=45)
+    except asyncio.TimeoutError:
+        logger.exception("Voice transcription timed out")
+        await update.message.reply_text(
+            transcription_error_text("transcription_timeout"),
+            reply_markup=failure_reply_markup,
+        )
+        return None
+    except Exception:
+        logger.exception("Не удалось распознать голосовое")
+        await update.message.reply_text(
+            "Не удалось распознать голосовое. Попробуй ещё раз или введи текстом.",
+            reply_markup=failure_reply_markup,
+        )
+        return None
+
+    if isinstance(result, dict):
+        text = result.get("text")
+        speech_engine = result.get("engine", "")
+        error = result.get("error", "")
+    else:
+        text = result
+        speech_engine = ""
+        error = ""
+    context.user_data["_last_speech_engine"] = speech_engine
+
+    if not text:
+        message = transcription_error_text(error) if error else "Голос распознался как пустой. Попробуй ещё раз или введи текстом."
+        await update.message.reply_text(message, reply_markup=failure_reply_markup)
+        return None
+
+    logger.info("voice_transcribed raw_transcript=%r speech_engine=%s", text, speech_engine)
+    return text
+
+
+async def _maybe_override_with_weeek_voice(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, previous_state: str):
+    route = detect_top_level_route(text)
+    _log_event(
+        "voice_route_detected",
+        previous_state=previous_state,
+        active_flow=context.user_data.get("_active_flow", ""),
+        new_target=route.get("target", ""),
+        project=((route.get("project") or {}).get("project_name") or ""),
+        column_hint=route.get("column_hint", ""),
+    )
+    if route.get("target") not in {"weeek_task", "weeek_subtask"}:
+        return None
+    _log_event(
+        "voice_route_override_previous_state",
+        previous_state=previous_state,
+        new_target=route.get("target", ""),
+        transcript=text,
+    )
+    _reset_transient_flow_state(context)
+    return await _start_weeek_capture(update, context, text, return_state=False)
+
+
+async def add_brief_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = await _transcribe_or_warn(update, context, failure_reply_markup=main_menu_keyboard())
+    if text is None:
+        return BRIEF
+    override = await _maybe_override_with_weeek_voice(update, context, text, "idea_brief")
+    if override is not None:
+        return override
+    return await _handle_brief_text(update, context, text)
+
+
+async def add_details_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = await _transcribe_or_warn(update, context)
+    if text is None:
+        return DETAILS
+    override = await _maybe_override_with_weeek_voice(update, context, text, "idea_details")
+    if override is not None:
+        return override
+    return await _handle_details_text(update, context, text)
+
+
+async def task_add_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = await _transcribe_or_warn(update, context)
+    if text is None:
+        return TASK_TEXT
+    override = await _maybe_override_with_weeek_voice(update, context, text, "task_text")
+    if override is not None:
+        return override
+    speech_engine = context.user_data.pop("_last_speech_engine", "")
+    return await _handle_task_text(update, context, text, transcript=text, speech_engine=speech_engine)
+
+
+async def weeek_capture_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = await _transcribe_or_warn(update, context, failure_reply_markup=cancel_keyboard())
+    if not text:
+        return WEEEK_CAPTURE
+    return await _start_weeek_capture(update, context, text, return_state=True)
+
+
+async def clarify_reminder_time_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = await _transcribe_or_warn(update, context)
+    if text is None:
+        return CLARIFY_REMINDER_TIME
+    override = await _maybe_override_with_weeek_voice(update, context, text, "clarify_reminder_time")
+    if override is not None:
+        return override
+    logger.info("reminder_time_clarification_voice raw_transcript=%r speech_engine=%s", text, context.user_data.get("_last_speech_engine", ""))
+    return await _handle_clarified_time_text(update, context, text)
+
+
+async def classify_capture(update: Update, text: str, forced_type: str | None = None) -> dict:
+    user_id = update.effective_user.id
+    default_timezone = effective_user_timezone(user_id)
+    _log_event("capture_gpt_parse_started", model=OPENAI_PARSE_MODEL, forced_type=forced_type or "", transcript=text)
+    parsed = await parse_capture_with_gpt(text, default_timezone)
+    if parsed:
+        capture = parsed
+        _log_event(
+            "capture_gpt_parse_succeeded",
+            model=OPENAI_PARSE_MODEL,
+            target=capture.get("target", ""),
+            project_candidate=capture.get("project_name_candidate", ""),
+            column_hint=capture.get("column_hint", ""),
+            source=capture.get("source", ""),
+        )
+    else:
+        capture = classify_capture_text(text)
+        _log_event(
+            "capture_gpt_parse_failed",
+            model=OPENAI_PARSE_MODEL,
+            target=capture.get("target", ""),
+            project_candidate=capture.get("project_name_candidate", ""),
+            column_hint=capture.get("column_hint", ""),
+            source="rules",
+        )
+
+    if forced_type:
+        capture["type"] = forced_type
+
+    timezone = capture.get("timezone") or default_timezone
+    due_time = capture.get("due_time", "")
+    due_date = capture.get("due_date", "")
+    if not due_time:
+        rule_due_time = extract_capture_due_time(text)
+        if rule_due_time:
+            due_time = rule_due_time
+    if due_time and not due_date:
+        due_date = resolve_capture_due_date(text, timezone, due_time)
+    if due_date and not due_time and capture["type"] == "reminder":
+        capture["needs_time_clarification"] = True
+        capture["clarification_reason"] = capture.get("clarification_reason") or "не хватает точного времени"
+    capture["due_time"] = due_time
+    capture["due_date"] = due_date
+    capture["timezone"] = timezone
+    return capture
+
+
+async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not voice_available():
+        await update.message.reply_text(
+            "🎤 Голосовой ввод сейчас не настроен. Команда /voice покажет, как включить.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    _clear_active_flow(context)
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+    text = await _transcribe_or_warn(update, context)
+    if not text:
+        return ConversationHandler.END
+
+    route = detect_top_level_route(text)
+    _log_event(
+        "voice_route_detected",
+        previous_state="top_level",
+        active_flow=context.user_data.get("_active_flow", ""),
+        new_target=route.get("target", ""),
+        project=((route.get("project") or {}).get("project_name") or ""),
+        column_hint=route.get("column_hint", ""),
+    )
+    if route.get("target") in {"weeek_task", "weeek_subtask"}:
+        return await _start_weeek_capture(update, context, text, return_state=False)
+
+    user_id = update.effective_user.id
+    db.upsert_user(user_id)
+    forced_type = "task" if route.get("target") == "local_task" else "reminder" if route.get("target") == "reminder" else None
+    capture = await classify_capture(update, text, forced_type=forced_type)
+    capture_type = capture["type"]
+    speech_engine = context.user_data.pop("_last_speech_engine", "")
+    capture["speech_engine"] = speech_engine
+    capture["transcript"] = text
+    capture["transcript_clean"] = capture.get("transcript_clean") or text
+    _log_voice_capture(text, capture, speech_engine)
+
+    if _needs_reminder_time_clarification(capture):
+        context.user_data["pending_reminder_capture"] = capture
+        context.user_data["pending_reminder_attempts"] = 0
+        _set_active_flow(context, "clarify_reminder_time")
+        await _ask_reminder_time_clarification(update, context)
+        return CLARIFY_REMINDER_TIME
+
+    if capture_type in {"task", "reminder"}:
+        task_id = _create_task_from_capture(user_id, capture)
+        await _send_created_task(update, capture, task_id, recognized_text=text, reminder=capture_type == "reminder")
+        _clear_active_flow(context)
+        return ConversationHandler.END
+
+    brief = capture["title"]
+    details = capture["body"]
+    if _openai_client and capture.get("source") != "gpt":
+        parsed = await parse_idea_with_gpt(text)
+        if parsed:
+            brief, details = parsed
+
+    if not brief:
+        first = text.split(".")[0].strip() or text.strip()
+        brief = first[:120]
+        details = text.strip()
+
+    idea_id = db.add_idea(user_id, brief, details)
+    schedule_user_reminders(context.application, user_id)
+    await update.message.reply_html(
+        f"✅ Идея сохранена!\n\n{brief_message(brief)}",
+        reply_markup=main_menu_keyboard(),
+    )
+    if details and details.casefold() != brief.casefold():
+        await update.message.reply_html(f"<b>Описание:</b> {html.escape(details)}", reply_markup=main_menu_keyboard())
+    transcription = transcription_message(text, speech_engine)
+    if transcription:
+        await update.message.reply_html(transcription.lstrip(), reply_markup=main_menu_keyboard())
+    await update.message.reply_text("Что дальше?", reply_markup=post_save_keyboard(idea_id))
+    _clear_active_flow(context)
+    return ConversationHandler.END
+
+
+async def weeek_project_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    draft = _get_weeek_draft(context)
+    if not draft:
+        await query.answer("Черновик задачи Weeek потерян. Начни заново.", show_alert=True)
+        return ConversationHandler.END
+    project_id = (query.data or "").split(":", 1)[1]
+    project = next((item for item in draft.get("projects", []) if item["id"] == project_id), None)
+    if not project:
+        await query.answer("Проект устарел, выбери ещё раз.", show_alert=True)
+        return await _send_weeek_project_picker(query.message, context)
+    draft["project_id"] = project["id"]
+    draft["project_name"] = project["name"]
+    _log_event("weeek_project_selected", project_id=project["id"], project_name=project["name"])
+    known_project = WEEEK_TARGETS.get(str(project["id"]))
+    if known_project:
+        draft["board_id"] = known_project["board_id"]
+        draft["board_name"] = known_project["board_name"]
+        if draft.get("target") == "weeek_subtask":
+            return await _send_weeek_parent_picker(query.message, context)
+        return await _send_weeek_column_picker(query.message, context)
+    return await _send_weeek_board_picker(query.message, context)
+
+
+async def weeek_board_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    draft = _get_weeek_draft(context)
+    if not draft:
+        await query.answer("Черновик задачи Weeek потерян. Начни заново.", show_alert=True)
+        return ConversationHandler.END
+    board_id = (query.data or "").split(":", 1)[1]
+    board = next((item for item in draft.get("boards", []) if item["id"] == board_id), None)
+    if not board:
+        await query.answer("Доска устарела, выбери ещё раз.", show_alert=True)
+        return await _send_weeek_board_picker(query.message, context)
+    draft["board_id"] = board["id"]
+    draft["board_name"] = board["name"]
+    _log_event("weeek_board_selected", board_id=board["id"], board_name=board["name"])
+    if draft.get("target") == "weeek_subtask":
+        return await _send_weeek_parent_picker(query.message, context)
+    return await _send_weeek_column_picker(query.message, context)
+
+
+async def weeek_column_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    draft = _get_weeek_draft(context)
+    if not draft:
+        await query.answer("Черновик задачи Weeek потерян. Начни заново.", show_alert=True)
+        return ConversationHandler.END
+    column_id = (query.data or "").split(":", 1)[1]
+    column = next((item for item in draft.get("columns", []) if item["id"] == column_id), None)
+    if not column:
+        await query.answer("Колонка устарела, выбери ещё раз.", show_alert=True)
+        return await _send_weeek_column_picker(query.message, context)
+    draft["column_id"] = column["id"]
+    draft["column_name"] = column["name"]
+    _log_event("weeek_column_selected", column_id=column["id"], column_name=column["name"])
+    return await _show_weeek_preview(query.message, context)
+
+
+async def weeek_parent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    draft = _get_weeek_draft(context)
+    if not draft:
+        await query.answer("Черновик задачи Weeek потерян. Начни заново.", show_alert=True)
+        return ConversationHandler.END
+    parent_id = (query.data or "").split(":", 1)[1]
+    parent = next((item for item in draft.get("parent_tasks", []) if item["id"] == parent_id), None)
+    if not parent:
+        await query.answer("Родительская задача устарела. Выбери ещё раз.", show_alert=True)
+        return await _send_weeek_parent_picker(query.message, context)
+    draft["parent_task_id"] = parent["id"]
+    draft["parent_task_name"] = parent["name"]
+    draft["parent_task_match_source"] = "manual"
+    _log_event("weeek_parent_selected", parent_task_id=parent["id"], parent_task_name=parent["name"])
+    return await _send_weeek_column_picker(query.message, context)
+
+
+async def weeek_preview_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+
+    if data == "weeek_cancel":
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        await query.message.reply_text("Ок, отменил создание задачи в Weeek.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    if data == "weeek_repick_column":
+        return await _send_weeek_column_picker(query.message, context)
+
+    if data == "weeek_repick_parent":
+        return await _send_weeek_parent_picker(query.message, context)
+
+    if data != "weeek_create":
+        return WEEEK_PREVIEW
+
+    draft = _get_weeek_draft(context)
+    if not draft:
+        await query.answer("Черновик задачи Weeek потерян. Начни заново.", show_alert=True)
+        return ConversationHandler.END
+    capture = draft.get("capture") or {}
+    client = get_weeek_client()
+    _log_event(
+        "weeek_task_create_started",
+        target=draft.get("target", ""),
+        project_id=draft.get("project_id", ""),
+        board_id=draft.get("board_id", ""),
+        column_id=draft.get("column_id", ""),
+        title=build_weeek_task_title(capture),
+    )
+    try:
+        if draft.get("target") == "weeek_subtask":
+            response = await client.create_subtask(
+                title=build_weeek_task_title(capture),
+                description=_compact_spaces(capture.get("body") or ""),
+                project_id=draft.get("project_id", ""),
+                board_id=draft.get("board_id", ""),
+                column_id=draft.get("column_id", ""),
+                parent_task_id=draft.get("parent_task_id", ""),
+                due_date=capture.get("due_date", ""),
+                due_time=capture.get("due_time", ""),
+            )
+        else:
+            response = await client.create_task(
+                title=build_weeek_task_title(capture),
+                description=_compact_spaces(capture.get("body") or ""),
+                project_id=draft.get("project_id", ""),
+                board_id=draft.get("board_id", ""),
+                column_id=draft.get("column_id", ""),
+                due_date=capture.get("due_date", ""),
+                due_time=capture.get("due_time", ""),
+            )
+    except WeeekApiError as exc:
+        _log_event("weeek_task_create_failed", error=str(exc))
+        await query.message.reply_text(
+            f"Не удалось создать задачу в Weeek: {exc}",
+            reply_markup=main_menu_keyboard(),
+        )
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        return ConversationHandler.END
+
+    title = build_weeek_task_title(capture)
+    task_id = response.get("id") or response.get("_id") or response.get("taskId") or "?"
+    _log_event("weeek_task_create_succeeded", task_id=task_id, title=title)
+    await query.message.reply_html(
+        "✅ <b>Задача отправлена в Weeek</b>\n\n"
+        f"<b>ID:</b> {html.escape(str(task_id))}\n"
+        f"<b>Название:</b> {html.escape(title)}\n"
+        f"<b>Проект:</b> {html.escape(draft.get('project_name', '—'))}\n"
+        f"<b>Доска:</b> {html.escape(draft.get('board_name', '—'))}\n"
+        f"<b>Колонка:</b> {html.escape(draft.get('column_name', '—'))}",
+        reply_markup=main_menu_keyboard(),
+    )
+    transcription = transcription_message(capture.get("transcript_clean") or capture.get("transcript") or "", capture.get("speech_engine", ""))
+    if transcription:
+        await query.message.reply_html(transcription.lstrip(), reply_markup=main_menu_keyboard())
+    _clear_weeek_draft(context)
+    _clear_active_flow(context)
+    return ConversationHandler.END
+
+
+async def text_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text:
+        return ConversationHandler.END
+
+    route = detect_top_level_route(text)
+    if route.get("target") in {"weeek_task", "weeek_subtask"}:
+        return await _start_weeek_capture(update, context, text, return_state=False)
+
+    user_id = update.effective_user.id
+    db.upsert_user(user_id)
+
+    forced_type = "task" if route.get("target") == "local_task" else "reminder" if route.get("target") == "reminder" else None
+    capture = await classify_capture(update, text, forced_type=forced_type)
+    capture_type = capture["type"]
+    logger.info(
+        "text_capture raw_text=%r type=%s title=%r body=%r due_date=%s due_time=%s timezone=%s source=%s confidence=%.2f time_confidence=%.2f needs_time_clarification=%s",
+        text,
+        capture.get("type", ""),
+        capture.get("title", ""),
+        capture.get("body", ""),
+        capture.get("due_date", ""),
+        capture.get("due_time", ""),
+        capture.get("timezone", ""),
+        capture.get("source", ""),
+        _coerce_confidence(capture.get("confidence"), 0.0),
+        _coerce_confidence(capture.get("time_confidence"), 0.0),
+        bool(capture.get("needs_time_clarification")),
+    )
+
+    if _needs_reminder_time_clarification(capture):
+        context.user_data["pending_reminder_capture"] = capture
+        context.user_data["pending_reminder_attempts"] = 0
+        _set_active_flow(context, "clarify_reminder_time")
+        await _ask_reminder_time_clarification(update, context)
+        return CLARIFY_REMINDER_TIME
+
+    if capture_type in {"task", "reminder"}:
+        task_id = _create_task_from_capture(user_id, capture)
+        await _send_created_task(update, capture, task_id, reminder=capture_type == "reminder")
+        return ConversationHandler.END
+
+    brief = capture["title"]
+    details = capture["body"]
+    if _openai_client and capture.get("source") != "gpt":
+        parsed = await parse_idea_with_gpt(text)
+        if parsed:
+            brief, details = parsed
+
+    if not brief:
+        first = text.split(".")[0].strip() or text.strip()
+        brief = first[:120]
+        details = text.strip()
+
+    idea_id = db.add_idea(user_id, brief, details)
+    schedule_user_reminders(context.application, user_id)
+    await update.message.reply_html(
+        f"✅ Идея сохранена!\n\n{brief_message(brief)}",
+        reply_markup=main_menu_keyboard(),
+    )
+    if details and details.casefold() != brief.casefold():
+        await update.message.reply_html(f"<b>Описание:</b> {html.escape(details)}", reply_markup=main_menu_keyboard())
+    await update.message.reply_text("Что дальше?", reply_markup=post_save_keyboard(idea_id))
+    return ConversationHandler.END
+
+
+_legacy_handle_callback = handle_callback
+
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data or ""
+
+    if data.startswith("weeek_project:"):
+        return await weeek_project_callback(update, context)
+    if data.startswith("weeek_board:"):
+        return await weeek_board_callback(update, context)
+    if data.startswith("weeek_parent:"):
+        return await weeek_parent_callback(update, context)
+    if data.startswith("weeek_column:"):
+        return await weeek_column_callback(update, context)
+    if data.startswith("weeek_"):
+        return await weeek_preview_callback(update, context)
+    return await _legacy_handle_callback(update, context)
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN env var is not set. Copy .env.example to .env and fill it in.")
