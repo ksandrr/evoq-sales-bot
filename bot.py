@@ -2543,6 +2543,7 @@ async def weeek_preview_callback(update: Update, context: ContextTypes.DEFAULT_T
                 parent_task_id=draft.get("parent_task_id", ""),
                 due_date=capture.get("due_date", ""),
                 due_time=capture.get("due_time", ""),
+                timezone_name=capture.get("timezone") or effective_user_timezone(query.from_user.id),
             )
         else:
             response = await client.create_task(
@@ -2553,6 +2554,7 @@ async def weeek_preview_callback(update: Update, context: ContextTypes.DEFAULT_T
                 column_id=draft.get("column_id", ""),
                 due_date=capture.get("due_date", ""),
                 due_time=capture.get("due_time", ""),
+                timezone_name=capture.get("timezone") or effective_user_timezone(query.from_user.id),
             )
     except WeeekApiError as exc:
         await query.message.reply_text(
@@ -3976,6 +3978,7 @@ async def weeek_preview_callback(update: Update, context: ContextTypes.DEFAULT_T
                 parent_task_id=draft.get("parent_task_id", ""),
                 due_date=capture.get("due_date", ""),
                 due_time=capture.get("due_time", ""),
+                timezone_name=capture.get("timezone") or effective_user_timezone(query.from_user.id),
             )
         else:
             response = await client.create_task(
@@ -3986,6 +3989,7 @@ async def weeek_preview_callback(update: Update, context: ContextTypes.DEFAULT_T
                 column_id=draft.get("column_id", ""),
                 due_date=capture.get("due_date", ""),
                 due_time=capture.get("due_time", ""),
+                timezone_name=capture.get("timezone") or effective_user_timezone(query.from_user.id),
             )
     except WeeekApiError as exc:
         _log_event("weeek_task_create_failed", error=str(exc))

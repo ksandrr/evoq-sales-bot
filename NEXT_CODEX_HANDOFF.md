@@ -348,3 +348,53 @@ journalctl -u mira-task-bot.service -n 40 --no-pager
    - voice while another draft is active: must override into a new Weeek flow
    - manual button flow through `Задача ВИК`
    - confirm `Готово` is no longer offered in the column picker
+## Follow-Up On 2026-06-04: Weeek dueDateTime UTC format fix
+
+### Symptom
+
+- Weeek task creation still failed after the previous due-field fix.
+- The live error was:
+  - `422 {"success":false,"errors":{"dueDateTime":["The due date time does not match the format Y-m-d\\TH:i:s\\Z."]}}`
+
+### Root Cause
+
+- The previous fix removed conflicting due fields, but `weeek_client.py` still serialized combined due datetime as local `YYYY-MM-DDTHH:MM`.
+- Weeek expects `dueDateTime` in strict UTC form with seconds and a trailing `Z`.
+- The bot also was not passing the parsed task timezone into the Weeek client, so the client could not convert local captured time into UTC correctly.
+
+### Fix
+
+- In `weeek_client.py`:
+  - added `_format_due_datetime(...)`
+  - convert local `due_date + due_time + timezone_name` into UTC
+  - serialize as `%Y-%m-%dT%H:%M:%SZ`
+- In `bot.py`:
+  - pass `capture["timezone"]` into `create_task(...)` and `create_subtask(...)`
+  - fallback to `effective_user_timezone(...)` if capture timezone is empty
+- In `tests/test_time_parsing.py`:
+  - changed the Weeek payload assertion from local `2026-06-05T22:00`
+  - new expected value for `Asia/Omsk 2026-06-05 22:00` is `2026-06-05T16:00:00Z`
+
+### Validation
+
+Validated on the Linux server:
+
+```bash
+cd /home/sanya/mira-task-bot && .venv/bin/python -m py_compile bot.py weeek_client.py tests/test_time_parsing.py
+cd /home/sanya/mira-task-bot && .venv/bin/python -m unittest discover -s tests
+sudo systemctl restart mira-task-bot.service
+systemctl is-active mira-task-bot.service
+```
+
+Results:
+
+- `py_compile`: passed
+- `unittest`: passed (`32 tests`, `OK`)
+- service status after restart: `active`
+
+### Important Deployment Note
+
+- The code fix is already live on the Linux server after restart.
+- Server-side `git commit` failed because `user.name` / `user.email` are not configured there.
+- Server-side `git push` failed because the server itself does not have GitHub HTTPS credentials configured.
+- The safe fallback is to push from a local authenticated clone and then run `git pull` on the server.

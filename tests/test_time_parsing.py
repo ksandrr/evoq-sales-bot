@@ -433,9 +433,10 @@ class WeeekPayloadTests(unittest.TestCase):
             project_id="6",
             due_date="2026-06-05",
             due_time="22:00",
+            timezone_name="Asia/Omsk",
         )
 
-        self.assertEqual(payload["dueDateTime"], "2026-06-05T22:00")
+        self.assertEqual(payload["dueDateTime"], "2026-06-05T16:00:00Z")
         self.assertNotIn("dueDate", payload)
         self.assertNotIn("dueTime", payload)
         self.assertNotIn("day", payload)

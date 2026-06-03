@@ -1,6 +1,8 @@
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
@@ -200,6 +202,7 @@ class WeeekClient:
         project_id: str = "",
         due_date: str = "",
         due_time: str = "",
+        timezone_name: str = "",
         parent_id: str = "",
     ) -> dict:
         location = {}
@@ -223,8 +226,8 @@ class WeeekClient:
         has_due_date = bool(due_date and re.match(r"^\d{4}-\d{2}-\d{2}$", due_date))
         has_due_time = bool(due_time and re.match(r"^\d{2}:\d{2}$", due_time))
         if has_due_date and has_due_time:
-            # Weeek rejects mixed due fields; send only the combined timestamp.
-            payload["dueDateTime"] = f"{due_date}T{due_time}"
+            # Weeek rejects mixed due fields; send only one UTC timestamp field.
+            payload["dueDateTime"] = self._format_due_datetime(due_date, due_time, timezone_name)
         elif has_due_date:
             payload["dueDate"] = due_date
         elif has_due_time:
@@ -234,6 +237,16 @@ class WeeekClient:
         if self.workspace_id:
             payload["workspaceId"] = self.workspace_id
         return payload
+
+    def _format_due_datetime(self, due_date: str, due_time: str, timezone_name: str) -> str:
+        local_tz = timezone.utc
+        if timezone_name:
+            try:
+                local_tz = ZoneInfo(timezone_name)
+            except ZoneInfoNotFoundError:
+                local_tz = timezone.utc
+        local_dt = datetime.strptime(f"{due_date} {due_time}", "%Y-%m-%d %H:%M").replace(tzinfo=local_tz)
+        return local_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     async def create_task(
         self,
@@ -245,6 +258,7 @@ class WeeekClient:
         project_id: str = "",
         due_date: str = "",
         due_time: str = "",
+        timezone_name: str = "",
     ) -> dict:
         payload = self._task_payload(
             title=title,
@@ -254,6 +268,7 @@ class WeeekClient:
             project_id=project_id,
             due_date=due_date,
             due_time=due_time,
+            timezone_name=timezone_name,
         )
         response = await self._request("POST", "/tm/tasks", json_body=payload)
         if isinstance(response, dict):
@@ -271,6 +286,7 @@ class WeeekClient:
         project_id: str = "",
         due_date: str = "",
         due_time: str = "",
+        timezone_name: str = "",
     ) -> dict:
         payload = self._task_payload(
             title=title,
@@ -280,6 +296,7 @@ class WeeekClient:
             project_id=project_id,
             due_date=due_date,
             due_time=due_time,
+            timezone_name=timezone_name,
             parent_id=parent_task_id,
         )
         response = await self._request("POST", "/tm/tasks", json_body=payload)
