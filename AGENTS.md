@@ -15,7 +15,7 @@
 
 то перед завершением работы нужно обновить файл:
 
-- `H:\TGBots\mira-task-bot\NEXT_CODEX_HANDOFF.md`
+- `H:\TGBots\evoq-sales-bot\NEXT_CODEX_HANDOFF.md`
 
 ## Что обязательно дописывать в NEXT_CODEX_HANDOFF.md
 
