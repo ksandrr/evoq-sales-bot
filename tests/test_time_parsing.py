@@ -408,6 +408,41 @@ class RouteAndSubtaskTests(unittest.TestCase):
         route = bot.detect_top_level_route("добавь задачу завтра в 10 написать Кате")
         self.assertEqual(route["target"], "local_task")
 
+    def test_weeek_routing_metadata_does_not_leak_into_task_content(self):
+        raw_text = "Мира, запиши задачу в личное, что нужно написать Мише завтра в 15:30 и поставь статус к работе"
+        route = bot.detect_top_level_route(raw_text)
+        content_text = bot.strip_weeek_routing_metadata(bot.strip_weeek_request_prefix(raw_text), route)
+        capture = bot.classify_capture_text(content_text)
+        capture = bot.sanitize_weeek_capture_content(capture, route, fallback_text=content_text)
+        polluted_capture = bot.sanitize_weeek_capture_content(
+            {
+                "type": "task",
+                "title": "Написать Мише",
+                "body": "Нужно написать Мише. Раздел: личное, статус: к работе.",
+            },
+            route,
+            fallback_text=content_text,
+        )
+
+        self.assertEqual(route["project"]["project_name"], "Личное")
+        self.assertEqual(route["column_hint"], "to_work")
+        self.assertEqual(capture["title"], "Написать Мише")
+        self.assertNotIn("личное", capture["body"].lower())
+        self.assertNotIn("к работе", capture["body"].lower())
+        self.assertNotIn("статус", capture["body"].lower())
+        self.assertEqual(polluted_capture["body"], "Нужно написать Мише")
+
+    def test_plain_phrase_keeps_useful_content(self):
+        raw_text = "написать Мише завтра в 15:30"
+        route = bot.detect_top_level_route(raw_text)
+        content_text = bot.strip_weeek_routing_metadata(raw_text, route)
+        capture = bot.classify_capture_text(content_text)
+        capture = bot.sanitize_weeek_capture_content(capture, route, fallback_text=content_text)
+
+        self.assertEqual(content_text, raw_text)
+        self.assertIn("Мише", capture["title"])
+        self.assertIn("Мише", capture["body"])
+
     def test_match_parent_task_exact_and_fuzzy(self):
         tasks = [
             {"id": "1", "name": "Разобраться, как парсить аудиторию"},
@@ -440,6 +475,21 @@ class WeeekPayloadTests(unittest.TestCase):
         self.assertNotIn("dueDate", payload)
         self.assertNotIn("dueTime", payload)
         self.assertNotIn("day", payload)
+
+    def test_extract_task_display_id_uses_created_task_id(self):
+        client = weeek_client.WeeekClient(api_token="token", base_url="https://api.weeek.net/public/v1")
+        response = {
+            "success": True,
+            "task": {
+                "id": 74,
+                "title": "[CODEX PROBE] Inspect Weeek create response",
+                "projectId": 6,
+                "boardId": 10,
+                "boardColumnId": 29,
+            },
+        }
+
+        self.assertEqual(client.extract_task_display_id(response), "74")
 
 
 if __name__ == "__main__":

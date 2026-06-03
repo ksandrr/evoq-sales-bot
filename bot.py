@@ -409,6 +409,96 @@ def strip_weeek_request_prefix(text: str) -> str:
     return _compact_spaces(cleaned).strip(" .,!?:;")
 
 
+def _weeek_project_route_variants(route: dict | None = None) -> list[str]:
+    items = [route.get("project")] if route and route.get("project") else list(WEEEK_TARGETS.values())
+    variants: list[str] = []
+    for item in items:
+        if not item:
+            continue
+        names = [item.get("project_name", "")] + list(item.get("aliases", ()))
+        for name in names:
+            candidate = _compact_spaces(str(name))
+            candidate = re.sub(r"^(?:в|во)\s+", "", candidate, flags=re.IGNORECASE)
+            if candidate and candidate not in variants:
+                variants.append(candidate)
+    return variants
+
+
+def _weeek_column_route_variants(route: dict | None = None) -> list[str]:
+    keys = [route.get("column_hint")] if route and route.get("column_hint") else list(WEEEK_COLUMN_HINTS)
+    variants: list[str] = []
+    for key in keys:
+        if not key:
+            continue
+        for source in (WEEEK_COLUMN_HINTS.get(key, ()), WEEEK_COLUMN_NAMES.get(key, ())):
+            for name in source:
+                candidate = _compact_spaces(str(name))
+                if candidate and candidate not in variants:
+                    variants.append(candidate)
+    return variants
+
+
+def strip_weeek_routing_metadata(text: str, route: dict | None = None) -> str:
+    cleaned = _compact_spaces(text)
+    if not cleaned:
+        return ""
+
+    patterns: list[str] = []
+    for variant in _weeek_project_route_variants(route):
+        escaped = re.escape(variant)
+        patterns.extend(
+            [
+                rf"\bв\s+проект\s+{escaped}\b",
+                rf"\bв\s+раздел\s+{escaped}\b",
+                rf"\bпроект\s+{escaped}\b",
+                rf"\bраздел\s+{escaped}\b",
+                rf"\bв\s+{escaped}\b",
+                rf"\b(?:раздел|проект)\s*:\s*{escaped}\b",
+            ]
+        )
+    for variant in _weeek_column_route_variants(route):
+        escaped = re.escape(variant)
+        patterns.extend(
+            [
+                rf"\b(?:и\s+)?постав(?:ь|ить)\s+статус\s+{escaped}\b",
+                rf"\b(?:и\s+)?постав(?:ь|ить)\s+(?:это\s+)?в\s+колонку\s+{escaped}\b",
+                rf"\b(?:и\s+)?в\s+колонку\s+{escaped}\b",
+                rf"\b(?:и\s+)?добав(?:ь|ить)\s+в\s+{escaped}\b",
+                rf"\b(?:и\s+)?статус\s+{escaped}\b",
+                rf"\b(?:и\s+)?колонк[ауе]\s+{escaped}\b",
+                rf"^\s*(?:и\s+)?{escaped}\b",
+                rf"\b(?:статус|колонка)\s*:\s*{escaped}\b",
+            ]
+        )
+
+    for pattern in patterns:
+        cleaned = re.sub(pattern, " ", cleaned, flags=re.IGNORECASE)
+
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    cleaned = re.sub(r"([,.;:!?])\s*(?:[,.;:!?]\s*)+", r"\1 ", cleaned)
+    cleaned = re.sub(r"\b(?:и|а)\s*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^(?:и|а)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = cleaned.strip(" ,.;:!?-")
+    return cleaned
+
+
+def sanitize_weeek_capture_content(capture: dict, route: dict | None = None, fallback_text: str = "") -> dict:
+    sanitized = dict(capture)
+    capture_type = sanitized.get("type") or "task"
+    title = strip_weeek_routing_metadata(_compact_spaces(sanitized.get("title") or ""), route)
+    body = strip_weeek_routing_metadata(_compact_spaces(sanitized.get("body") or fallback_text or ""), route)
+
+    if not title:
+        title = generate_capture_title(fallback_text or body or sanitized.get("transcript_clean") or "", capture_type)
+    if not body:
+        body = _compact_spaces(fallback_text or sanitized.get("body") or sanitized.get("transcript_clean") or "")
+
+    sanitized["title"] = _compact_spaces(title)
+    sanitized["body"] = _compact_spaces(body)
+    return sanitized
+
+
 def normalize_weeek_column_hint(text: str) -> str:
     low = _compact_spaces(text).lower().replace("ё", "е")
     for key, variants in WEEEK_COLUMN_HINTS.items():
@@ -864,6 +954,9 @@ async def parse_capture_with_gpt(text: str, default_timezone: str):
         "Если timezone не указан, используй default_timezone. "
         "Если для reminder нет точной даты или времени, либо время неоднозначное, выставь needs_time_clarification=true "
         "и time_confidence ниже 0.75. "
+        "Служебные фразы маршрутизации вроде 'в личное', 'в проект личное', 'раздел личное', "
+        "'поставь статус к работе', 'в колонку к работе', 'статус к работе' используй только для project_name_candidate, board_name_candidate и column_hint, "
+        "но не включай их в title и body. "
         "Слова Mira, Weeek, Vosk, OpenAI, Telegram, GitHub сохраняй корректно в title/body. "
         f"Сегодня: {now.date().isoformat()}. Текущее время: {now.strftime('%H:%M')}. "
         f"default_timezone: {default_timezone}."
@@ -2391,24 +2484,26 @@ async def _start_weeek_capture(update: Update, context: ContextTypes.DEFAULT_TYP
         clean_text = re.sub(r"^(?:бот[, ]+)?(?:добавь|создай|запиши)\s+", "", clean_text, flags=re.IGNORECASE)
         clean_text = re.sub(r"^(?:задачу|подзадачу)\s+", "", clean_text, flags=re.IGNORECASE)
         clean_text = re.sub(r"^(?:в\s+)?(?:weeek|вик)\s+", "", clean_text, flags=re.IGNORECASE)
-    if not clean_text:
+    route = detect_top_level_route(raw_text)
+    content_text = strip_weeek_routing_metadata(clean_text, route)
+    if not content_text:
         await update.message.reply_text(
             "Поймал запрос на Weeek, но сама задача пустая. Напиши одной строкой, что нужно сделать.",
             reply_markup=cancel_keyboard(),
         )
         return WEEEK_CAPTURE
-    route = detect_top_level_route(raw_text)
-    capture = await classify_capture(update, clean_text, forced_type="task")
+    capture = await classify_capture(update, content_text, forced_type="task")
+    capture = sanitize_weeek_capture_content(capture, route, fallback_text=content_text)
     speech_engine = context.user_data.get("_last_speech_engine", "")
     capture["speech_engine"] = speech_engine
     capture["transcript"] = raw_text
-    capture["transcript_clean"] = capture.get("transcript_clean") or clean_text
+    capture["transcript_clean"] = capture.get("transcript_clean") or content_text
     draft = _get_weeek_draft(context)
     draft.clear()
     draft.update(
         {
             "raw_text": raw_text,
-            "clean_text": clean_text,
+            "clean_text": content_text,
             "capture": capture,
             "target": route.get("target") or capture.get("target") or "weeek_task",
             "column_hint": route.get("column_hint") or capture.get("column_hint") or normalize_weeek_column_hint(raw_text),
@@ -2416,7 +2511,7 @@ async def _start_weeek_capture(update: Update, context: ContextTypes.DEFAULT_TYP
         }
     )
     if not draft["capture"].get("transcript_clean"):
-        draft["capture"]["transcript_clean"] = clean_text
+        draft["capture"]["transcript_clean"] = content_text
     if not draft["capture"].get("transcript"):
         draft["capture"]["transcript"] = raw_text
     auto_project = route.get("project") or match_weeek_target(capture.get("project_name_candidate") or "")
@@ -2565,7 +2660,7 @@ async def weeek_preview_callback(update: Update, context: ContextTypes.DEFAULT_T
         return ConversationHandler.END
 
     title = build_weeek_task_title(capture)
-    task_id = response.get("id") or response.get("_id") or response.get("taskId") or "?"
+    task_id = client.extract_task_display_id(response)
     await query.message.reply_html(
         "✅ <b>Задача отправлена в Weeek</b>\n\n"
         f"<b>ID:</b> {html.escape(str(task_id))}\n"
@@ -3564,9 +3659,18 @@ async def _start_weeek_capture(update: Update, context: ContextTypes.DEFAULT_TYP
         return WEEEK_CAPTURE if return_state else ConversationHandler.END
 
     route = detect_top_level_route(raw_text)
-    capture = await classify_capture(update, clean_text, forced_type="task")
+    content_text = strip_weeek_routing_metadata(clean_text, route)
+    if not content_text:
+        await update.message.reply_text(
+            "Поймал запрос на Weeek, но сама задача пустая. Напиши одной строкой, что нужно сделать.",
+            reply_markup=cancel_keyboard(),
+        )
+        return WEEEK_CAPTURE if return_state else ConversationHandler.END
+
+    capture = await classify_capture(update, content_text, forced_type="task")
+    capture = sanitize_weeek_capture_content(capture, route, fallback_text=content_text)
     capture["transcript"] = raw_text
-    capture["transcript_clean"] = capture.get("transcript_clean") or clean_text
+    capture["transcript_clean"] = capture.get("transcript_clean") or content_text
     capture["speech_engine"] = context.user_data.get("_last_speech_engine", "")
 
     draft = _get_weeek_draft(context)
@@ -3587,7 +3691,7 @@ async def _start_weeek_capture(update: Update, context: ContextTypes.DEFAULT_TYP
     _log_event(
         "weeek_capture_started",
         transcript=raw_text,
-        transcript_clean=clean_text,
+        transcript_clean=content_text,
         target=draft.get("target", ""),
         project_candidate=(auto_project or {}).get("project_name", ""),
         column_hint=draft.get("column_hint", ""),
@@ -4002,7 +4106,7 @@ async def weeek_preview_callback(update: Update, context: ContextTypes.DEFAULT_T
         return ConversationHandler.END
 
     title = build_weeek_task_title(capture)
-    task_id = response.get("id") or response.get("_id") or response.get("taskId") or "?"
+    task_id = client.extract_task_display_id(response)
     _log_event("weeek_task_create_succeeded", task_id=task_id, title=title)
     await query.message.reply_html(
         "✅ <b>Задача отправлена в Weeek</b>\n\n"

@@ -86,6 +86,49 @@ class WeeekClient:
         except json.JSONDecodeError as exc:
             raise WeeekApiError(f"Invalid JSON from Weeek: {response.text[:200]}") from exc
 
+    @staticmethod
+    def _extract_created_task(response: dict) -> dict:
+        if not isinstance(response, dict):
+            return {}
+        task = response.get("task")
+        if isinstance(task, dict):
+            return task
+        data = response.get("data")
+        if isinstance(data, dict):
+            nested_task = data.get("task")
+            if isinstance(nested_task, dict):
+                return nested_task
+            return data
+        return {}
+
+    @classmethod
+    def extract_task_internal_id(cls, response: dict) -> str:
+        task = cls._extract_created_task(response)
+        for value in (
+            task.get("id"),
+            response.get("id") if isinstance(response, dict) else None,
+            response.get("taskId") if isinstance(response, dict) else None,
+        ):
+            if value not in (None, ""):
+                return str(value)
+        return ""
+
+    @classmethod
+    def extract_task_display_id(cls, response: dict) -> str:
+        task = cls._extract_created_task(response)
+        for value in (
+            task.get("number"),
+            task.get("taskNumber"),
+            task.get("seqNumber"),
+            task.get("displayId"),
+            response.get("number") if isinstance(response, dict) else None,
+            response.get("taskNumber") if isinstance(response, dict) else None,
+            cls.extract_task_internal_id(response),
+        ):
+            if value not in (None, ""):
+                return str(value)
+        return "?"
+
     def _base_list_params(self) -> dict:
         params = {}
         if self.workspace_id:
@@ -303,7 +346,7 @@ class WeeekClient:
         if isinstance(response, dict):
             task = response.get("task")
             if isinstance(task, dict) and not task.get("parentId"):
-                task_id = task.get("id") or response.get("id") or response.get("taskId")
+                task_id = self.extract_task_internal_id(response)
                 if task_id:
                     try:
                         await self._request(
