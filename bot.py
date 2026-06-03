@@ -39,19 +39,12 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "Asia/Omsk")
-OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL") or "").strip()
 OPENAI_PARSE_MODEL = os.getenv("OPENAI_PARSE_MODEL", "gpt-5.5")
-OPENAI_STT_API_KEY = (os.getenv("OPENAI_STT_API_KEY") or "").strip()
-OPENAI_STT_BASE_URL = (os.getenv("OPENAI_STT_BASE_URL") or OPENAI_BASE_URL or "https://api.openai.com/v1").strip()
 OPENAI_STT_MODEL = (os.getenv("OPENAI_STT_MODEL") or "gpt-4o-transcribe").strip()
 OPENAI_STT_ENABLED = (os.getenv("OPENAI_STT_ENABLED") or "true").strip().lower() in {"1", "true", "yes", "on"}
 WEEEK_API_TOKEN = (os.getenv("WEEEK_API_TOKEN") or "").strip()
 WEEEK_API_BASE_URL = (os.getenv("WEEEK_API_BASE_URL") or "https://api.weeek.net/public/v1").strip()
 WEEEK_DEFAULT_WORKSPACE_ID = (os.getenv("WEEEK_DEFAULT_WORKSPACE_ID") or "").strip()
-
-
-def _is_custom_openai_base_url(base_url: str) -> bool:
-    return bool(base_url and base_url.rstrip("/") != "https://api.openai.com/v1")
 
 
 def _normalize_text(text: str) -> str:
@@ -83,51 +76,26 @@ for handler in logging.getLogger().handlers:
     handler.addFilter(SecretRedactionFilter())
 
 
-def _openai_client_kwargs(api_key: str, base_url: str) -> dict:
-    kwargs = {"api_key": api_key}
-    if base_url:
-        kwargs["base_url"] = base_url
-    if _is_custom_openai_base_url(base_url):
-        kwargs["max_retries"] = 0
-    return kwargs
-
-
-# OpenAI client is used only for text/chat parsing. Voice STT is Vosk-only.
+# OpenAI client is used for text/chat parsing and the primary STT path.
 _openai_client = None
 _openai_stt_client = None
 if OPENAI_API_KEY:
     try:
         from openai import OpenAI
 
-        _openai_client = OpenAI(**_openai_client_kwargs(OPENAI_API_KEY, OPENAI_BASE_URL))
-        logger.info(
-            "OpenAI клиент инициализирован — base_url=%s, GPT-парсинг через %s. Голос распознаётся только Vosk.",
-            OPENAI_BASE_URL or "https://api.openai.com/v1",
-            OPENAI_PARSE_MODEL,
-        )
+        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        logger.info("OpenAI client initialized: official_api=true, parse_model=%s", OPENAI_PARSE_MODEL)
+        if OPENAI_STT_ENABLED and OPENAI_STT_MODEL:
+            _openai_stt_client = _openai_client
+            logger.info("OpenAI STT client initialized: official_api=true, model=%s", OPENAI_STT_MODEL)
+        elif OPENAI_STT_ENABLED:
+            logger.info("OpenAI STT is enabled, but OPENAI_STT_MODEL is empty.")
+        else:
+            logger.info("OpenAI STT is disabled via OPENAI_STT_ENABLED=false.")
     except ImportError:
-        logger.warning("Установлен OPENAI_API_KEY, но пакет openai не установлен.")
+        logger.warning("OPENAI_API_KEY is set, but the openai package is not installed.")
 else:
-    logger.info("OPENAI_API_KEY не задан — GPT-парсинг отключён. Голос распознаётся Vosk (если установлен).")
-
-# Vosk — оффлайн-распознавание (fallback, если OpenAI не настроен).
-if OPENAI_STT_ENABLED and OPENAI_STT_API_KEY:
-    try:
-        if "OpenAI" not in globals():
-            from openai import OpenAI
-
-        _openai_stt_client = OpenAI(**_openai_client_kwargs(OPENAI_STT_API_KEY, OPENAI_STT_BASE_URL))
-        logger.info(
-            "OpenAI STT client initialized: base_url=%s, model=%s",
-            OPENAI_STT_BASE_URL,
-            OPENAI_STT_MODEL,
-        )
-    except ImportError:
-        logger.warning("OPENAI_STT_API_KEY is set, but openai package is not installed.")
-elif OPENAI_STT_ENABLED:
-    logger.info("OPENAI_STT_API_KEY is not set — voice will fall back to Vosk when available.")
-else:
-    logger.info("OpenAI STT is disabled via OPENAI_STT_ENABLED=false.")
+    logger.info("OPENAI_API_KEY is not set - GPT parsing is disabled and voice falls back to Vosk when available.")
 
 VOSK_MODEL_URL = os.getenv(
     "VOSK_MODEL_URL",
@@ -139,7 +107,7 @@ _vosk_checked = False
 
 def _voice_status_summary() -> str:
     if _openai_stt_available():
-        return f"OpenAI STT: {OPENAI_STT_MODEL} via {OPENAI_STT_BASE_URL}"
+        return f"OpenAI STT: {OPENAI_STT_MODEL}"
     if _vosk_available() and shutil.which("ffmpeg"):
         return "Vosk fallback"
     return "disabled"
@@ -225,9 +193,9 @@ def voice_available() -> bool:
 
 
 logger.info(
-    "STT health primary=%s base_url=%s model=%s fallback_vosk=%s status=%s",
+    "STT health primary=%s official_api=%s model=%s fallback_vosk=%s status=%s",
     bool(_openai_stt_available()),
-    OPENAI_STT_BASE_URL or "-",
+    bool(_openai_stt_available()),
     OPENAI_STT_MODEL or "-",
     bool(_vosk_available()),
     _voice_status_summary(),
@@ -662,10 +630,9 @@ async def transcribe_voice(voice_file):
             except Exception as exc:
                 openai_error = _openai_stt_error_code(exc)
                 logger.warning(
-                    "primary_stt_failed code=%s model=%s base_url=%s fallback=vosk error=%s",
+                    "primary_stt_failed code=%s model=%s official_api=true fallback=vosk error=%s",
                     openai_error,
                     OPENAI_STT_MODEL,
-                    OPENAI_STT_BASE_URL,
                     exc,
                 )
             else:
@@ -745,20 +712,14 @@ def _vosk_transcribe_file(ogg_path: str):
             pass
 
 
-def _uses_custom_openai_endpoint() -> bool:
-    return _is_custom_openai_base_url(OPENAI_BASE_URL)
-
 
 def _chat_json_request_kwargs(model: str, messages: list[dict], temperature: float) -> dict:
-    kwargs = {
+    return {
         "model": model,
         "messages": messages,
+        "temperature": temperature,
+        "response_format": {"type": "json_object"},
     }
-    if not (_uses_custom_openai_endpoint() and model.lower().startswith("gpt-5")):
-        kwargs["temperature"] = temperature
-    if not _uses_custom_openai_endpoint():
-        kwargs["response_format"] = {"type": "json_object"}
-    return kwargs
 
 
 def _extract_json_object(raw: str) -> dict | None:
@@ -792,28 +753,6 @@ def _extract_json_object(raw: str) -> dict | None:
             return data
     return None
 
-
-def _is_upstream_unavailable(exc: Exception) -> bool:
-    status_code = getattr(exc, "status_code", None)
-    code = str(getattr(exc, "code", "") or "").lower()
-    text = str(exc).lower()
-    return status_code == 503 or "upstream_unavailable" in code or "upstream_unavailable" in text
-
-
-async def _chat_create_with_retry(request_kwargs: dict, log_label: str):
-    attempts = 2
-    for attempt in range(1, attempts + 1):
-        try:
-            return await _async_call(
-                _openai_client.chat.completions.create,
-                **request_kwargs,
-            )
-        except Exception as exc:
-            if attempt < attempts and _is_upstream_unavailable(exc):
-                logger.warning("%s upstream unavailable, retrying attempt=%s model=%s", log_label, attempt, request_kwargs.get("model"))
-                await asyncio.sleep(0.7 * attempt)
-                continue
-            raise
 
 
 async def parse_idea_with_gpt(text: str):
@@ -873,7 +812,7 @@ async def parse_idea_with_gpt(text: str):
         0.3,
     )
     try:
-        response = await _chat_create_with_retry(request_kwargs, "GPT idea parsing")
+        response = await _async_call(_openai_client.chat.completions.create, **request_kwargs)
         raw = response.choices[0].message.content
         data = _extract_json_object(raw)
         if not data:
@@ -925,7 +864,7 @@ async def parse_capture_with_gpt(text: str, default_timezone: str):
         "Если timezone не указан, используй default_timezone. "
         "Если для reminder нет точной даты или времени, либо время неоднозначное, выставь needs_time_clarification=true "
         "и time_confidence ниже 0.75. "
-        "Слова EVOQ, Vosk, OpenAI, Telegram, GitHub сохраняй корректно в title/body. "
+        "Слова Mira, Weeek, Vosk, OpenAI, Telegram, GitHub сохраняй корректно в title/body. "
         f"Сегодня: {now.date().isoformat()}. Текущее время: {now.strftime('%H:%M')}. "
         f"default_timezone: {default_timezone}."
     )
@@ -938,7 +877,7 @@ async def parse_capture_with_gpt(text: str, default_timezone: str):
         0.1,
     )
     try:
-        response = await _chat_create_with_retry(request_kwargs, "GPT capture parsing")
+        response = await _async_call(_openai_client.chat.completions.create, **request_kwargs)
         raw = response.choices[0].message.content
         data = _extract_json_object(raw)
         if not data:
@@ -1671,7 +1610,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if voice_available():
-        voice_status = "включён (Vosk, оффлайн) — можно наговорить идею или задачу голосом"
+        voice_status = "включён — сначала OpenAI STT, при сбое Vosk fallback"
     else:
         voice_status = "выключен — команда /voice покажет, как включить"
     text = (
@@ -1692,9 +1631,9 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def voice_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if voice_available():
         text = (
-            "🎤 <b>Голосовой ввод включён (Vosk, оффлайн, бесплатно).</b>\n\n"
+            "🎤 <b>Голосовой ввод включён.</b>\n\n"
             f"🧠 Парсинг смысла: <b>{html.escape(OPENAI_PARSE_MODEL)}</b>.\n\n"
-            "Vosk работает прямо на сервере, без OpenAI STT, токенов и rate limit. "
+            "Mira сначала пробует OpenAI STT через официальный API, а при сбое переключается на локальный Vosk. "
             "Качество ниже Whisper, но для коротких фраз вполне приемлемо.\n\n"
             "Просто запиши голосовое прямо в чате:\n"
             "• Вне диалогов — бот поймёт, это идея, задача или напоминание.\n"
@@ -1704,7 +1643,7 @@ async def voice_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         text = (
             "🎤 <b>Голосовой ввод выключен.</b>\n\n"
-            "Для голосового ввода нужен локальный Vosk и ffmpeg:\n\n"
+            "Для голосового ввода нужен OpenAI API key, а локальный Vosk и ffmpeg остаются fallback-вариантом:\n\n"
             "• Установи зависимости из <code>requirements.txt</code>.\n"
             "• На сервере нужен ffmpeg: <code>sudo apt install ffmpeg</code>.\n"
             "• Vosk сам скачает русскую модель (~45 МБ) при первом голосовом.\n\n"
@@ -2115,7 +2054,7 @@ def transcription_error_text(error: str) -> str:
     if error == "openai_stt_auth":
         return (
             "OpenAI STT сейчас не прошёл авторизацию, а локальный fallback недоступен. "
-            "Проверь OPENAI_STT_API_KEY или переключись на текст."
+            "Проверь OPENAI_API_KEY или переключись на текст."
         )
     if error in {"openai_stt_failed", "openai_stt_empty"}:
         return (

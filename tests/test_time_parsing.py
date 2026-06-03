@@ -133,45 +133,37 @@ class _FakeCompletions:
 
 
 class GptJsonParsingTests(unittest.TestCase):
-    def _parse_with_fake_client(self, content, base_url):
+    def _parse_with_fake_client(self, content):
         completions = _FakeCompletions(content)
         old_client = bot._openai_client
-        old_base_url = bot.OPENAI_BASE_URL
         bot._openai_client = types.SimpleNamespace(
             chat=types.SimpleNamespace(completions=completions)
         )
-        bot.OPENAI_BASE_URL = base_url
         try:
-            result = asyncio.run(bot.parse_capture_with_gpt("сходить к стоматологу", "Asia/Omsk"))
+            result = asyncio.run(bot.parse_capture_with_gpt("Сходить к стоматологу", "Asia/Omsk"))
         finally:
             bot._openai_client = old_client
-            bot.OPENAI_BASE_URL = old_base_url
         return result, completions.kwargs
 
-    def test_custom_endpoint_does_not_send_response_format(self):
+    def test_official_request_uses_json_response_format(self):
         result, kwargs = self._parse_with_fake_client(
-            '{"type":"task","title":"Сходить к стоматологу","body":"Сходить к стоматологу",'
-            '"due_date":"","due_time":"","timezone":"","confidence":0.9,'
-            '"time_confidence":1,"needs_time_clarification":false,"clarification_reason":""}',
-            "https://custom.example/v1",
+            '{"type":"task","title":"Сходить к стоматологу","body":"Сходить к стоматологу","due_date":"","due_time":"","timezone":"","confidence":0.9,"time_confidence":1,"needs_time_clarification":false,"clarification_reason":""}'
         )
 
         self.assertEqual(result["title"], "Сходить к стоматологу")
-        self.assertNotIn("response_format", kwargs)
+        self.assertEqual(kwargs["response_format"], {"type": "json_object"})
+        self.assertIn("temperature", kwargs)
 
     def test_text_wrapped_json_is_parsed(self):
         result, _ = self._parse_with_fake_client(
-            'Готово:\n{"type":"task","title":"Сходить к стоматологу","body":"Сходить к стоматологу",'
-            '"due_date":"","due_time":"","timezone":"","confidence":0.9,'
-            '"time_confidence":1,"needs_time_clarification":false,"clarification_reason":""}',
-            "https://custom.example/v1",
+            'Готово:\n{"type":"task","title":"Сходить к стоматологу","body":"Сходить к стоматологу","due_date":"","due_time":"","timezone":"","confidence":0.9,"time_confidence":1,"needs_time_clarification":false,"clarification_reason":""}'
         )
 
         self.assertEqual(result["source"], "gpt")
         self.assertEqual(result["title"], "Сходить к стоматологу")
 
     def test_bad_json_returns_none(self):
-        result, _ = self._parse_with_fake_client("это не json", "https://custom.example/v1")
+        result, _ = self._parse_with_fake_client("это не json")
         self.assertIsNone(result)
 
 
@@ -202,45 +194,21 @@ class DisplayDescriptionTests(unittest.TestCase):
 
 
 class VoiceAndWeeekTests(unittest.TestCase):
-    def test_custom_endpoint_client_disables_sdk_retries(self):
-        self.assertEqual(
-            bot._openai_client_kwargs("test-key", "https://custom.example/v1")["max_retries"],
-            0,
+    def test_openai_client_uses_single_official_key(self):
+        self.assertFalse(hasattr(bot, "OPENAI_BASE_URL"))
+        self.assertFalse(hasattr(bot, "OPENAI_STT_BASE_URL"))
+        self.assertFalse(hasattr(bot, "OPENAI_STT_API_KEY"))
+
+    def test_official_request_kwargs_include_json_mode_and_temperature(self):
+        kwargs = bot._chat_json_request_kwargs(
+            "gpt-5.5",
+            [{"role": "user", "content": "ping"}],
+            0.1,
         )
-        self.assertNotIn(
-            "max_retries",
-            bot._openai_client_kwargs("test-key", "https://api.openai.com/v1"),
-        )
 
-    def test_gpt_54_custom_request_omits_json_mode_and_temperature(self):
-        old_base_url = bot.OPENAI_BASE_URL
-        bot.OPENAI_BASE_URL = "https://custom.example/v1"
-        try:
-            kwargs = bot._chat_json_request_kwargs(
-                "gpt-5.4-mini",
-                [{"role": "user", "content": "ping"}],
-                0.1,
-            )
-        finally:
-            bot.OPENAI_BASE_URL = old_base_url
-
-        self.assertNotIn("response_format", kwargs)
-        self.assertNotIn("temperature", kwargs)
-
-    def test_gpt_55_custom_request_omits_json_mode_and_temperature(self):
-        old_base_url = bot.OPENAI_BASE_URL
-        bot.OPENAI_BASE_URL = "https://custom.example/v1"
-        try:
-            kwargs = bot._chat_json_request_kwargs(
-                "gpt-5.5",
-                [{"role": "user", "content": "ping"}],
-                0.1,
-            )
-        finally:
-            bot.OPENAI_BASE_URL = old_base_url
-
-        self.assertNotIn("response_format", kwargs)
-        self.assertNotIn("temperature", kwargs)
+        self.assertEqual(kwargs["response_format"], {"type": "json_object"})
+        self.assertEqual(kwargs["temperature"], 0.1)
+        self.assertNotIn("base_url", kwargs)
 
     def test_voice_available_accepts_openai_stt_without_vosk(self):
         old_stt_available = bot._openai_stt_available
@@ -322,6 +290,20 @@ class VoiceAndWeeekTests(unittest.TestCase):
         self.assertEqual(transcriptions.calls, 1)
         self.assertEqual(result["text"], "openai transcript")
         self.assertEqual(result["engine"], bot._openai_stt_engine_label())
+
+    def test_voice_status_summary_does_not_reference_custom_endpoint(self):
+        old_stt_available = bot._openai_stt_available
+        try:
+            bot._openai_stt_available = lambda: True
+            summary = bot._voice_status_summary()
+        finally:
+            bot._openai_stt_available = old_stt_available
+
+        self.assertIn("OpenAI STT", summary)
+        self.assertNotIn("codex.sale", summary)
+        self.assertNotIn("OPENAI_BASE_URL", summary)
+        self.assertNotIn("OPENAI_STT_BASE_URL", summary)
+        self.assertNotIn("OPENAI_STT_API_KEY", summary)
 
     def test_transcribe_voice_falls_back_to_vosk_after_openai_failure(self):
         class _FakeVoiceFile:
