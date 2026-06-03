@@ -213,3 +213,138 @@ Voice behavior:
 3. Run one live Telegram smoke test for voice and confirm the `Название` / `Описание` / `Транскрипция` block.
 4. Run one Weeek task creation test and one subtask creation test.
 5. Decide separately whether the Windows workspace folder should also be renamed from `evoq-sales-bot` to `mira-task-bot`.
+
+## Follow-Up On 2026-06-04
+
+- The user manually updated absolute paths in the server `.env` from the old Linux path to the new one.
+- No secret values were copied into this handoff.
+- After the `.env` path fix, the service was restarted on the server:
+
+```bash
+sudo systemctl restart mira-task-bot.service
+systemctl is-active mira-task-bot.service
+journalctl -u mira-task-bot.service -n 100 --no-pager
+```
+
+- Result:
+  - `mira-task-bot.service` is `active`
+  - logs show `OpenAI client initialized: official_api=true`
+  - logs show `OpenAI STT client initialized: official_api=true`
+  - logs show `STT health primary=True ... fallback_vosk=True`
+  - bot startup completed successfully
+
+## Follow-Up On 2026-06-04: Voice / Weeek Fix
+
+### Goal
+
+Fix the broken voice -> Weeek flow reported by the user:
+
+- OpenAI STT was failing on Telegram `.oga`
+- GPT parsing for `gpt-5.5` was failing because `temperature` was sent
+- Weeek preview buttons/messages had mojibake
+- active draft states could intercept a new voice command instead of switching into a new Weeek flow
+- logs were not detailed enough to reconstruct the full scenario from journal
+
+### Code Changes
+
+- Reworked the primary STT path so OpenAI STT now transcodes Telegram voice to `.wav` through `ffmpeg` before sending it to the official API.
+- Kept Vosk as the fallback path after OpenAI STT failure.
+- Removed `temperature` from official JSON parsing request kwargs used for GPT parsing.
+- Added detailed structured runtime logs for:
+  - `voice_downloaded`
+  - `voice_converted_for_openai`
+  - `openai_stt_request_started`
+  - `openai_stt_request_succeeded`
+  - `vosk_fallback_started`
+  - `vosk_fallback_succeeded`
+  - `voice_route_detected`
+  - `voice_route_override_previous_state`
+  - `capture_gpt_parse_started`
+  - `capture_gpt_parse_succeeded`
+  - `capture_gpt_parse_failed`
+  - `weeek_capture_started`
+  - `weeek_projects_loaded`
+  - `weeek_boards_loaded`
+  - `weeek_columns_loaded`
+  - `weeek_columns_filtered`
+  - `weeek_column_auto_selected`
+  - `weeek_preview_rendered`
+  - `weeek_task_create_started`
+  - `weeek_task_create_succeeded`
+  - `weeek_task_create_failed`
+- Added voice override behavior: if a user is inside another unfinished flow but clearly says a new Weeek command by voice, the bot resets the transient draft state and starts a fresh Weeek flow.
+- Filtered Weeek column selection so `Готово` is not shown as a selectable target column for creating a new task.
+- Replaced the broken Weeek preview UI strings with clean Russian text and a single canonical preview path.
+- Reworked Weeek callback routing so top-level voice/text Weeek starts do not depend on the previous conversation state tracking.
+
+### Files Edited In This Follow-Up
+
+- `H:\TGBots\evoq-sales-bot\bot.py`
+- `H:\TGBots\evoq-sales-bot\tests\test_time_parsing.py`
+
+### Commands Run
+
+Local:
+
+```powershell
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m py_compile bot.py weeek_client.py tests\test_time_parsing.py
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m unittest discover -s tests
+git commit -m "Fix voice Weeek flow and OpenAI STT handling"
+git push origin tembo/telegram-idea-bot-daily-reminders
+```
+
+Linux:
+
+```bash
+cd /home/sanya/mira-task-bot
+git fetch origin
+git pull --ff-only origin tembo/telegram-idea-bot-daily-reminders
+.venv/bin/python -m py_compile bot.py weeek_client.py tests/test_time_parsing.py
+.venv/bin/python -m unittest discover -s tests
+sudo systemctl restart mira-task-bot.service
+systemctl is-active mira-task-bot.service
+journalctl -u mira-task-bot.service -n 40 --no-pager
+```
+
+### Test Results
+
+- Local `py_compile`: passed
+- Local `unittest`: passed (`31 tests`, `OK`)
+- Server `py_compile`: passed
+- Server `unittest`: passed (`31 tests`, `OK`)
+
+### Deploy Status
+
+- Deploy to Linux completed successfully.
+- Service restart completed successfully.
+- `systemctl is-active mira-task-bot.service` returned `active`.
+- Fresh startup logs after restart show:
+  - `OpenAI client initialized: official_api=true`
+  - `OpenAI STT client initialized: official_api=true`
+  - `STT health primary=True official_api=True model=gpt-4o-transcribe fallback_vosk=True`
+  - `Bot started; reminders scheduled.`
+  - `Application started`
+
+### Commit
+
+- deployed commit: `88aebae`
+- commit message: `Fix voice Weeek flow and OpenAI STT handling`
+
+### Server .env Changes
+
+- No secret values were written to this file.
+- In this follow-up Codex did not rewrite server `.env`.
+- The user had already updated the Linux absolute paths in `.env` before this deploy.
+
+### Remaining Risks / Manual Checks
+
+1. The journal now confirms the old bad behavior happened before this fix:
+   - `Unsupported file format oga`
+   - `temperature does not support 0.1`
+   - `voice_top_level returned state 530`
+2. After deploy, startup is clean, but the exact user scenario still needs a real Telegram smoke test with live voice input.
+3. First manual checks to run:
+   - voice from empty chat: `Мира, запиши задачу в ВИК в личное купить молока завтра в 22:00`
+   - voice while another draft is active: must override into a new Weeek flow
+   - manual button flow through `Задача ВИК`
+   - confirm `Готово` is no longer offered in the column picker
