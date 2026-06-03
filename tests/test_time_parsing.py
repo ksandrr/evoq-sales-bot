@@ -60,6 +60,7 @@ telegram_ext.filters = _Dummy()
 sys.modules.setdefault("telegram.ext", telegram_ext)
 
 import bot
+import weeek_client
 
 
 extract_capture_due_time = bot.extract_capture_due_time
@@ -418,6 +419,26 @@ class RouteAndSubtaskTests(unittest.TestCase):
         self.assertEqual(source_exact, "exact")
         self.assertEqual(fuzzy["id"], "1")
         self.assertIn(source_fuzzy, {"normalized", "fuzzy"})
+
+
+class WeeekPayloadTests(unittest.TestCase):
+    def test_due_datetime_is_sent_without_conflicting_due_fields(self):
+        client = weeek_client.WeeekClient(api_token="token", base_url="https://api.weeek.net/public/v1")
+
+        payload = client._task_payload(
+            title="Купить молоко",
+            description="Нужно купить молоко.",
+            board_id="10",
+            column_id="20",
+            project_id="6",
+            due_date="2026-06-05",
+            due_time="22:00",
+        )
+
+        self.assertEqual(payload["dueDateTime"], "2026-06-05T22:00")
+        self.assertNotIn("dueDate", payload)
+        self.assertNotIn("dueTime", payload)
+        self.assertNotIn("day", payload)
 
 
 if __name__ == "__main__":

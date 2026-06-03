@@ -220,13 +220,15 @@ class WeeekClient:
         }
         if project_id:
             payload["projectId"] = project_id
-        if due_date:
+        has_due_date = bool(due_date and re.match(r"^\d{4}-\d{2}-\d{2}$", due_date))
+        has_due_time = bool(due_time and re.match(r"^\d{2}:\d{2}$", due_time))
+        if has_due_date and has_due_time:
+            # Weeek rejects mixed due fields; send only the combined timestamp.
+            payload["dueDateTime"] = f"{due_date}T{due_time}"
+        elif has_due_date:
             payload["dueDate"] = due_date
-            payload["day"] = due_date
-        if due_time:
+        elif has_due_time:
             payload["dueTime"] = due_time
-            if due_date and re.match(r"^\d{4}-\d{2}-\d{2}$", due_date) and re.match(r"^\d{2}:\d{2}$", due_time):
-                payload["dueDateTime"] = f"{due_date}T{due_time}:00"
         if parent_id:
             payload["parentId"] = int(parent_id) if str(parent_id).isdigit() else parent_id
         if self.workspace_id:
