@@ -1,5 +1,53 @@
 # NEXT CODEX HANDOFF
 
+## 2026-06-06 Voice/Audio Flow Fix
+
+### Session Goal
+
+Fix the broken Telegram voice/audio flow in Mira Task Bot with the smallest possible patch so that voice messages no longer go silent.
+
+### What Changed
+
+- In `bot.py`:
+  - added an immediate user-facing reply `Распознаю голосовое...` before transcription starts
+  - wrapped the top-level voice flow in a defensive `try/except` so unexpected failures now return a visible error instead of going silent
+  - kept the change scoped to voice/audio handling only
+
+### Files Edited
+
+- `C:\Users\gorbi\OneDrive\Документы\mira-task-bot\bot.py`
+- `C:\Users\gorbi\OneDrive\Документы\mira-task-bot\NEXT_CODEX_HANDOFF.md`
+
+### Checks Run
+
+- `C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m py_compile bot.py`
+- `C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m unittest tests.test_time_parsing`
+
+### Test Result
+
+- `py_compile`: passed
+- `tests.test_time_parsing`: passed
+
+### Deployment
+
+- No Linux deploy was performed in this session.
+
+### Commit
+
+- No commit was created in this session.
+
+### .env Changes
+
+- No `.env` variables were changed in this session.
+
+### Open Issues
+
+- The patch is code-checked locally, but it still needs a live Telegram smoke test with a real voice or audio message.
+
+### Next Check
+
+- First verify that a real Telegram voice message now gets `Распознаю голосовое...`, then the Weeek draft or a clear error message.
+
 ## Session Goal
 
 Finish the move to official OpenAI API usage with one `OPENAI_API_KEY`, rename the GitHub repo to `mira-task-bot`, rename the Linux deploy path and systemd service to `mira-task-bot`, deploy the updated code, and verify the service starts cleanly.

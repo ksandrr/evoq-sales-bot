@@ -3165,6 +3165,7 @@ async def _transcribe_or_warn(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return None
 
+    await update.message.reply_text("Распознаю голосовое...")
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
     voice = update.message.voice or update.message.audio
     if not voice:
@@ -3915,6 +3916,7 @@ async def _transcribe_or_warn(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return None
 
+    await update.message.reply_text("Распознаю голосовое...")
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
     voice = update.message.voice or update.message.audio
     if not voice:
@@ -4115,81 +4117,88 @@ async def classify_capture(update: Update, text: str, forced_type: str | None = 
 
 
 async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not voice_available():
-        await update.message.reply_text(
-            "🎤 Голосовой ввод сейчас не настроен. Команда /voice покажет, как включить.",
+    try:
+        if not voice_available():
+            await update.message.reply_text(
+                "🎤 Голосовой ввод сейчас не настроен. Команда /voice покажет, как включить.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        _clear_active_flow(context)
+        text = await _transcribe_or_warn(update, context)
+        if not text:
+            return ConversationHandler.END
+
+        route = detect_top_level_route(text)
+        _log_event(
+            "voice_route_detected",
+            previous_state="top_level",
+            active_flow=context.user_data.get("_active_flow", ""),
+            new_target=route.get("target", ""),
+            project=((route.get("project") or {}).get("project_name") or ""),
+            column_hint=route.get("column_hint", ""),
+        )
+        if route.get("target") in {"weeek_task", "weeek_subtask"}:
+            return await _start_weeek_capture(update, context, text, return_state=False)
+
+        user_id = update.effective_user.id
+        db.upsert_user(user_id)
+        forced_type = "task" if route.get("target") == "local_task" else "reminder" if route.get("target") == "reminder" else None
+        capture = await classify_capture(update, text, forced_type=forced_type)
+        capture_type = capture["type"]
+        speech_engine = context.user_data.pop("_last_speech_engine", "")
+        capture["speech_engine"] = speech_engine
+        capture["transcript"] = text
+        capture["transcript_clean"] = capture.get("transcript_clean") or text
+        _log_voice_capture(text, capture, speech_engine)
+
+        if _needs_reminder_time_clarification(capture):
+            context.user_data["pending_reminder_capture"] = capture
+            context.user_data["pending_reminder_attempts"] = 0
+            _set_active_flow(context, "clarify_reminder_time")
+            await _ask_reminder_time_clarification(update, context)
+            return CLARIFY_REMINDER_TIME
+
+        if capture_type in {"task", "reminder"}:
+            task_id = _create_task_from_capture(user_id, capture)
+            await _send_created_task(update, capture, task_id, recognized_text=text, reminder=capture_type == "reminder")
+            _clear_active_flow(context)
+            return ConversationHandler.END
+
+        brief = capture["title"]
+        details = capture["body"]
+        if _openai_client and capture.get("source") != "gpt":
+            parsed = await parse_idea_with_gpt(text)
+            if parsed:
+                brief, details = parsed
+
+        if not brief:
+            first = text.split(".")[0].strip() or text.strip()
+            brief = first[:120]
+            details = text.strip()
+
+        idea_id = db.add_idea(user_id, brief, details)
+        schedule_user_reminders(context.application, user_id)
+        await update.message.reply_html(
+            f"✅ Идея сохранена!\n\n{brief_message(brief)}",
             reply_markup=main_menu_keyboard(),
         )
-        return
-
-    _clear_active_flow(context)
-    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
-    text = await _transcribe_or_warn(update, context)
-    if not text:
-        return ConversationHandler.END
-
-    route = detect_top_level_route(text)
-    _log_event(
-        "voice_route_detected",
-        previous_state="top_level",
-        active_flow=context.user_data.get("_active_flow", ""),
-        new_target=route.get("target", ""),
-        project=((route.get("project") or {}).get("project_name") or ""),
-        column_hint=route.get("column_hint", ""),
-    )
-    if route.get("target") in {"weeek_task", "weeek_subtask"}:
-        return await _start_weeek_capture(update, context, text, return_state=False)
-
-    user_id = update.effective_user.id
-    db.upsert_user(user_id)
-    forced_type = "task" if route.get("target") == "local_task" else "reminder" if route.get("target") == "reminder" else None
-    capture = await classify_capture(update, text, forced_type=forced_type)
-    capture_type = capture["type"]
-    speech_engine = context.user_data.pop("_last_speech_engine", "")
-    capture["speech_engine"] = speech_engine
-    capture["transcript"] = text
-    capture["transcript_clean"] = capture.get("transcript_clean") or text
-    _log_voice_capture(text, capture, speech_engine)
-
-    if _needs_reminder_time_clarification(capture):
-        context.user_data["pending_reminder_capture"] = capture
-        context.user_data["pending_reminder_attempts"] = 0
-        _set_active_flow(context, "clarify_reminder_time")
-        await _ask_reminder_time_clarification(update, context)
-        return CLARIFY_REMINDER_TIME
-
-    if capture_type in {"task", "reminder"}:
-        task_id = _create_task_from_capture(user_id, capture)
-        await _send_created_task(update, capture, task_id, recognized_text=text, reminder=capture_type == "reminder")
+        if details and details.casefold() != brief.casefold():
+            await update.message.reply_html(f"<b>Описание:</b> {html.escape(details)}", reply_markup=main_menu_keyboard())
+        transcription = transcription_message(text, speech_engine)
+        if transcription:
+            await update.message.reply_html(transcription.lstrip(), reply_markup=main_menu_keyboard())
+        await update.message.reply_text("Что дальше?", reply_markup=post_save_keyboard(idea_id))
         _clear_active_flow(context)
         return ConversationHandler.END
-
-    brief = capture["title"]
-    details = capture["body"]
-    if _openai_client and capture.get("source") != "gpt":
-        parsed = await parse_idea_with_gpt(text)
-        if parsed:
-            brief, details = parsed
-
-    if not brief:
-        first = text.split(".")[0].strip() or text.strip()
-        brief = first[:120]
-        details = text.strip()
-
-    idea_id = db.add_idea(user_id, brief, details)
-    schedule_user_reminders(context.application, user_id)
-    await update.message.reply_html(
-        f"✅ Идея сохранена!\n\n{brief_message(brief)}",
-        reply_markup=main_menu_keyboard(),
-    )
-    if details and details.casefold() != brief.casefold():
-        await update.message.reply_html(f"<b>Описание:</b> {html.escape(details)}", reply_markup=main_menu_keyboard())
-    transcription = transcription_message(text, speech_engine)
-    if transcription:
-        await update.message.reply_html(transcription.lstrip(), reply_markup=main_menu_keyboard())
-    await update.message.reply_text("Что дальше?", reply_markup=post_save_keyboard(idea_id))
-    _clear_active_flow(context)
-    return ConversationHandler.END
+    except Exception:
+        logger.exception("Voice top-level flow failed")
+        await update.message.reply_text(
+            "Не удалось обработать голосовое. Попробуй ещё раз или введи текстом.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return ConversationHandler.END
 
 
 async def weeek_project_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
