@@ -1,5 +1,61 @@
 # NEXT CODEX HANDOFF
 
+## 2026-06-06 Weeek Project Selection Freeze Fix
+
+### Session Goal
+
+Fix the hang in the voice -> Weeek project selection flow with a minimal patch so the bot does not get stuck after choosing a project.
+
+### What Changed
+
+- In `bot.py`:
+  - wrapped Weeek project/board/column/parent loading steps with `WeeekApiError` handling
+  - if Weeek project/board/task loading fails, the bot now sends a visible error, clears the Weeek draft, clears the active flow, and returns to a safe state
+- In `weeek_client.py`:
+  - changed Weeek HTTP timeout handling to `httpx.Timeout(20.0, connect=10.0)`
+  - converted network/timeout failures from raw `httpx` exceptions into `WeeekApiError`, so callback handlers can recover cleanly instead of crashing the conversation
+
+### Files Edited
+
+- `C:\Users\gorbi\OneDrive\Документы\mira-task-bot\bot.py`
+- `C:\Users\gorbi\OneDrive\Документы\mira-task-bot\weeek_client.py`
+- `C:\Users\gorbi\OneDrive\Документы\mira-task-bot\NEXT_CODEX_HANDOFF.md`
+
+### Checks Run
+
+- `C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m py_compile bot.py weeek_client.py`
+- `C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m unittest tests.test_time_parsing`
+- `ssh ... journalctl -u mira-task-bot.service -n 200 --no-pager`
+
+### Test Result
+
+- `py_compile`: passed
+- `tests.test_time_parsing`: passed
+- Linux logs: showed uncaught `httpx.ConnectTimeout` in the bot process; this matched the failure mode where an upstream request could break the Weeek flow without clearing the user state
+
+### Deployment
+
+- Not deployed yet at the time of this note. Update this section after `git push`, server `git pull`, and service restart are completed.
+
+### Commit
+
+- Not created yet at the time of this note.
+
+### .env Changes
+
+- No `.env` variables were changed in this session.
+
+### Open Issues
+
+- A real Telegram smoke test is still needed after deploy:
+  - send voice
+  - choose a Weeek project
+  - verify the bot either continues to the next picker or shows a Weeek error without getting stuck
+
+### Next Check
+
+- First verify on the live bot that a failed Weeek API call after project selection now returns a user-facing error and that `/start` plus a new voice message still work immediately afterward.
+
 ## 2026-06-06 Voice/Audio Flow Fix
 
 ### Session Goal
@@ -30,11 +86,15 @@ Fix the broken Telegram voice/audio flow in Mira Task Bot with the smallest poss
 
 ### Deployment
 
-- No Linux deploy was performed in this session.
+- Deployed to the Linux server at `/home/sanya/mira-task-bot` with `git pull`.
+- Restarted `mira-task-bot.service` with `sudo systemctl restart`.
+- Post-restart status was `active (running)`.
+- Recent logs show normal startup: `Bot started; reminders scheduled.` and `Application started.`
 
 ### Commit
 
-- No commit was created in this session.
+- Commit: `eaf5c1e` (`Fix voice audio flow fallback`)
+- Branch pushed: `tembo/telegram-idea-bot-daily-reminders`
 
 ### .env Changes
 
@@ -42,7 +102,7 @@ Fix the broken Telegram voice/audio flow in Mira Task Bot with the smallest poss
 
 ### Open Issues
 
-- The patch is code-checked locally, but it still needs a live Telegram smoke test with a real voice or audio message.
+- The patch is deployed and the service is running, but it still needs a live Telegram smoke test with a real voice or audio message.
 
 ### Next Check
 

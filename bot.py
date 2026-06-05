@@ -2534,7 +2534,16 @@ def _sort_weeek_columns(columns: list[dict], hint: str) -> list[dict]:
 
 async def _send_weeek_project_picker(message, context: ContextTypes.DEFAULT_TYPE):
     client = get_weeek_client()
-    projects = await client.list_projects()
+    try:
+        projects = await client.list_projects()
+    except WeeekApiError as exc:
+        await message.reply_text(
+            f"Не удалось получить проекты Weeek: {exc}",
+            reply_markup=main_menu_keyboard(),
+        )
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        return ConversationHandler.END
     if not projects:
         await message.reply_text(
             "Не смог найти проекты в Weeek. Проверь WEEEK_API_TOKEN, WEEEK_API_BASE_URL и доступы у токена.",
@@ -2556,7 +2565,16 @@ async def _send_weeek_board_picker(message, context: ContextTypes.DEFAULT_TYPE):
     draft = _get_weeek_draft(context)
     project_id = draft.get("project_id")
     client = get_weeek_client()
-    boards = await client.list_boards(project_id)
+    try:
+        boards = await client.list_boards(project_id)
+    except WeeekApiError as exc:
+        await message.reply_text(
+            f"Не удалось получить доски Weeek: {exc}",
+            reply_markup=main_menu_keyboard(),
+        )
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        return ConversationHandler.END
     if not boards:
         await message.reply_text(
             "Для выбранного проекта не нашёл доски Weeek. Проверь структуру проекта в Weeek.",
@@ -2577,7 +2595,16 @@ async def _send_weeek_column_picker(message, context: ContextTypes.DEFAULT_TYPE)
     draft = _get_weeek_draft(context)
     board_id = draft.get("board_id")
     client = get_weeek_client()
-    columns = await client.list_columns(board_id)
+    try:
+        columns = await client.list_columns(board_id)
+    except WeeekApiError as exc:
+        await message.reply_text(
+            f"Не удалось получить колонки Weeek: {exc}",
+            reply_markup=main_menu_keyboard(),
+        )
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        return ConversationHandler.END
     if not columns:
         await message.reply_text(
             "Не смог получить колонки этой доски Weeek. Возможно, API вернул непривычный формат.",
@@ -2605,7 +2632,16 @@ async def _send_weeek_column_picker(message, context: ContextTypes.DEFAULT_TYPE)
 async def _send_weeek_parent_picker(message, context: ContextTypes.DEFAULT_TYPE):
     draft = _get_weeek_draft(context)
     client = get_weeek_client()
-    tasks = await client.list_tasks(draft.get("project_id", ""), draft.get("board_id", ""))
+    try:
+        tasks = await client.list_tasks(draft.get("project_id", ""), draft.get("board_id", ""))
+    except WeeekApiError as exc:
+        await message.reply_text(
+            f"Не удалось получить задачи Weeek: {exc}",
+            reply_markup=main_menu_keyboard(),
+        )
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        return ConversationHandler.END
     if not tasks:
         await message.reply_text(
             "Не смог получить список задач в этой доске Weeek.",
