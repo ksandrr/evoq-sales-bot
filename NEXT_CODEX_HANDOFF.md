@@ -1,5 +1,103 @@
 # NEXT CODEX HANDOFF
 
+## 2026-06-06 Robust Weeek Project Callback Release
+
+### Session Goal
+
+Fix the still-broken live Weeek project button flow after commit `1f09081` so selecting a Weeek project can never keep the Telegram bot stuck, while leaving menu, reminders, `.env`, and unrelated flows alone.
+
+### Root Cause Found
+
+- Fresh live logs for the reported 02:58-02:59 Asia/Omsk failure map to `2026-06-05 20:58-20:59 UTC` on the server.
+- Exact last log line before the project-click path stalled for project `Личное` was:
+  - `2026-06-05 20:59:04,731 - __main__ - INFO - weeek_columns_loading_started board_id='10'`
+- The next line arrived only at `20:59:26,516 UTC`:
+  - `weeek_columns_loading_failed board_id='10' error=Weeek API timed out`
+- Then the error reply to Telegram also timed out:
+  - `20:59:30,528 ... weeek_columns_error_message_failed board_id='10' error=Timed out`
+- A later stale project click timed out in `query.answer(...)`, and `/start` then failed with `telegram.error.TimedOut` caused by `httpx.ConnectTimeout` while connecting through the configured HTTP proxy/TLS path.
+- Conclusion: the project callback was waiting inside `ConversationHandler` for slow Weeek loading and Telegram sends. There is also a real server network/proxy problem to Telegram API; code can bound and recover from it, but cannot fully fix the server/proxy connectivity.
+
+### What Changed
+
+- In `bot.py`:
+  - added `TELEGRAM_SHORT_TIMEOUT = 4` and `WEEEK_PROJECT_CALLBACK_TIMEOUT = 16`;
+  - changed the active `weeek_project_callback` implementation so it:
+    - logs `callback_id`, callback data, user id, matched handler, and current active flow;
+    - acknowledges callback with short Telegram timeouts and continues safely if ACK fails/times out;
+    - updates the selected project in `weeek_draft`;
+    - schedules project next-step work in a background task;
+    - immediately clears `_active_flow` and returns `ConversationHandler.END`, releasing the conversation;
+  - moved slow post-project work into `_bounded_weeek_project_next_step(...)` with strict timeout;
+  - added safe error reporting that clears `weeek_draft` and `_active_flow` even if the error message cannot be sent;
+  - made `/start` clear transient flow state before replying;
+  - made `/start` reply use short Telegram timeouts and catch `TelegramError`;
+  - moved the public `/start` handler to group `-1` and added a silent `/start` fallback only to `weeek_conv`, so `/start` can end a stuck Weeek conversation after sending/attempting the recovery reply.
+- In `tests/test_time_parsing.py`:
+  - added `WeeekProjectCallbackTests.test_project_callback_schedules_next_step_and_releases_conversation`.
+
+### Files Edited
+
+- `C:\Users\gorbi\OneDrive\Документы\mira-task-bot\bot.py`
+- `C:\Users\gorbi\OneDrive\Документы\mira-task-bot\tests\test_time_parsing.py`
+- `C:\Users\gorbi\OneDrive\Документы\mira-task-bot\NEXT_CODEX_HANDOFF.md`
+
+### Checks Run
+
+- Local:
+  - `C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m py_compile bot.py weeek_client.py tests\test_time_parsing.py`
+  - `C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m unittest discover -s tests`
+- Server:
+  - `cd /home/sanya/mira-task-bot && git pull --ff-only`
+  - `.venv/bin/python -m py_compile bot.py weeek_client.py tests/test_time_parsing.py`
+  - `.venv/bin/python -m unittest discover -s tests`
+  - `kill 18811` to restart the user-owned process under systemd `Restart=always` because `sudo systemctl restart mira-task-bot.service` required an unavailable sudo password.
+  - `systemctl status mira-task-bot.service --no-pager -l`
+  - `journalctl -u mira-task-bot.service -n 100 --no-pager`
+
+### Test Result
+
+- Local `py_compile`: passed.
+- Local unittest discovery: `Ran 44 tests ... OK`.
+- Server `py_compile`: passed.
+- Server unittest discovery: `Ran 44 tests ... OK`.
+
+### Deployment
+
+- Deployed to `/home/sanya/mira-task-bot`.
+- Running commit after deploy: `6bf2d12`.
+- Service restarted by terminating PID `18811`; systemd restarted it automatically.
+- Post-restart status:
+  - `Active: active (running) since Fri 2026-06-05 21:17:46 UTC`
+  - new PID: `19749`
+- Fresh journal showed app startup completed:
+  - `Bot started; reminders scheduled.`
+  - `Application started`
+
+### Commit
+
+- Commit: `6bf2d12` (`Release Weeek project callbacks from conversation`)
+- Branch pushed: `tembo/telegram-idea-bot-daily-reminders`
+
+### .env Changes
+
+- No `.env` variables were changed.
+- No secrets were read or written into handoff.
+
+### Open Issues
+
+- Server network/proxy connectivity to Telegram API is still a real external risk. The code now bounds Telegram waits and clears state, but if `api.telegram.org` is unreachable through the configured proxy, Telegram replies can still fail visibly.
+- Weeek API `list_columns(board_id='10')` timed out during the live failure. The new code prevents that from holding the callback conversation, but Weeek/API/network latency may still produce a user-facing failure.
+
+### Next Check
+
+- Run a live Telegram smoke test:
+  - send a voice Weeek task that reaches project buttons;
+  - click `Личное`;
+  - confirm logs show `weeek_project_callback_received`, `weeek_project_callback_answer_*`, `weeek_project_callback_next_step_scheduled`, `weeek_project_callback_exited`;
+  - immediately send `/start` and a new voice message while Weeek loading is still slow;
+  - verify `/start` and new voice are accepted immediately, even if the background Weeek step later logs timeout/error cleanup.
+
 ## 2026-06-06 Telegram Callback Timeout Follow-Up
 
 ### Session Goal
