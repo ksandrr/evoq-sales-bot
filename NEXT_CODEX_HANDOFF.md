@@ -55,11 +55,17 @@ Investigate the still-broken live Weeek project selection hang after deploy usin
 
 ### Deployment
 
-- Not deployed yet at the time of writing this note. Update after commit/push/pull/restart.
+- Deployed to the Linux server at `/home/sanya/mira-task-bot` with `git pull`.
+- Server checks completed:
+  - `.venv/bin/python -m py_compile bot.py weeek_client.py`
+  - `.venv/bin/python -m unittest tests.test_time_parsing`
+- Restarted `mira-task-bot.service`.
+- Post-restart status: `active (running)`.
 
 ### Commit
 
-- Not created yet at the time of writing this note.
+- Commit: `1f09081` (`Trace and bound Weeek project callback timeouts`)
+- Branch pushed: `tembo/telegram-idea-bot-daily-reminders`
 
 ### .env Changes
 
