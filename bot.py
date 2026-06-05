@@ -39,8 +39,12 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "Asia/Omsk")
-OPENAI_PARSE_MODEL = os.getenv("OPENAI_PARSE_MODEL", "gpt-5.5")
-OPENAI_STT_MODEL = (os.getenv("OPENAI_STT_MODEL") or "gpt-4o-transcribe").strip()
+OPENAI_PARSE_ENABLED = (os.getenv("OPENAI_PARSE_ENABLED") or "true").strip().lower() in {"1", "true", "yes", "on"}
+OPENAI_PARSE_MODEL = os.getenv("OPENAI_PARSE_MODEL", "gpt-5.4-mini")
+OPENAI_PARSE_STRATEGY = (os.getenv("OPENAI_PARSE_STRATEGY") or "gpt_first").strip().lower()
+if OPENAI_PARSE_STRATEGY not in {"gpt_first", "rules_first"}:
+    OPENAI_PARSE_STRATEGY = "gpt_first"
+OPENAI_STT_MODEL = (os.getenv("OPENAI_STT_MODEL") or "gpt-4o-mini-transcribe").strip()
 OPENAI_STT_ENABLED = (os.getenv("OPENAI_STT_ENABLED") or "true").strip().lower() in {"1", "true", "yes", "on"}
 WEEEK_API_TOKEN = (os.getenv("WEEEK_API_TOKEN") or "").strip()
 WEEEK_API_BASE_URL = (os.getenv("WEEEK_API_BASE_URL") or "https://api.weeek.net/public/v1").strip()
@@ -49,6 +53,10 @@ WEEEK_DEFAULT_WORKSPACE_ID = (os.getenv("WEEEK_DEFAULT_WORKSPACE_ID") or "").str
 
 def _normalize_text(text: str) -> str:
     return _compact_spaces(text).lower().replace("ё", "е")
+
+
+def _is_real_ru_text(text: str) -> bool:
+    return bool(re.search(r"[\u0400-\u04ff]", text or ""))
 
 
 logging.basicConfig(
@@ -186,12 +194,67 @@ def _openai_stt_available() -> bool:
     return bool(_openai_stt_client and OPENAI_STT_ENABLED and OPENAI_STT_MODEL)
 
 
+def _openai_parse_available() -> bool:
+    return bool(_openai_client and OPENAI_PARSE_ENABLED and OPENAI_PARSE_MODEL)
+
+
 def voice_available() -> bool:
     if _openai_stt_available():
         return True
     return _vosk_available() and bool(shutil.which("ffmpeg"))
 
 
+def _voice_mode() -> str:
+    if _openai_stt_available():
+        return "openai"
+    if _vosk_available() and shutil.which("ffmpeg"):
+        return "vosk"
+    return "disabled"
+
+
+def _log_openai_usage(feature: str, model: str, response) -> None:
+    usage = getattr(response, "usage", None)
+    input_tokens = (
+        getattr(usage, "prompt_tokens", None)
+        if usage is not None else None
+    )
+    if input_tokens is None and usage is not None:
+        input_tokens = getattr(usage, "input_tokens", None)
+    output_tokens = (
+        getattr(usage, "completion_tokens", None)
+        if usage is not None else None
+    )
+    if output_tokens is None and usage is not None:
+        output_tokens = getattr(usage, "output_tokens", None)
+    total_tokens = getattr(usage, "total_tokens", None) if usage is not None else None
+    logger.info(
+        "openai_usage feature=%s model=%s input_tokens=%s output_tokens=%s total_tokens=%s",
+        feature,
+        model,
+        input_tokens if input_tokens is not None else "-",
+        output_tokens if output_tokens is not None else "-",
+        total_tokens if total_tokens is not None else "-",
+    )
+
+
+def _log_openai_stt_usage(duration="", file_size="") -> None:
+    logger.info(
+        "openai_usage feature=openai_stt model=%s duration=%s file_size=%s",
+        OPENAI_STT_MODEL or "-",
+        duration if duration not in (None, "") else "-",
+        file_size if file_size not in (None, "") else "-",
+    )
+
+
+logger.info(
+    "cost_config OPENAI_PARSE_ENABLED=%s OPENAI_PARSE_MODEL=%s OPENAI_PARSE_STRATEGY=%s OPENAI_STT_ENABLED=%s OPENAI_STT_MODEL=%s stt_mode=%s",
+    OPENAI_PARSE_ENABLED,
+    OPENAI_PARSE_MODEL or "-",
+    OPENAI_PARSE_STRATEGY,
+    OPENAI_STT_ENABLED,
+    OPENAI_STT_MODEL or "-",
+    _voice_mode(),
+)
 logger.info(
     "STT health primary=%s official_api=%s model=%s fallback_vosk=%s status=%s",
     bool(_openai_stt_available()),
@@ -846,7 +909,7 @@ def _extract_json_object(raw: str) -> dict | None:
 
 
 async def parse_idea_with_gpt(text: str):
-    if not _openai_client:
+    if not _openai_parse_available():
         return None
 
     system = (
@@ -903,6 +966,7 @@ async def parse_idea_with_gpt(text: str):
     )
     try:
         response = await _async_call(_openai_client.chat.completions.create, **request_kwargs)
+        _log_openai_usage("idea_parse", OPENAI_PARSE_MODEL, response)
         raw = response.choices[0].message.content
         data = _extract_json_object(raw)
         if not data:
@@ -925,8 +989,8 @@ async def parse_idea_with_gpt(text: str):
         return None
 
 
-async def parse_capture_with_gpt(text: str, default_timezone: str):
-    if not _openai_client:
+async def parse_capture_with_gpt(text: str, default_timezone: str, feature: str = "capture_parse"):
+    if not _openai_parse_available():
         return None
 
     now = _today_in_timezone(default_timezone)
@@ -971,6 +1035,7 @@ async def parse_capture_with_gpt(text: str, default_timezone: str):
     )
     try:
         response = await _async_call(_openai_client.chat.completions.create, **request_kwargs)
+        _log_openai_usage(feature, OPENAI_PARSE_MODEL, response)
         raw = response.choices[0].message.content
         data = _extract_json_object(raw)
         if not data:
@@ -1362,6 +1427,21 @@ def extract_capture_timezone(text: str, default_tz: str = "") -> str:
 
 def extract_capture_due_time(text: str) -> str:
     low = (text or "").lower().replace("ё", "е")
+    if _is_real_ru_text(low):
+        m = re.search(r"\b(?:к|на|в)\s+([01]?\d|2[0-3])[:.](\d{2})\b", low)
+        if m:
+            return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
+        m = re.search(r"\b(?:к|на|в)\s+([01]?\d|2[0-3])\s*(?:час(?:ов|а)?|ч)?\s*(утра|дня|вечера|ночи)?\b", low)
+        if m:
+            hour = int(m.group(1))
+            part = m.group(2) or ("вечера" if "вечером" in low else "")
+            if part in {"дня", "вечера"} and hour < 12:
+                hour += 12
+            if part == "ночи" and hour == 12:
+                hour = 0
+            return f"{hour:02d}:00"
+        if "вечером" in low:
+            return "22:00"
 
     m = re.search(r"\b(?:к|на|в)\s+([01]?\d|2[0-3])[:.](\d{2})\b", low)
     if m:
@@ -1416,6 +1496,13 @@ def extract_capture_due_time(text: str) -> str:
 def extract_capture_due_date(text: str, timezone: str) -> str:
     low = (text or "").lower().replace("ё", "е")
     now = _today_in_timezone(timezone or _default_timezone())
+    if _is_real_ru_text(low):
+        if "послезавтра" in low:
+            return (now + timedelta(days=2)).date().isoformat()
+        if "завтра" in low:
+            return (now + timedelta(days=1)).date().isoformat()
+        if "сегодня" in low:
+            return now.date().isoformat()
     if "послезавтра" in low:
         return (now + timedelta(days=2)).date().isoformat()
     if "завтра" in low:
@@ -1492,6 +1579,97 @@ def classify_capture_text(text: str) -> dict:
         "transcript": clean,
         "source": "rules",
     }
+
+
+def _capture_title_is_weak(title: str, text: str = "") -> bool:
+    title = _compact_spaces(title or "")
+    if not title:
+        return True
+    low = title.lower()
+    weak_titles = {
+        "РРґРµСЏ",
+        "Р—Р°РґР°С‡Р°",
+        "РќР°РїРѕРјРёРЅР°РЅРёРµ",
+        "idea",
+        "task",
+        "reminder",
+    }
+    if title in weak_titles:
+        return True
+    if len(title) <= 2:
+        return True
+    if title.count(",") >= 2:
+        return True
+    if any(token in low for token in ("СЃРјРѕС‚СЂРё", "РєРѕСЂРѕС‡Рµ", "РїСЂРёРІРµС‚")) and len(title.split()) <= 4:
+        return True
+    return False
+
+
+def _capture_type_is_obvious(rule_capture: dict, text: str, forced_type: str | None = None) -> bool:
+    if forced_type:
+        return True
+    low = _normalize_text(text or "")
+    capture_type = rule_capture.get("type", "")
+    if capture_type == "reminder":
+        return "напом" in low or "РЅР°РїРѕРј" in low or "remind" in low
+    if capture_type == "task":
+        return any(word in low for word in CAPTURE_INTENT_WORDS) or any(re.search(rf"\b{word}\b", low) for word in ACTION_WORDS)
+    if capture_type == "idea":
+        return any(re.search(pattern, low) for pattern in IDEA_INTENT_PATTERNS) or not any(word in low for word in CAPTURE_INTENT_WORDS)
+    return False
+
+
+def should_use_gpt_for_capture(rule_capture: dict, text: str, forced_type: str | None = None) -> bool:
+    if not OPENAI_PARSE_ENABLED:
+        return False
+    if not _openai_client:
+        return False
+
+    capture_type = rule_capture.get("type", "")
+    title = rule_capture.get("title", "")
+    body = rule_capture.get("body", "")
+    confidence = _coerce_confidence(rule_capture.get("confidence"), 0.0)
+    time_confidence = _coerce_confidence(rule_capture.get("time_confidence"), 0.0)
+    words = re.findall(r"\w+", text or "", flags=re.UNICODE)
+
+    if capture_type == "reminder":
+        if not rule_capture.get("due_date") and not rule_capture.get("due_date_hint"):
+            return True
+        if not rule_capture.get("due_time"):
+            return True
+        if time_confidence < 0.75:
+            return True
+        if rule_capture.get("needs_time_clarification"):
+            return True
+
+    if confidence < 0.65:
+        return True
+    if _capture_title_is_weak(title, text):
+        return True
+    if not _compact_spaces(body or ""):
+        return True
+    if not _capture_type_is_obvious(rule_capture, text, forced_type):
+        return True
+    if len(words) > 32:
+        return True
+    if (text or "").count(",") >= 4:
+        return True
+    return False
+
+
+def should_use_gpt_for_idea(capture: dict, text: str) -> bool:
+    if not OPENAI_PARSE_ENABLED or not _openai_client:
+        return False
+    if capture.get("source") == "gpt":
+        return False
+    if _capture_title_is_weak(capture.get("title", ""), text):
+        return True
+    body = _compact_spaces(capture.get("body") or "")
+    if not body:
+        return True
+    if len(re.findall(r"\w+", text or "", flags=re.UNICODE)) > 32:
+        return True
+    return False
 
 
 async def classify_capture(update: Update, text: str, forced_type: str | None = None) -> dict:
@@ -1744,6 +1922,24 @@ async def voice_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     text += f"\n\n<b>Active STT path:</b> {html.escape(_voice_status_summary())}"
     await update.message.reply_html(text, reply_markup=main_menu_keyboard(), disable_web_page_preview=True)
+
+
+def cost_settings_message() -> str:
+    return (
+        "<b>API cost mode</b>\n\n"
+        f"OPENAI_PARSE_ENABLED={str(OPENAI_PARSE_ENABLED).lower()}\n"
+        f"OPENAI_PARSE_STRATEGY={html.escape(OPENAI_PARSE_STRATEGY)}\n"
+        f"OPENAI_PARSE_MODEL={html.escape(OPENAI_PARSE_MODEL or '-')}\n"
+        f"OPENAI_STT_ENABLED={str(OPENAI_STT_ENABLED).lower()}\n"
+        f"OPENAI_STT_MODEL={html.escape(OPENAI_STT_MODEL or '-')}\n"
+        f"voice mode: {html.escape(_voice_mode())}\n\n"
+        "gpt_first = safer, but more expensive\n"
+        "rules_first = cheaper, but should be tested"
+    )
+
+
+async def cost_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_html(cost_settings_message(), reply_markup=main_menu_keyboard())
 
 
 async def list_ideas(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2758,7 +2954,7 @@ async def _send_created_task(update: Update, capture: dict, task_id: int, recogn
 async def _extract_clarified_due(update: Update, text: str, pending: dict) -> dict:
     user_id = update.effective_user.id
     default_timezone = effective_user_timezone(user_id)
-    parsed = await parse_capture_with_gpt(text, default_timezone)
+    parsed = await parse_capture_with_gpt(text, default_timezone, feature="reminder_clarification")
     timezone = (parsed or {}).get("timezone") or pending.get("timezone") or default_timezone
     due_time = (parsed or {}).get("due_time") or extract_capture_due_time(text)
     due_date = (parsed or {}).get("due_date") or extract_capture_due_date(text, timezone)
@@ -2864,7 +3060,7 @@ async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     brief = capture["title"]
     details = capture["body"]
-    if _openai_client and capture.get("source") != "gpt":
+    if should_use_gpt_for_idea(capture, text):
         parsed = await parse_idea_with_gpt(text)
         if parsed:
             brief, details = parsed
@@ -2936,7 +3132,7 @@ async def text_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     brief = capture["title"]
     details = capture["body"]
-    if _openai_client and capture.get("source") != "gpt":
+    if should_use_gpt_for_idea(capture, text):
         parsed = await parse_idea_with_gpt(text)
         if parsed:
             brief, details = parsed
@@ -3373,9 +3569,11 @@ async def transcribe_voice(voice_file, update: Update | None = None):
         if _openai_stt_available():
             try:
                 _log_event("openai_stt_request_started", model=OPENAI_STT_MODEL, **meta)
+                stt_file_size = meta.get("file_size") or os.path.getsize(tmp_path)
                 text = await _async_call(_openai_transcribe_file, tmp_path)
+                _log_openai_stt_usage(meta.get("duration", ""), stt_file_size)
                 if text:
-                    _log_event("openai_stt_request_succeeded", model=OPENAI_STT_MODEL, transcript=text, **meta)
+                    _log_event("openai_stt_request_succeeded", model=OPENAI_STT_MODEL, **meta)
                     logger.info("voice transcription engine=%s", _openai_stt_engine_label())
                     return {"text": text, "engine": _openai_stt_engine_label()}
             except Exception as exc:
@@ -3833,28 +4031,54 @@ async def clarify_reminder_time_voice(update: Update, context: ContextTypes.DEFA
 async def classify_capture(update: Update, text: str, forced_type: str | None = None) -> dict:
     user_id = update.effective_user.id
     default_timezone = effective_user_timezone(user_id)
-    _log_event("capture_gpt_parse_started", model=OPENAI_PARSE_MODEL, forced_type=forced_type or "", transcript=text)
-    parsed = await parse_capture_with_gpt(text, default_timezone)
-    if parsed:
-        capture = parsed
-        _log_event(
-            "capture_gpt_parse_succeeded",
-            model=OPENAI_PARSE_MODEL,
-            target=capture.get("target", ""),
-            project_candidate=capture.get("project_name_candidate", ""),
-            column_hint=capture.get("column_hint", ""),
-            source=capture.get("source", ""),
-        )
+    rule_capture = classify_capture_text(text)
+    parsed = None
+
+    if OPENAI_PARSE_STRATEGY == "rules_first":
+        if should_use_gpt_for_capture(rule_capture, text, forced_type=forced_type):
+            _log_event("capture_gpt_parse_started", model=OPENAI_PARSE_MODEL, forced_type=forced_type or "", strategy=OPENAI_PARSE_STRATEGY)
+            parsed = await parse_capture_with_gpt(text, default_timezone)
+            if parsed:
+                _log_event(
+                    "capture_gpt_parse_succeeded",
+                    model=OPENAI_PARSE_MODEL,
+                    target=parsed.get("target", ""),
+                    project_candidate=parsed.get("project_name_candidate", ""),
+                    column_hint=parsed.get("column_hint", ""),
+                    source=parsed.get("source", ""),
+                    strategy=OPENAI_PARSE_STRATEGY,
+                )
+            else:
+                _log_event("capture_gpt_parse_failed", model=OPENAI_PARSE_MODEL, source="rules", strategy=OPENAI_PARSE_STRATEGY)
+        else:
+            _log_event("capture_gpt_parse_skipped", reason="rules_confident", strategy=OPENAI_PARSE_STRATEGY, source="rules")
+        capture = parsed or rule_capture
     else:
-        capture = classify_capture_text(text)
-        _log_event(
-            "capture_gpt_parse_failed",
-            model=OPENAI_PARSE_MODEL,
-            target=capture.get("target", ""),
-            project_candidate=capture.get("project_name_candidate", ""),
-            column_hint=capture.get("column_hint", ""),
-            source="rules",
-        )
+        if OPENAI_PARSE_ENABLED:
+            _log_event("capture_gpt_parse_started", model=OPENAI_PARSE_MODEL, forced_type=forced_type or "", strategy=OPENAI_PARSE_STRATEGY)
+            parsed = await parse_capture_with_gpt(text, default_timezone)
+        if parsed:
+            capture = parsed
+            _log_event(
+                "capture_gpt_parse_succeeded",
+                model=OPENAI_PARSE_MODEL,
+                target=capture.get("target", ""),
+                project_candidate=capture.get("project_name_candidate", ""),
+                column_hint=capture.get("column_hint", ""),
+                source=capture.get("source", ""),
+                strategy=OPENAI_PARSE_STRATEGY,
+            )
+        else:
+            capture = rule_capture
+            _log_event(
+                "capture_gpt_parse_failed" if OPENAI_PARSE_ENABLED else "capture_gpt_parse_disabled",
+                model=OPENAI_PARSE_MODEL,
+                target=capture.get("target", ""),
+                project_candidate=capture.get("project_name_candidate", ""),
+                column_hint=capture.get("column_hint", ""),
+                source="rules",
+                strategy=OPENAI_PARSE_STRATEGY,
+            )
 
     if forced_type:
         capture["type"] = forced_type
@@ -3874,6 +4098,19 @@ async def classify_capture(update: Update, text: str, forced_type: str | None = 
     capture["due_time"] = due_time
     capture["due_date"] = due_date
     capture["timezone"] = timezone
+    capture["body"] = capture.get("body") or text
+    capture["title"] = _compact_spaces(capture.get("title") or generate_capture_title(text, capture["type"]))
+    capture["target"] = capture.get("target") or ""
+    capture["project_name_candidate"] = capture.get("project_name_candidate") or ""
+    capture["board_name_candidate"] = capture.get("board_name_candidate") or ""
+    capture["column_hint"] = capture.get("column_hint") or normalize_weeek_column_hint(text)
+    capture["parent_task_candidate"] = capture.get("parent_task_candidate") or extract_parent_task_candidate(text)
+    capture["transcript_clean"] = _compact_spaces(capture.get("transcript_clean") or text)
+    capture["transcript"] = _compact_spaces(capture.get("transcript") or text)
+    capture["confidence"] = _coerce_confidence(capture.get("confidence"), 0.75)
+    capture["time_confidence"] = _coerce_confidence(capture.get("time_confidence"), _rule_time_confidence(text, due_time))
+    if capture["type"] != "reminder":
+        capture["needs_time_clarification"] = False
     return capture
 
 
@@ -4363,6 +4600,8 @@ def main():
     application.add_handler(CommandHandler("reminders", reminders_show))
     application.add_handler(CommandHandler("settime", reminders_show))
     application.add_handler(CommandHandler("voice", voice_instructions))
+    application.add_handler(CommandHandler("cost", cost_mode))
+    application.add_handler(CommandHandler("costmode", cost_mode))
     application.add_handler(CommandHandler("tasks", list_tasks))
 
     application.add_handler(add_conv)
