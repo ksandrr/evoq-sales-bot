@@ -85,6 +85,44 @@ class ExtractCaptureDueTimeTests(unittest.TestCase):
         self.assertEqual(extract_capture_due_time("в двенадцать дня"), "12:00")
 
 
+class WeeekProjectCallbackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_project_callback_schedules_next_step_and_releases_conversation(self):
+        scheduled = []
+
+        class FakeApplication:
+            def create_task(self, coro):
+                scheduled.append(coro)
+
+        class FakeQuery:
+            id = "cb-1"
+            data = "weeek_project:6"
+            from_user = types.SimpleNamespace(id=123)
+            message = types.SimpleNamespace(message_id=456)
+
+            async def answer(self, **kwargs):
+                return None
+
+        update = types.SimpleNamespace(callback_query=FakeQuery())
+        context = types.SimpleNamespace(
+            user_data={
+                "_active_flow": "weeek_capture",
+                "weeek_draft": {
+                    "projects": [{"id": "6", "name": "Personal"}],
+                    "target": "weeek_task",
+                },
+            },
+            application=FakeApplication(),
+        )
+
+        result = await bot.weeek_project_callback(update, context)
+
+        self.assertEqual(result, bot.ConversationHandler.END)
+        self.assertIsNone(context.user_data.get("_active_flow"))
+        self.assertEqual(context.user_data["weeek_draft"]["project_id"], "6")
+        self.assertEqual(len(scheduled), 1)
+        scheduled[0].close()
+
+
 class CaptureTitleFallbackTests(unittest.TestCase):
     def test_noisy_dentist_task_gets_human_title(self):
         capture = bot.classify_capture_text(

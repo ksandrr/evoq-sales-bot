@@ -54,6 +54,8 @@ OPENAI_STT_ENABLED = (os.getenv("OPENAI_STT_ENABLED") or "true").strip().lower()
 WEEEK_API_TOKEN = (os.getenv("WEEEK_API_TOKEN") or "").strip()
 WEEEK_API_BASE_URL = (os.getenv("WEEEK_API_BASE_URL") or "https://api.weeek.net/public/v1").strip()
 WEEEK_DEFAULT_WORKSPACE_ID = (os.getenv("WEEEK_DEFAULT_WORKSPACE_ID") or "").strip()
+TELEGRAM_SHORT_TIMEOUT = 4
+WEEEK_PROJECT_CALLBACK_TIMEOUT = 16
 
 
 def _normalize_text(text: str) -> str:
@@ -1866,6 +1868,8 @@ async def _async_call(fn, *args, **kwargs):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    _reset_transient_flow_state(context)
+    logger.info("start_recovery_state_cleared user_id=%s", user_id)
     db.upsert_user(user_id)
     schedule_user_reminders(context.application, user_id)
 
@@ -1881,7 +1885,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏰ Напоминания: <b>{times_txt}</b>\n\n"
         "Используй кнопки внизу. Идею или задачу можно ввести текстом или голосом."
     )
-    await update.message.reply_html(text, reply_markup=main_menu_keyboard())
+    try:
+        await update.message.reply_html(
+            text,
+            reply_markup=main_menu_keyboard(),
+            read_timeout=TELEGRAM_SHORT_TIMEOUT,
+            write_timeout=TELEGRAM_SHORT_TIMEOUT,
+            connect_timeout=TELEGRAM_SHORT_TIMEOUT,
+            pool_timeout=TELEGRAM_SHORT_TIMEOUT,
+        )
+    except TelegramError as exc:
+        logger.warning("start_recovery_reply_failed user_id=%s error=%s", user_id, exc)
+
+
+async def start_conversation_recovery(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
+    _reset_transient_flow_state(context)
+    logger.info("start_conversation_recovery_state_cleared user_id=%s", user_id)
+    return ConversationHandler.END
 
 
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4757,6 +4778,173 @@ async def weeek_project_callback(update: Update, context: ContextTypes.DEFAULT_T
         _clear_active_flow(context)
         return ConversationHandler.END
 
+def _callback_trace_id(query) -> str:
+    return str(getattr(query, "id", "") or "no-query-id")
+
+
+async def _safe_answer_weeek_project_callback(query, callback_id: str, text: str = "", show_alert: bool = False):
+    logger.info("weeek_project_callback_answer_started callback_id=%s", callback_id)
+    try:
+        kwargs = {
+            "read_timeout": TELEGRAM_SHORT_TIMEOUT,
+            "write_timeout": TELEGRAM_SHORT_TIMEOUT,
+            "connect_timeout": TELEGRAM_SHORT_TIMEOUT,
+            "pool_timeout": TELEGRAM_SHORT_TIMEOUT,
+        }
+        if text:
+            kwargs["text"] = text
+            kwargs["show_alert"] = show_alert
+        await query.answer(**kwargs)
+        logger.info("weeek_project_callback_answer_finished callback_id=%s", callback_id)
+        return True
+    except TimedOut:
+        logger.warning("weeek_project_callback_answer_timed_out callback_id=%s", callback_id)
+        return False
+    except TelegramError as exc:
+        logger.warning("weeek_project_callback_answer_failed callback_id=%s error=%s", callback_id, exc)
+        return False
+
+
+async def _safe_weeek_project_error_message(message, context: ContextTypes.DEFAULT_TYPE, callback_id: str, text: str):
+    try:
+        await message.reply_text(
+            text,
+            reply_markup=main_menu_keyboard(),
+            read_timeout=TELEGRAM_SHORT_TIMEOUT,
+            write_timeout=TELEGRAM_SHORT_TIMEOUT,
+            connect_timeout=TELEGRAM_SHORT_TIMEOUT,
+            pool_timeout=TELEGRAM_SHORT_TIMEOUT,
+        )
+        logger.info("weeek_project_callback_error_message_sent callback_id=%s", callback_id)
+    except TelegramError as exc:
+        logger.warning("weeek_project_callback_error_message_failed callback_id=%s error=%s", callback_id, exc)
+    finally:
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        logger.info("weeek_project_callback_state_cleared callback_id=%s", callback_id)
+
+
+async def _run_weeek_project_next_step(message, context: ContextTypes.DEFAULT_TYPE, callback_id: str):
+    draft = _get_weeek_draft(context)
+    project_id = draft.get("project_id", "")
+    project_name = draft.get("project_name", "")
+    logger.info("weeek_project_callback_next_step_started callback_id=%s project_id=%r", callback_id, project_id)
+    try:
+        known_project = WEEEK_TARGETS.get(str(project_id))
+        if known_project:
+            logger.info(
+                "weeek_known_project_mapping_found callback_id=%s project_id=%r board_id=%r board_name=%r",
+                callback_id,
+                project_id,
+                known_project["board_id"],
+                known_project["board_name"],
+            )
+            draft["board_id"] = known_project["board_id"]
+            draft["board_name"] = known_project["board_name"]
+            logger.info("weeek_draft_known_project_state_update_finished callback_id=%s project_id=%r board_id=%r", callback_id, project_id, known_project["board_id"])
+            if draft.get("target") == "weeek_subtask":
+                await _send_weeek_parent_picker(message, context)
+            else:
+                await _send_weeek_column_picker(message, context)
+        else:
+            await _send_weeek_board_picker(message, context)
+        logger.info("weeek_project_callback_next_step_finished callback_id=%s project_id=%r", callback_id, project_id)
+    except (TelegramError, WeeekApiError) as exc:
+        logger.warning("weeek_project_callback_next_step_failed callback_id=%s project_id=%r error=%s", callback_id, project_id, exc)
+        await _safe_weeek_project_error_message(
+            message,
+            context,
+            callback_id,
+            f"Не удалось продолжить создание задачи в Weeek после выбора проекта {project_name or project_id}: {exc}",
+        )
+    except Exception:
+        logger.exception("weeek_project_callback_next_step_unhandled callback_id=%s project_id=%r", callback_id, project_id)
+        await _safe_weeek_project_error_message(
+            message,
+            context,
+            callback_id,
+            "Не удалось продолжить создание задачи в Weeek после выбора проекта. Начни заново.",
+        )
+    finally:
+        logger.info("weeek_project_callback_background_exited callback_id=%s", callback_id)
+
+
+async def _bounded_weeek_project_next_step(message, context: ContextTypes.DEFAULT_TYPE, callback_id: str):
+    try:
+        await asyncio.wait_for(
+            _run_weeek_project_next_step(message, context, callback_id),
+            timeout=WEEEK_PROJECT_CALLBACK_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("weeek_project_callback_background_timed_out callback_id=%s", callback_id)
+        await _safe_weeek_project_error_message(
+            message,
+            context,
+            callback_id,
+            "Не удалось продолжить выбор проекта Weeek: операция заняла слишком много времени. Начни заново.",
+        )
+
+
+async def weeek_project_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    callback_id = _callback_trace_id(query)
+    logger.info(
+        "weeek_project_callback_received callback_id=%s data=%r user_id=%s message_id=%s matched_handler=weeek_project_callback current_user_state=%r",
+        callback_id,
+        query.data,
+        query.from_user.id if query.from_user else None,
+        query.message.message_id if query.message else None,
+        context.user_data.get("_active_flow", ""),
+    )
+    await _safe_answer_weeek_project_callback(query, callback_id)
+    draft = _get_weeek_draft(context)
+    if not draft:
+        logger.warning("weeek_project_callback_missing_draft callback_id=%s", callback_id)
+        await _safe_answer_weeek_project_callback(
+            query,
+            callback_id,
+            "Черновик задачи Weeek потерян. Начни заново.",
+            show_alert=True,
+        )
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        logger.info("weeek_project_callback_state_cleared callback_id=%s reason=missing_draft", callback_id)
+        logger.info("weeek_project_callback_exited callback_id=%s", callback_id)
+        return ConversationHandler.END
+    project_id = (query.data or "").split(":", 1)[1]
+    project = next((item for item in draft.get("projects", []) if item["id"] == project_id), None)
+    if not project:
+        logger.warning("weeek_project_callback_stale_project callback_id=%s project_id=%r", callback_id, project_id)
+        await _safe_answer_weeek_project_callback(
+            query,
+            callback_id,
+            "Проект устарел. Начни создание задачи заново.",
+            show_alert=True,
+        )
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        logger.info("weeek_project_callback_state_cleared callback_id=%s reason=stale_project", callback_id)
+        logger.info("weeek_project_callback_exited callback_id=%s", callback_id)
+        return ConversationHandler.END
+    logger.info("weeek_draft_project_state_update_started callback_id=%s project_id=%r project_name=%r", callback_id, project["id"], project["name"])
+    draft["project_id"] = project["id"]
+    draft["project_name"] = project["name"]
+    logger.info("weeek_draft_project_state_update_finished callback_id=%s project_id=%r project_name=%r", callback_id, project["id"], project["name"])
+    _log_event("weeek_project_selected", callback_id=callback_id, project_id=project["id"], project_name=project["name"])
+    if not query.message:
+        logger.warning("weeek_project_callback_missing_message callback_id=%s", callback_id)
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        logger.info("weeek_project_callback_state_cleared callback_id=%s reason=missing_message", callback_id)
+        logger.info("weeek_project_callback_exited callback_id=%s", callback_id)
+        return ConversationHandler.END
+    logger.info("weeek_project_callback_next_step_scheduled callback_id=%s", callback_id)
+    context.application.create_task(_bounded_weeek_project_next_step(query.message, context, callback_id))
+    _clear_active_flow(context)
+    logger.info("weeek_project_callback_state_cleared callback_id=%s reason=conversation_released", callback_id)
+    logger.info("weeek_project_callback_exited callback_id=%s", callback_id)
+    return ConversationHandler.END
+
 
 _legacy_handle_callback = handle_callback
 
@@ -4875,6 +5063,7 @@ def main():
             ],
         },
         fallbacks=[
+            CommandHandler("start", start_conversation_recovery),
             CommandHandler("cancel", cancel),
             MessageHandler(filters.Regex(f"^{BTN_CANCEL}$"), cancel),
         ],
@@ -4923,7 +5112,7 @@ def main():
         allow_reentry=True,
     )
 
-    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("start", start), group=-1)
     application.add_handler(CommandHandler("help", show_help))
     application.add_handler(CommandHandler("list", list_ideas))
     application.add_handler(CommandHandler("test", test_reminder))
