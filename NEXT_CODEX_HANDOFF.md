@@ -35,11 +35,20 @@ Fix the hang in the voice -> Weeek project selection flow with a minimal patch s
 
 ### Deployment
 
-- Not deployed yet at the time of this note. Update this section after `git push`, server `git pull`, and service restart are completed.
+- Deployed to the Linux server at `/home/sanya/mira-task-bot` with `git pull`.
+- Server checks completed:
+  - `.venv/bin/python -m py_compile bot.py weeek_client.py`
+  - `.venv/bin/python -m unittest tests.test_time_parsing`
+- Restarted `mira-task-bot.service`.
+- Post-restart status: `active (running)`.
+- Fresh service logs after restart showed normal startup:
+  - `Bot started; reminders scheduled.`
+  - `Application started.`
 
 ### Commit
 
-- Not created yet at the time of this note.
+- Commit: `72155a6` (`Handle Weeek callback timeout failures`)
+- Branch pushed: `tembo/telegram-idea-bot-daily-reminders`
 
 ### .env Changes
 
