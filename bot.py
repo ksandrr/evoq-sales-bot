@@ -22,6 +22,11 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction, ParseMode
+try:
+    from telegram.error import TelegramError, TimedOut
+except Exception:  # pragma: no cover - tests can stub `telegram` as a simple module
+    TelegramError = Exception
+    TimedOut = Exception
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -4471,6 +4476,286 @@ async def text_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_html(f"<b>Описание:</b> {html.escape(details)}", reply_markup=main_menu_keyboard())
     await update.message.reply_text("Что дальше?", reply_markup=post_save_keyboard(idea_id))
     return ConversationHandler.END
+
+
+async def _send_weeek_board_picker(message, context: ContextTypes.DEFAULT_TYPE):
+    draft = _get_weeek_draft(context)
+    project_id = draft.get("project_id")
+    client = get_weeek_client()
+    logger.info("weeek_boards_loading_started project_id=%r", project_id)
+    try:
+        boards = await client.list_boards(project_id)
+        logger.info("weeek_boards_loading_finished project_id=%r count=%s", project_id, len(boards))
+    except WeeekApiError as exc:
+        logger.warning("weeek_boards_loading_failed project_id=%r error=%s", project_id, exc)
+        try:
+            await message.reply_text(
+                f"Не удалось получить доски Weeek: {exc}",
+                reply_markup=main_menu_keyboard(),
+                read_timeout=4,
+                write_timeout=4,
+                connect_timeout=4,
+                pool_timeout=4,
+            )
+        except TelegramError as telegram_exc:
+            logger.warning("weeek_boards_error_message_failed project_id=%r error=%s", project_id, telegram_exc)
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        return ConversationHandler.END
+    if not boards:
+        logger.warning("weeek_boards_empty project_id=%r", project_id)
+        try:
+            await message.reply_text(
+                "Для выбранного проекта не нашёл доски Weeek. Проверь структуру проекта в Weeek.",
+                reply_markup=main_menu_keyboard(),
+                read_timeout=4,
+                write_timeout=4,
+                connect_timeout=4,
+                pool_timeout=4,
+            )
+        except TelegramError as telegram_exc:
+            logger.warning("weeek_boards_empty_message_failed project_id=%r error=%s", project_id, telegram_exc)
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        return ConversationHandler.END
+    logger.info("weeek_draft_board_state_update_started project_id=%r", project_id)
+    draft["boards"] = [{"id": option.id, "name": option.name, "raw": option.raw} for option in boards]
+    logger.info("weeek_draft_board_state_update_finished project_id=%r count=%s", project_id, len(draft["boards"]))
+    logger.info("weeek_board_message_send_started project_id=%r", project_id)
+    await message.reply_text(
+        "Теперь выбери доску:",
+        reply_markup=_weeek_options_keyboard(draft["boards"], "weeek_board"),
+        read_timeout=4,
+        write_timeout=4,
+        connect_timeout=4,
+        pool_timeout=4,
+    )
+    logger.info("weeek_board_message_send_finished project_id=%r", project_id)
+    return WEEEK_BOARD
+
+
+async def _send_weeek_column_picker(message, context: ContextTypes.DEFAULT_TYPE):
+    draft = _get_weeek_draft(context)
+    board_id = draft.get("board_id")
+    client = get_weeek_client()
+    logger.info("weeek_columns_loading_started board_id=%r", board_id)
+    try:
+        columns = await client.list_columns(board_id)
+        logger.info("weeek_columns_loading_finished board_id=%r count=%s", board_id, len(columns))
+    except WeeekApiError as exc:
+        logger.warning("weeek_columns_loading_failed board_id=%r error=%s", board_id, exc)
+        try:
+            await message.reply_text(
+                f"Не удалось получить колонки Weeek: {exc}",
+                reply_markup=main_menu_keyboard(),
+                read_timeout=4,
+                write_timeout=4,
+                connect_timeout=4,
+                pool_timeout=4,
+            )
+        except TelegramError as telegram_exc:
+            logger.warning("weeek_columns_error_message_failed board_id=%r error=%s", board_id, telegram_exc)
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        return ConversationHandler.END
+    if not columns:
+        logger.warning("weeek_columns_empty board_id=%r", board_id)
+        try:
+            await message.reply_text(
+                "Не смог получить колонки этой доски Weeek. Возможно, API вернул непривычный формат.",
+                reply_markup=main_menu_keyboard(),
+                read_timeout=4,
+                write_timeout=4,
+                connect_timeout=4,
+                pool_timeout=4,
+            )
+        except TelegramError as telegram_exc:
+            logger.warning("weeek_columns_empty_message_failed board_id=%r error=%s", board_id, telegram_exc)
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        return ConversationHandler.END
+    logger.info("weeek_draft_column_state_update_started board_id=%r", board_id)
+    mapped = [{"id": option.id, "name": option.name, "raw": option.raw} for option in columns]
+    draft["columns"] = _sort_weeek_columns(mapped, draft.get("column_hint", ""))
+    logger.info("weeek_draft_column_state_update_finished board_id=%r count=%s", board_id, len(draft["columns"]))
+    hint = draft.get("column_hint", "")
+    if hint:
+        matched = [column for column in draft["columns"] if _column_matches_hint(column.get("name", ""), hint)]
+        if len(matched) == 1:
+            draft["column_id"] = matched[0]["id"]
+            draft["column_name"] = matched[0]["name"]
+            logger.info("weeek_column_auto_selected board_id=%r column_id=%r column_name=%r", board_id, matched[0]["id"], matched[0]["name"])
+            return await _show_weeek_preview(message, context)
+    logger.info("weeek_column_message_send_started board_id=%r", board_id)
+    await message.reply_text(
+        "И последним шагом выбери колонку:",
+        reply_markup=_weeek_options_keyboard(draft["columns"], "weeek_column"),
+        read_timeout=4,
+        write_timeout=4,
+        connect_timeout=4,
+        pool_timeout=4,
+    )
+    logger.info("weeek_column_message_send_finished board_id=%r", board_id)
+    return WEEEK_COLUMN
+
+
+async def _send_weeek_parent_picker(message, context: ContextTypes.DEFAULT_TYPE):
+    draft = _get_weeek_draft(context)
+    project_id = draft.get("project_id", "")
+    board_id = draft.get("board_id", "")
+    client = get_weeek_client()
+    logger.info("weeek_parent_tasks_loading_started project_id=%r board_id=%r", project_id, board_id)
+    try:
+        tasks = await client.list_tasks(project_id, board_id)
+        logger.info("weeek_parent_tasks_loading_finished project_id=%r board_id=%r count=%s", project_id, board_id, len(tasks))
+    except WeeekApiError as exc:
+        logger.warning("weeek_parent_tasks_loading_failed project_id=%r board_id=%r error=%s", project_id, board_id, exc)
+        try:
+            await message.reply_text(
+                f"Не удалось получить задачи Weeek: {exc}",
+                reply_markup=main_menu_keyboard(),
+                read_timeout=4,
+                write_timeout=4,
+                connect_timeout=4,
+                pool_timeout=4,
+            )
+        except TelegramError as telegram_exc:
+            logger.warning("weeek_parent_tasks_error_message_failed project_id=%r board_id=%r error=%s", project_id, board_id, telegram_exc)
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        return ConversationHandler.END
+    if not tasks:
+        logger.warning("weeek_parent_tasks_empty project_id=%r board_id=%r", project_id, board_id)
+        try:
+            await message.reply_text(
+                "Не смог получить список задач в этой доске Weeek.",
+                reply_markup=main_menu_keyboard(),
+                read_timeout=4,
+                write_timeout=4,
+                connect_timeout=4,
+                pool_timeout=4,
+            )
+        except TelegramError as telegram_exc:
+            logger.warning("weeek_parent_tasks_empty_message_failed project_id=%r board_id=%r error=%s", project_id, board_id, telegram_exc)
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        return ConversationHandler.END
+    logger.info("weeek_draft_parent_state_update_started project_id=%r board_id=%r", project_id, board_id)
+    mapped = [{"id": option.id, "name": option.name, "raw": option.raw} for option in tasks]
+    draft["parent_tasks"] = mapped
+    logger.info("weeek_draft_parent_state_update_finished project_id=%r board_id=%r count=%s", project_id, board_id, len(mapped))
+    candidate = draft.get("parent_task_candidate") or ""
+    parent_task, match_source = _match_parent_task(mapped, candidate)
+    if parent_task:
+        draft["parent_task_id"] = parent_task["id"]
+        draft["parent_task_name"] = parent_task["name"]
+        draft["parent_task_match_source"] = match_source
+        logger.info("weeek_parent_auto_selected project_id=%r board_id=%r parent_id=%r parent_name=%r", project_id, board_id, parent_task["id"], parent_task["name"])
+        return await _send_weeek_column_picker(message, context)
+    logger.info("weeek_parent_message_send_started project_id=%r board_id=%r candidate=%r", project_id, board_id, candidate)
+    if candidate:
+        await message.reply_text(
+            "Не смог однозначно найти родительскую задачу. Выбери её вручную:",
+            reply_markup=_weeek_options_keyboard(mapped, "weeek_parent"),
+            read_timeout=4,
+            write_timeout=4,
+            connect_timeout=4,
+            pool_timeout=4,
+        )
+    else:
+        await message.reply_text(
+            "Выбери родительскую задачу:",
+            reply_markup=_weeek_options_keyboard(mapped, "weeek_parent"),
+            read_timeout=4,
+            write_timeout=4,
+            connect_timeout=4,
+            pool_timeout=4,
+        )
+    logger.info("weeek_parent_message_send_finished project_id=%r board_id=%r", project_id, board_id)
+    return WEEEK_PARENT
+
+
+async def weeek_project_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    logger.info(
+        "weeek_project_callback_received data=%r user_id=%s message_id=%s",
+        query.data,
+        query.from_user.id if query.from_user else None,
+        query.message.message_id if query.message else None,
+    )
+    logger.info("weeek_project_callback_answer_started query_id=%r", query.id)
+    try:
+        await query.answer(read_timeout=4, write_timeout=4, connect_timeout=4, pool_timeout=4)
+        logger.info("weeek_project_callback_answer_finished query_id=%r", query.id)
+    except TimedOut:
+        logger.warning("weeek_project_callback_answer_timed_out query_id=%r", query.id)
+    except TelegramError as exc:
+        logger.warning("weeek_project_callback_answer_failed query_id=%r error=%s", query.id, exc)
+    draft = _get_weeek_draft(context)
+    if not draft:
+        logger.warning("weeek_project_callback_missing_draft query_id=%r", query.id)
+        try:
+            await query.answer(
+                "Черновик задачи Weeek потерян. Начни заново.",
+                show_alert=True,
+                read_timeout=4,
+                write_timeout=4,
+                connect_timeout=4,
+                pool_timeout=4,
+            )
+        except TelegramError as exc:
+            logger.warning("weeek_project_callback_missing_draft_answer_failed query_id=%r error=%s", query.id, exc)
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        return ConversationHandler.END
+    project_id = (query.data or "").split(":", 1)[1]
+    project = next((item for item in draft.get("projects", []) if item["id"] == project_id), None)
+    if not project:
+        logger.warning("weeek_project_callback_stale_project project_id=%r", project_id)
+        try:
+            await query.answer(
+                "Проект устарел, выбери ещё раз.",
+                show_alert=True,
+                read_timeout=4,
+                write_timeout=4,
+                connect_timeout=4,
+                pool_timeout=4,
+            )
+        except TelegramError as exc:
+            logger.warning("weeek_project_callback_stale_project_answer_failed project_id=%r error=%s", project_id, exc)
+        return await _send_weeek_project_picker(query.message, context)
+    logger.info("weeek_draft_project_state_update_started project_id=%r project_name=%r", project["id"], project["name"])
+    draft["project_id"] = project["id"]
+    draft["project_name"] = project["name"]
+    logger.info("weeek_draft_project_state_update_finished project_id=%r project_name=%r", project["id"], project["name"])
+    _log_event("weeek_project_selected", project_id=project["id"], project_name=project["name"])
+    known_project = WEEEK_TARGETS.get(str(project["id"]))
+    if known_project:
+        logger.info(
+            "weeek_known_project_mapping_found project_id=%r board_id=%r board_name=%r",
+            project["id"],
+            known_project["board_id"],
+            known_project["board_name"],
+        )
+        draft["board_id"] = known_project["board_id"]
+        draft["board_name"] = known_project["board_name"]
+        logger.info("weeek_draft_known_project_state_update_finished project_id=%r board_id=%r", project["id"], known_project["board_id"])
+        try:
+            if draft.get("target") == "weeek_subtask":
+                return await _send_weeek_parent_picker(query.message, context)
+            return await _send_weeek_column_picker(query.message, context)
+        except TelegramError as exc:
+            logger.warning("weeek_project_callback_known_project_step_failed project_id=%r error=%s", project["id"], exc)
+            _clear_weeek_draft(context)
+            _clear_active_flow(context)
+            return ConversationHandler.END
+    try:
+        return await _send_weeek_board_picker(query.message, context)
+    except TelegramError as exc:
+        logger.warning("weeek_project_callback_board_step_failed project_id=%r error=%s", project["id"], exc)
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        return ConversationHandler.END
 
 
 _legacy_handle_callback = handle_callback

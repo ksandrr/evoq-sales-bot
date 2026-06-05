@@ -1,5 +1,86 @@
 # NEXT CODEX HANDOFF
 
+## 2026-06-06 Telegram Callback Timeout Follow-Up
+
+### Session Goal
+
+Investigate the still-broken live Weeek project selection hang after deploy using the exact server logs from the real Telegram test, then apply the smallest safe fix.
+
+### Root Cause Found
+
+- The live server logs for the real click on project `Личное` showed that the last confirmed business step was:
+  - `weeek_project_selected project_id='6' project_name='Личное'`
+- After that, the process was not hanging inside Weeek API loading. It was timing out on Telegram API calls, specifically on:
+  - `await query.answer()` inside `weeek_project_callback`
+- The exact stack trace in `journalctl` showed:
+  - `bot.py -> handle_callback -> weeek_project_callback -> await query.answer()`
+  - failure type: `telegram.error.TimedOut`
+- A later live voice right after the stuck click also failed on a Telegram send call (`reply_text("Распознаю голосовое...")`) with the same timeout family, so `/start` and new voice were not blocked by FSM state logic alone. Telegram API request timeouts were part of the real failure mode.
+
+### What Changed
+
+- In `bot.py`:
+  - added precise logging around the active Weeek project-selection path:
+    - callback received
+    - callback answer started/finished/timed out/failed
+    - project draft update started/finished
+    - known project mapping found
+    - boards loading started/finished/failed
+    - columns loading started/finished/failed
+    - parent tasks loading started/finished/failed
+    - next Telegram message send started/finished
+  - added a later overriding active version of the Weeek picker functions and `weeek_project_callback` without changing menu or overall architecture
+  - changed Weeek project callback to use short Telegram timeouts for `query.answer(...)`
+  - if `query.answer(...)` times out, the callback now logs it and continues instead of crashing immediately
+  - if the next Telegram step or a Weeek-loading step fails, the bot now clears `weeek_draft` and clears the active flow before ending that flow
+  - used short Telegram timeouts on the follow-up `reply_text(...)` calls inside the Weeek picker flow so one slow Telegram request does not keep the flow hanging as long
+
+### Files Edited
+
+- `C:\Users\gorbi\OneDrive\Документы\mira-task-bot\bot.py`
+- `C:\Users\gorbi\OneDrive\Документы\mira-task-bot\NEXT_CODEX_HANDOFF.md`
+
+### Checks Run
+
+- Linux log inspection:
+  - `journalctl -u mira-task-bot.service --since "2026-06-05 20:40:00" --until "2026-06-05 20:45:00" --no-pager`
+- Local code checks:
+  - `C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m py_compile bot.py weeek_client.py`
+  - `C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m unittest tests.test_time_parsing`
+
+### Test Result
+
+- `py_compile`: passed
+- `tests.test_time_parsing`: passed
+
+### Deployment
+
+- Not deployed yet at the time of writing this note. Update after commit/push/pull/restart.
+
+### Commit
+
+- Not created yet at the time of writing this note.
+
+### .env Changes
+
+- No `.env` variables were changed in this session.
+
+### Open Issues
+
+- A fresh live Telegram smoke test is still needed after deploy because the real issue was a Telegram callback/send timeout, not a purely local code-path exception.
+
+### Next Check
+
+- First check the fresh server logs right after one click on `Личное` and confirm the new log chain:
+  - `weeek_project_callback_received`
+  - `weeek_project_callback_answer_started`
+  - either `weeek_project_callback_answer_finished` or `weeek_project_callback_answer_timed_out`
+  - then one of:
+    - `weeek_columns_loading_started`
+    - `weeek_boards_loading_started`
+    - `weeek_parent_tasks_loading_started`
+  - and finally either a successful `...message_send_finished` or a clear logged failure with state reset
+
 ## 2026-06-06 Weeek Project Selection Freeze Fix
 
 ### Session Goal
