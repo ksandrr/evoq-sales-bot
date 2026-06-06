@@ -832,3 +832,82 @@ git diff --check
 3. Set the non-secret model names back to `gpt-5.5` and `gpt-4o-transcribe`, then run tests and restart `mira-task-bot.service`.
 4. Run a real Telegram voice-to-Weeek smoke test.
 5. If project selection still hangs, investigate the already observed server outbound timeout to Weeek/Telegram; parse strategy is not proven to be the root cause.
+
+## Session 2026-06-06: Weeek-only Mira
+
+### Goal
+
+Reduce Mira to one workflow: every ordinary text or voice message creates a Weeek task or subtask. Remove all active local idea, task, and reminder interfaces while preserving existing SQLite data.
+
+### Code Changes
+
+- Main keyboard now contains only `🧩 Задача ВИК`.
+- Active commands are only `/start`, `/help`, `/voice`, and `/cancel`; Telegram command metadata is set during `post_init`.
+- Top-level text and voice always enter the Weeek draft flow.
+- Ordinary input is forced to `weeek_task`; explicit subtask wording preserves `weeek_subtask`.
+- Project selection is always shown manually, even if a project name was spoken.
+- Existing project/board/column/parent/preview confirmation and `draft_id` protections remain active.
+- Local idea/task/reminder handlers and commands are no longer registered.
+- Old reply buttons show a disabled-mode notice; old inline callbacks cannot read or mutate local SQLite records.
+- Daily idea reminders and local task-reminder polling are no longer scheduled.
+- `/cancel` now cancels pending Weeek background work through the hard-reset path.
+- Default models are `gpt-5.4-mini` and `gpt-4o-mini-transcribe`.
+- README was updated for the Weeek-only behavior.
+
+### Files Edited
+
+- `.env.example`
+- `README.md`
+- `bot.py`
+- `tests/test_time_parsing.py`
+- `NEXT_CODEX_HANDOFF.md`
+
+### Validation
+
+Local:
+
+```powershell
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m py_compile bot.py database.py weeek_client.py tests\test_time_parsing.py
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m unittest discover -s tests
+git diff --check
+```
+
+- `py_compile`: passed.
+- Full tests: passed, `48 tests`, `OK`.
+- Static command inspection: `cancel`, `help`, `start`, `voice`.
+- Added tests for text/voice Weeek-only routing, task/subtask targets, manual project selection, disabled local callbacks, and disabled schedulers.
+
+Linux:
+
+```bash
+cd /home/sanya/mira-task-bot
+git pull --ff-only origin tembo/telegram-idea-bot-daily-reminders
+.venv/bin/python -m py_compile bot.py database.py weeek_client.py tests/test_time_parsing.py
+.venv/bin/python -m unittest discover -s tests
+sudo systemctl restart mira-task-bot.service
+systemctl is-active mira-task-bot.service
+```
+
+- Server compile: passed.
+- Server tests: passed, `48 tests`, `OK`.
+- Service: `active`.
+- Startup logs confirm `gpt-5.4-mini`, `gpt-4o-mini-transcribe`, and Weeek-only mode.
+- After more than one minute, no `check_task_reminders` or `send_daily_reminder` jobs appeared.
+
+### Commit And Deployment
+
+- Commit: `c8be359` (`Simplify Mira to Weeek-only tasks`).
+- Pushed to `origin/tembo/telegram-idea-bot-daily-reminders`.
+- Deployed to `/home/sanya/mira-task-bot`.
+- Server `.env` changes, without secret values:
+  - removed `OPENAI_PARSE_STRATEGY`;
+  - removed `OPENAI_PARSE_ENABLED`;
+  - set `OPENAI_PARSE_MODEL` to `gpt-5.4-mini`;
+  - set `OPENAI_STT_MODEL` to `gpt-4o-mini-transcribe`.
+- Existing untracked server files `.env.bak.`, `.env.bak_pre_voice_fix`, and `data/` were not touched.
+
+### Remaining Work
+
+1. User must send a real Telegram voice message and complete project/column/preview confirmation.
+2. Verify explicit subtask speech reaches parent selection.
+3. If project/column loading hangs, inspect the known server outbound Weeek/Telegram timeout; the application state fixes remain deployed.
