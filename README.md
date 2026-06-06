@@ -1,17 +1,5 @@
 # evoq-sales-bot
 
-## OpenAI Cost Controls
-
-OpenAI STT is enabled by default through `gpt-4o-mini-transcribe`. Local Vosk remains a fallback when ffmpeg and the Vosk model are available.
-
-Semantic parsing is enabled by default through `gpt-5.4-mini`.
-
-- `OPENAI_PARSE_STRATEGY=gpt_first` is the safe default: GPT parses first, local rules are fallback.
-- `OPENAI_PARSE_STRATEGY=rules_first` is the cheaper test mode: local rules parse first, GPT is used only when rules are not confident.
-- `OPENAI_PARSE_ENABLED=false` fully disables OpenAI chat completion calls for semantic parsing. OpenAI STT is controlled separately by `OPENAI_STT_ENABLED`.
-
-Use `/cost` in Telegram to see the current non-secret cost mode. Detailed rollout and rollback notes are in `docs/API_COST_CONTROL.md`.
-
 Telegram-бот для быстрых идей, задач и напоминаний. Можно писать текстом или надиктовывать голосом: бот распознаёт речь, чистит лишние вводные, определяет тип записи и сохраняет результат в SQLite.
 
 ## Возможности

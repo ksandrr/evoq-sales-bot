@@ -361,28 +361,22 @@ class GptJsonParsingTests(unittest.TestCase):
         self.assertIsNone(result)
 
 
-class ParseCostModeTests(unittest.TestCase):
+class GptFirstCaptureTests(unittest.TestCase):
     def setUp(self):
-        self.old_strategy = bot.OPENAI_PARSE_STRATEGY
-        self.old_enabled = bot.OPENAI_PARSE_ENABLED
         self.old_client = bot._openai_client
         self.old_parse_capture = bot.parse_capture_with_gpt
-        self.old_parse_idea = bot.parse_idea_with_gpt
         self.old_effective_tz = bot.effective_user_timezone
         bot.effective_user_timezone = lambda _user_id: "Asia/Omsk"
 
     def tearDown(self):
-        bot.OPENAI_PARSE_STRATEGY = self.old_strategy
-        bot.OPENAI_PARSE_ENABLED = self.old_enabled
         bot._openai_client = self.old_client
         bot.parse_capture_with_gpt = self.old_parse_capture
-        bot.parse_idea_with_gpt = self.old_parse_idea
         bot.effective_user_timezone = self.old_effective_tz
 
     def _update(self):
         return types.SimpleNamespace(effective_user=types.SimpleNamespace(id=123))
 
-    def test_gpt_first_keeps_old_order(self):
+    def test_capture_always_tries_gpt_before_rules(self):
         calls = {"count": 0}
 
         async def fake_parse(text, default_timezone, feature="capture_parse"):
@@ -400,8 +394,6 @@ class ParseCostModeTests(unittest.TestCase):
                 "source": "gpt",
             }
 
-        bot.OPENAI_PARSE_STRATEGY = "gpt_first"
-        bot.OPENAI_PARSE_ENABLED = True
         bot._openai_client = object()
         bot.parse_capture_with_gpt = fake_parse
 
@@ -409,112 +401,6 @@ class ParseCostModeTests(unittest.TestCase):
 
         self.assertEqual(calls["count"], 1)
         self.assertEqual(capture["source"], "gpt")
-
-    def test_rules_first_simple_task_skips_gpt(self):
-        calls = {"count": 0}
-
-        async def fake_parse(*args, **kwargs):
-            calls["count"] += 1
-            return None
-
-        bot.OPENAI_PARSE_STRATEGY = "rules_first"
-        bot.OPENAI_PARSE_ENABLED = True
-        bot._openai_client = object()
-        bot.parse_capture_with_gpt = fake_parse
-
-        capture = asyncio.run(bot.classify_capture(self._update(), "добавь задачу завтра в 10 написать Кате"))
-
-        self.assertEqual(calls["count"], 0)
-        self.assertEqual(capture["source"], "rules")
-
-    def test_rules_first_simple_idea_skips_gpt(self):
-        calls = {"count": 0}
-
-        async def fake_parse(*args, **kwargs):
-            calls["count"] += 1
-            return None
-
-        bot.OPENAI_PARSE_STRATEGY = "rules_first"
-        bot.OPENAI_PARSE_ENABLED = True
-        bot._openai_client = object()
-        bot.parse_capture_with_gpt = fake_parse
-
-        capture = asyncio.run(bot.classify_capture(self._update(), "запиши идею про Telegram-бота для ЛПР"))
-
-        self.assertEqual(calls["count"], 0)
-        self.assertEqual(capture["type"], "idea")
-
-    def test_rules_first_simple_reminder_with_time_skips_gpt(self):
-        calls = {"count": 0}
-
-        async def fake_parse(*args, **kwargs):
-            calls["count"] += 1
-            return None
-
-        bot.OPENAI_PARSE_STRATEGY = "rules_first"
-        bot.OPENAI_PARSE_ENABLED = True
-        bot._openai_client = object()
-        bot.parse_capture_with_gpt = fake_parse
-
-        capture = asyncio.run(bot.classify_capture(self._update(), "напомни сегодня вечером проверить задачи"))
-
-        self.assertEqual(calls["count"], 0)
-        self.assertEqual(capture["type"], "reminder")
-
-    def test_rules_first_ambiguous_reminder_may_call_gpt(self):
-        calls = {"count": 0}
-
-        async def fake_parse(*args, **kwargs):
-            calls["count"] += 1
-            return None
-
-        bot.OPENAI_PARSE_STRATEGY = "rules_first"
-        bot.OPENAI_PARSE_ENABLED = True
-        bot._openai_client = object()
-        bot.parse_capture_with_gpt = fake_parse
-
-        asyncio.run(bot.classify_capture(self._update(), "напомни проверить задачи"))
-
-        self.assertEqual(calls["count"], 1)
-
-    def test_parse_disabled_never_calls_gpt(self):
-        calls = {"capture": 0, "idea": 0}
-
-        async def fake_capture(*args, **kwargs):
-            calls["capture"] += 1
-            return None
-
-        async def fake_idea(*args, **kwargs):
-            calls["idea"] += 1
-            return ("x", "y")
-
-        bot.OPENAI_PARSE_STRATEGY = "gpt_first"
-        bot.OPENAI_PARSE_ENABLED = False
-        bot._openai_client = object()
-        bot.parse_capture_with_gpt = fake_capture
-        bot.parse_idea_with_gpt = fake_idea
-
-        capture = asyncio.run(bot.classify_capture(self._update(), "добавь задачу написать Кате"))
-
-        self.assertEqual(calls, {"capture": 0, "idea": 0})
-        self.assertEqual(capture["source"], "rules")
-
-    def test_default_env_values_are_safe(self):
-        self.assertEqual(bot.OPENAI_PARSE_MODEL, "gpt-5.4-mini")
-        self.assertEqual(bot.OPENAI_PARSE_STRATEGY, "gpt_first")
-        self.assertTrue(bot.OPENAI_PARSE_ENABLED)
-        self.assertTrue(bot.OPENAI_STT_ENABLED)
-        self.assertEqual(bot.OPENAI_STT_MODEL, "gpt-4o-mini-transcribe")
-
-    def test_cost_message_hides_secrets(self):
-        message = bot.cost_settings_message()
-
-        self.assertIn("OPENAI_PARSE_ENABLED", message)
-        self.assertIn("OPENAI_PARSE_STRATEGY", message)
-        self.assertIn("voice mode", message)
-        self.assertNotIn("BOT_TOKEN", message)
-        self.assertNotIn("OPENAI_API_KEY", message)
-        self.assertNotIn("WEEEK_API_TOKEN", message)
 
 
 class DisplayDescriptionTests(unittest.TestCase):
