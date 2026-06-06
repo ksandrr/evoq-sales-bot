@@ -700,3 +700,83 @@ Results:
 - Server-side `git commit` failed because `user.name` / `user.email` are not configured there.
 - Server-side `git push` failed because the server itself does not have GitHub HTTPS credentials configured.
 - The safe fallback is to push from a local authenticated clone and then run `git pull` on the server.
+
+## Session 2026-06-06: Draft-scoped Weeek callback state
+
+### Goal
+
+Prevent old Weeek inline keyboards and delayed callback work from mutating or clearing a newer voice draft, and make `/start` and new voice input recover immediately.
+
+### Root Cause And Live Evidence
+
+- Weeek callback data had no flow identity, for example `weeek_project:6`, while the bot kept one mutable `weeek_draft`.
+- Old project/cancel buttons and delayed async work could therefore operate on the current draft.
+- The live callback at `2026-06-06 12:38:42 UTC` was acknowledged and released from the conversation correctly.
+- The exact last line before the long wait was:
+  - `weeek_columns_loading_started board_id='10'`
+- It was followed by:
+  - `weeek_columns_loading_failed ... error=Weeek API timed out`
+  - `weeek_project_callback_error_message_failed ... error=Timed out`
+- This confirms a separate server outbound connectivity/proxy problem affecting Weeek and at least one Telegram send. The code now contains bounded calls and state cleanup, but network/proxy reliability must be fixed separately.
+
+### Code Changes
+
+- Added an 8-character random `draft_id` to every new `weeek_draft`.
+- Added `draft_id` to project, board, column, parent, preview, and cancel callback data.
+- Added stale callback validation before any Weeek callback mutates state.
+- Scoped inline cancel to its draft; stale cancel does not clear the current draft.
+- Made `/start` and top-level voice handling hard-reset Weeek state and cancel pending Weeek background work.
+- Stored the project continuation task per user and made it verify `draft_id` before and after async steps.
+- Added stale checks around project/board/column/parent loading and task creation completion.
+- Kept project callback ACK and continuation timeouts bounded.
+
+### Files Edited
+
+- `bot.py`
+- `tests/test_time_parsing.py`
+- `NEXT_CODEX_HANDOFF.md`
+
+### Validation
+
+Local:
+
+```powershell
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m py_compile bot.py database.py weeek_client.py tests\test_time_parsing.py
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m unittest discover -s tests
+git diff --check
+```
+
+- `py_compile`: passed
+- Full tests: passed, `49 tests`, `OK`
+
+Linux:
+
+```bash
+cd /home/sanya/mira-task-bot
+git pull --ff-only origin tembo/telegram-idea-bot-daily-reminders
+.venv/bin/python -m py_compile bot.py database.py weeek_client.py tests/test_time_parsing.py
+.venv/bin/python -m unittest discover -s tests
+sudo systemctl restart mira-task-bot.service
+systemctl is-active mira-task-bot.service
+journalctl -u mira-task-bot.service --since '2026-06-06 12:59:29' --no-pager
+```
+
+- Server `py_compile`: passed
+- Server tests: passed, `49 tests`, `OK`
+- Service: `active`
+- Fresh logs reached `Application started`.
+
+### Commit And Deployment
+
+- Code commit: `99e3d78` (`Scope Weeek callbacks to active drafts`)
+- Pushed to `origin/tembo/telegram-idea-bot-daily-reminders`
+- Pulled and deployed to `/home/sanya/mira-task-bot`
+- No `.env`, secret, menu, or reminder changes were made.
+
+### Remaining Work
+
+1. Run the Telegram smoke checklist with a real voice message and project selection.
+2. Press an old project button after starting a new voice draft; it must show the stale-draft alert and preserve the new draft.
+3. Press an old cancel button after starting a new draft; it must not cancel the new draft.
+4. While a project continuation is waiting, send `/start`; the menu must respond immediately and old work must become obsolete.
+5. Investigate server proxy/network reliability to Weeek API and `api.telegram.org`; the observed upstream timeouts are not fixed by application state scoping.
