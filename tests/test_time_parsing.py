@@ -35,6 +35,7 @@ httpx.AsyncClient = _Dummy
 sys.modules.setdefault("httpx", httpx)
 
 telegram = types.ModuleType("telegram")
+telegram.BotCommand = _Dummy
 telegram.InlineKeyboardButton = _Dummy
 telegram.InlineKeyboardMarkup = _Dummy
 telegram.ReplyKeyboardMarkup = _Dummy
@@ -276,6 +277,146 @@ class WeeekProjectCallbackTests(unittest.IsolatedAsyncioTestCase):
             )
 
         picker.assert_not_awaited()
+
+
+class WeeekOnlyModeTests(unittest.IsolatedAsyncioTestCase):
+    def _update(self, text=""):
+        return types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=123),
+            message=types.SimpleNamespace(text=text),
+        )
+
+    def _context(self):
+        return types.SimpleNamespace(user_data={}, application=types.SimpleNamespace())
+
+    async def test_plain_text_creates_weeek_task_draft_and_always_asks_for_project(self):
+        context = self._context()
+        capture = {
+            "type": "task",
+            "title": "Купить материалы",
+            "body": "Купить материалы",
+            "target": "local_task",
+        }
+
+        with (
+            patch.object(bot, "weeek_available", return_value=True),
+            patch.object(bot, "classify_capture", new=AsyncMock(return_value=capture)),
+            patch.object(bot, "_send_weeek_project_picker", new=AsyncMock(return_value=bot.WEEEK_PROJECT)) as picker,
+        ):
+            result = await bot._start_weeek_capture(
+                self._update("Мира, запиши задачу купить материалы"),
+                context,
+                "Мира, запиши задачу купить материалы",
+                return_state=True,
+            )
+
+        self.assertEqual(result, bot.WEEEK_PROJECT)
+        self.assertEqual(context.user_data["weeek_draft"]["target"], "weeek_task")
+        self.assertNotIn("project_id", context.user_data["weeek_draft"])
+        picker.assert_awaited_once()
+
+    async def test_explicit_subtask_keeps_subtask_target(self):
+        context = self._context()
+        capture = {
+            "type": "task",
+            "title": "Собрать примеры",
+            "body": "Собрать примеры",
+        }
+
+        with (
+            patch.object(bot, "weeek_available", return_value=True),
+            patch.object(bot, "classify_capture", new=AsyncMock(return_value=capture)),
+            patch.object(bot, "_send_weeek_project_picker", new=AsyncMock(return_value=bot.WEEEK_PROJECT)),
+        ):
+            await bot._start_weeek_capture(
+                self._update("Создай подзадачу к задаче Разобраться с парсингом: собрать примеры"),
+                context,
+                "Создай подзадачу к задаче Разобраться с парсингом: собрать примеры",
+                return_state=True,
+            )
+
+        self.assertEqual(context.user_data["weeek_draft"]["target"], "weeek_subtask")
+
+    async def test_top_level_text_routes_only_to_weeek(self):
+        update = self._update("запиши идею проверить оффер")
+        context = self._context()
+
+        with (
+            patch.object(bot, "_start_weeek_capture", new=AsyncMock(return_value=bot.ConversationHandler.END)) as start_weeek,
+            patch.object(bot.db, "add_idea") as add_idea,
+            patch.object(bot.db, "add_task") as add_task,
+        ):
+            result = await bot.text_top_level(update, context)
+
+        self.assertEqual(result, bot.ConversationHandler.END)
+        start_weeek.assert_awaited_once_with(update, context, "запиши идею проверить оффер", return_state=False)
+        add_idea.assert_not_called()
+        add_task.assert_not_called()
+
+    async def test_top_level_voice_routes_only_to_weeek(self):
+        update = self._update()
+        context = self._context()
+
+        with (
+            patch.object(bot, "voice_available", return_value=True),
+            patch.object(bot, "_transcribe_or_warn", new=AsyncMock(return_value="Мира, сделай задачу купить материалы")),
+            patch.object(bot, "_start_weeek_capture", new=AsyncMock(return_value=bot.ConversationHandler.END)) as start_weeek,
+            patch.object(bot.db, "add_idea") as add_idea,
+            patch.object(bot.db, "add_task") as add_task,
+        ):
+            result = await bot.voice_top_level(update, context)
+
+        self.assertEqual(result, bot.ConversationHandler.END)
+        start_weeek.assert_awaited_once_with(
+            update,
+            context,
+            "Мира, сделай задачу купить материалы",
+            return_state=False,
+        )
+        add_idea.assert_not_called()
+        add_task.assert_not_called()
+
+    async def test_post_init_disables_local_schedulers_and_sets_four_commands(self):
+        fake_bot = types.SimpleNamespace(set_my_commands=AsyncMock())
+        application = types.SimpleNamespace(bot=fake_bot)
+
+        with (
+            patch.object(bot.db, "init_db") as init_db,
+            patch.object(bot, "schedule_user_reminders") as schedule_ideas,
+            patch.object(bot, "schedule_task_reminder_checker") as schedule_tasks,
+        ):
+            await bot.post_init(application)
+
+        init_db.assert_called_once()
+        schedule_ideas.assert_not_called()
+        schedule_tasks.assert_not_called()
+        commands = fake_bot.set_my_commands.await_args.args[0]
+        self.assertEqual(len(commands), 4)
+
+    async def test_legacy_inline_callback_does_not_touch_local_data(self):
+        class FakeQuery:
+            data = "delete:42"
+
+            def __init__(self):
+                self.answers = []
+
+            async def answer(self, text=None, **kwargs):
+                self.answers.append((text, kwargs))
+
+        query = FakeQuery()
+        with (
+            patch.object(bot.db, "get_idea") as get_idea,
+            patch.object(bot.db, "delete_idea") as delete_idea,
+        ):
+            result = await bot.handle_callback(
+                types.SimpleNamespace(callback_query=query),
+                self._context(),
+            )
+
+        self.assertEqual(result, bot.ConversationHandler.END)
+        self.assertIn("Локальный режим отключён", query.answers[0][0])
+        get_idea.assert_not_called()
+        delete_idea.assert_not_called()
 
 
 class CaptureTitleFallbackTests(unittest.TestCase):

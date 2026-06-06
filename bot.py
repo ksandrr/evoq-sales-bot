@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 from telegram import (
+    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
@@ -45,8 +46,8 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "Asia/Omsk")
-OPENAI_PARSE_MODEL = os.getenv("OPENAI_PARSE_MODEL", "gpt-5.5")
-OPENAI_STT_MODEL = (os.getenv("OPENAI_STT_MODEL") or "gpt-4o-transcribe").strip()
+OPENAI_PARSE_MODEL = os.getenv("OPENAI_PARSE_MODEL", "gpt-5.4-mini")
+OPENAI_STT_MODEL = (os.getenv("OPENAI_STT_MODEL") or "gpt-4o-mini-transcribe").strip()
 OPENAI_STT_ENABLED = (os.getenv("OPENAI_STT_ENABLED") or "true").strip().lower() in {"1", "true", "yes", "on"}
 WEEEK_API_TOKEN = (os.getenv("WEEEK_API_TOKEN") or "").strip()
 WEEEK_API_BASE_URL = (os.getenv("WEEEK_API_BASE_URL") or "https://api.weeek.net/public/v1").strip()
@@ -280,18 +281,22 @@ BTN_TEST = "🔔 Тест"
 BTN_HELP = "ℹ️ Помощь"
 BTN_CANCEL = "✖️ Отмена"
 BTN_ADD_WEEEK_TASK = "🧩 Задача ВИК"
+LEGACY_MENU_BUTTONS = (
+    BTN_ADD,
+    BTN_LIST,
+    BTN_ADD_TASK,
+    BTN_LIST_TASKS,
+    BTN_REMINDERS,
+    BTN_TEST,
+    BTN_HELP,
+)
+LEGACY_MENU_BUTTON_PATTERN = "^(" + "|".join(re.escape(label) for label in LEGACY_MENU_BUTTONS) + ")$"
 MENU_BUTTON_PATTERN = "^(" + "|".join(
     re.escape(label)
     for label in (
-        BTN_ADD,
-        BTN_LIST,
-        BTN_ADD_TASK,
         BTN_ADD_WEEEK_TASK,
-        BTN_LIST_TASKS,
-        BTN_REMINDERS,
-        BTN_TEST,
-        BTN_HELP,
         BTN_CANCEL,
+        *LEGACY_MENU_BUTTONS,
     )
 ) + ")$"
 
@@ -316,15 +321,9 @@ PRESET_TIMEZONES = [
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [
-            [BTN_ADD, BTN_ADD_TASK],
-            [BTN_ADD_WEEEK_TASK, BTN_LIST_TASKS],
-            [BTN_LIST, BTN_REMINDERS],
-            [BTN_TEST],
-            [BTN_HELP],
-        ],
+        [[BTN_ADD_WEEEK_TASK]],
         resize_keyboard=True,
-        input_field_placeholder="Тапни кнопку, напиши или наговори...",
+        input_field_placeholder="Напиши или наговори задачу для Weeek...",
     )
 
 
@@ -1803,19 +1802,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _reset_transient_flow_state(context)
     logger.info("start_hard_reset user_id=%s", user_id)
     db.upsert_user(user_id)
-    schedule_user_reminders(context.application, user_id)
-
-    tz = effective_user_timezone(user_id)
-    reminders = db.get_user_reminders(user_id)
-    times_txt = ", ".join(f"{h:02d}:{m:02d}" for _, h, m in reminders) or "—"
     text = (
-        "👋 Привет! Я бот-задачник и идейник в одном.\n\n"
-        f"💡 <b>Идеи</b> — то, что хочется обдумать. Каждый день в удобное время "
-        "я буду напоминать о них списком.\n"
-        f"✅ <b>Задачи</b> — то, что нужно сделать. Хранятся с галочками «сделано/не сделано».\n\n"
-        f"🌍 Часовой пояс: <b>{html.escape(tz)}</b>\n"
-        f"⏰ Напоминания: <b>{times_txt}</b>\n\n"
-        "Используй кнопки внизу. Идею или задачу можно ввести текстом или голосом."
+        "👋 <b>Привет! Я Mira.</b>\n\n"
+        "Я создаю задачи и подзадачи только в Weeek.\n"
+        "Просто напиши или наговори, что нужно сделать. Затем выбери проект, колонку и подтверди создание."
     )
     try:
         await update.message.reply_html(
@@ -1845,14 +1835,10 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         voice_status = "выключен — команда /voice покажет, как включить"
     text = (
         "<b>Как это работает</b>\n\n"
-        "<b>Идеи</b> — то, что хочется обдумать и не забыть.\n"
-        f"• <b>{BTN_ADD}</b> — ввести краткое название и подробное описание.\n"
-        f"• <b>{BTN_LIST}</b> — посмотреть все идеи. У каждой «📖 Подробнее» и «🗑 Удалить».\n\n"
-        "<b>Задачи</b> — то, что нужно сделать.\n"
-        f"• <b>{BTN_ADD_TASK}</b> — наговорить или ввести задачу одной строкой.\n"
-        f"• <b>{BTN_LIST_TASKS}</b> — список задач с галочками «сделано».\n\n"
-        f"• <b>{BTN_REMINDERS}</b> — ежедневные напоминания (по идеям) и часовой пояс.\n"
-        f"• <b>{BTN_TEST}</b> — отправить тестовое напоминание прямо сейчас.\n"
+        "• Напиши задачу обычным сообщением или отправь голосовое.\n"
+        f"• Кнопка <b>{BTN_ADD_WEEEK_TASK}</b> запускает пошаговый ввод.\n"
+        "• Для подзадачи явно скажи или напиши «создай подзадачу» и укажи родительскую задачу.\n"
+        "• После разбора выбери проект, колонку и подтверди создание.\n\n"
         f"• <b>/voice</b> — инструкция по голосовому вводу (сейчас {voice_status})."
     )
     await update.message.reply_html(text, reply_markup=main_menu_keyboard())
@@ -1865,10 +1851,8 @@ async def voice_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"🧠 Парсинг смысла: <b>{html.escape(OPENAI_PARSE_MODEL)}</b>.\n\n"
             "Mira сначала пробует OpenAI STT через официальный API, а при сбое переключается на локальный Vosk. "
             "Качество ниже Whisper, но для коротких фраз вполне приемлемо.\n\n"
-            "Просто запиши голосовое прямо в чате:\n"
-            "• Вне диалогов — бот поймёт, это идея, задача или напоминание.\n"
-            f"• В режиме «{BTN_ADD_TASK}» — текст голоса сохранится как задача.\n"
-            f"• На шагах «{BTN_ADD}» — голос подставится в текущий шаг.\n"
+            "Просто запиши голосовое прямо в чате. Mira распознает задачу, затем предложит выбрать проект и колонку Weeek.\n"
+            "Если нужна подзадача, произнеси слово «подзадача» и название родительской задачи.\n"
         )
     else:
         text = (
@@ -2103,7 +2087,8 @@ async def add_details_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
+    _hard_reset_weeek_flow(context, "cancel_command")
+    _reset_transient_flow_state(context)
     await update.message.reply_text("❌ Отменено.", reply_markup=main_menu_keyboard())
     return ConversationHandler.END
 
@@ -3437,10 +3422,15 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(application: Application):
     db.init_db()
-    for user_id in db.get_all_user_ids():
-        schedule_user_reminders(application, user_id)
-    schedule_task_reminder_checker(application)
-    logger.info("Bot started; reminders scheduled.")
+    await application.bot.set_my_commands(
+        [
+            BotCommand("start", "Главное меню"),
+            BotCommand("help", "Как создать задачу в Weeek"),
+            BotCommand("voice", "Модели GPT и распознавания голоса"),
+            BotCommand("cancel", "Отменить текущий ввод"),
+        ]
+    )
+    logger.info("Bot started in Weeek-only mode; local reminders are disabled.")
 
 
 def _log_event(event: str, **fields):
@@ -3929,15 +3919,11 @@ async def _start_weeek_capture(update: Update, context: ContextTypes.DEFAULT_TYP
         {
             "draft_id": draft_id,
             "capture": capture,
-            "target": route.get("target") or capture.get("target") or "weeek_task",
+            "target": "weeek_subtask" if route.get("target") == "weeek_subtask" else "weeek_task",
             "column_hint": route.get("column_hint") or capture.get("column_hint") or normalize_weeek_column_hint(raw_text),
             "parent_task_candidate": route.get("parent_task_candidate") or capture.get("parent_task_candidate") or "",
         }
     )
-    auto_project = route.get("project") or match_weeek_target(capture.get("project_name_candidate") or "")
-    if auto_project:
-        draft.update(auto_project)
-
     _set_active_flow(context, "weeek_capture")
     logger.info("weeek_draft_created draft_id=%s", draft_id)
     _log_event(
@@ -3945,18 +3931,12 @@ async def _start_weeek_capture(update: Update, context: ContextTypes.DEFAULT_TYP
         transcript=raw_text,
         transcript_clean=content_text,
         target=draft.get("target", ""),
-        project_candidate=(auto_project or {}).get("project_name", ""),
+        project_candidate=((route.get("project") or {}).get("project_name") or capture.get("project_name_candidate") or ""),
         column_hint=draft.get("column_hint", ""),
         speech_engine=capture.get("speech_engine", ""),
     )
 
-    if auto_project:
-        if draft.get("target") == "weeek_subtask":
-            next_state = await _send_weeek_parent_picker(update.message, context)
-        else:
-            next_state = await _send_weeek_column_picker(update.message, context)
-    else:
-        next_state = await _send_weeek_project_picker(update.message, context)
+    next_state = await _send_weeek_project_picker(update.message, context)
     return next_state if return_state else ConversationHandler.END
 
 
@@ -4158,68 +4138,7 @@ async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not text:
             return ConversationHandler.END
 
-        route = detect_top_level_route(text)
-        _log_event(
-            "voice_route_detected",
-            previous_state="top_level",
-            active_flow=context.user_data.get("_active_flow", ""),
-            new_target=route.get("target", ""),
-            project=((route.get("project") or {}).get("project_name") or ""),
-            column_hint=route.get("column_hint", ""),
-        )
-        if route.get("target") in {"weeek_task", "weeek_subtask"}:
-            return await _start_weeek_capture(update, context, text, return_state=False)
-
-        user_id = update.effective_user.id
-        db.upsert_user(user_id)
-        forced_type = "task" if route.get("target") == "local_task" else "reminder" if route.get("target") == "reminder" else None
-        capture = await classify_capture(update, text, forced_type=forced_type)
-        capture_type = capture["type"]
-        speech_engine = context.user_data.pop("_last_speech_engine", "")
-        capture["speech_engine"] = speech_engine
-        capture["transcript"] = text
-        capture["transcript_clean"] = capture.get("transcript_clean") or text
-        _log_voice_capture(text, capture, speech_engine)
-
-        if _needs_reminder_time_clarification(capture):
-            context.user_data["pending_reminder_capture"] = capture
-            context.user_data["pending_reminder_attempts"] = 0
-            _set_active_flow(context, "clarify_reminder_time")
-            await _ask_reminder_time_clarification(update, context)
-            return CLARIFY_REMINDER_TIME
-
-        if capture_type in {"task", "reminder"}:
-            task_id = _create_task_from_capture(user_id, capture)
-            await _send_created_task(update, capture, task_id, recognized_text=text, reminder=capture_type == "reminder")
-            _clear_active_flow(context)
-            return ConversationHandler.END
-
-        brief = capture["title"]
-        details = capture["body"]
-        if _openai_client and capture.get("source") != "gpt":
-            parsed = await parse_idea_with_gpt(text)
-            if parsed:
-                brief, details = parsed
-
-        if not brief:
-            first = text.split(".")[0].strip() or text.strip()
-            brief = first[:120]
-            details = text.strip()
-
-        idea_id = db.add_idea(user_id, brief, details)
-        schedule_user_reminders(context.application, user_id)
-        await update.message.reply_html(
-            f"✅ Идея сохранена!\n\n{brief_message(brief)}",
-            reply_markup=main_menu_keyboard(),
-        )
-        if details and details.casefold() != brief.casefold():
-            await update.message.reply_html(f"<b>Описание:</b> {html.escape(details)}", reply_markup=main_menu_keyboard())
-        transcription = transcription_message(text, speech_engine)
-        if transcription:
-            await update.message.reply_html(transcription.lstrip(), reply_markup=main_menu_keyboard())
-        await update.message.reply_text("Что дальше?", reply_markup=post_save_keyboard(idea_id))
-        _clear_active_flow(context)
-        return ConversationHandler.END
+        return await _start_weeek_capture(update, context, text, return_state=False)
     except Exception:
         logger.exception("Voice top-level flow failed")
         await update.message.reply_text(
@@ -4409,64 +4328,15 @@ async def text_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return ConversationHandler.END
 
-    route = detect_top_level_route(text)
-    if route.get("target") in {"weeek_task", "weeek_subtask"}:
-        return await _start_weeek_capture(update, context, text, return_state=False)
+    _hard_reset_weeek_flow(context, "new_top_level_text")
+    return await _start_weeek_capture(update, context, text, return_state=False)
 
-    user_id = update.effective_user.id
-    db.upsert_user(user_id)
 
-    forced_type = "task" if route.get("target") == "local_task" else "reminder" if route.get("target") == "reminder" else None
-    capture = await classify_capture(update, text, forced_type=forced_type)
-    capture_type = capture["type"]
-    logger.info(
-        "text_capture raw_text=%r type=%s title=%r body=%r due_date=%s due_time=%s timezone=%s source=%s confidence=%.2f time_confidence=%.2f needs_time_clarification=%s",
-        text,
-        capture.get("type", ""),
-        capture.get("title", ""),
-        capture.get("body", ""),
-        capture.get("due_date", ""),
-        capture.get("due_time", ""),
-        capture.get("timezone", ""),
-        capture.get("source", ""),
-        _coerce_confidence(capture.get("confidence"), 0.0),
-        _coerce_confidence(capture.get("time_confidence"), 0.0),
-        bool(capture.get("needs_time_clarification")),
-    )
-
-    if _needs_reminder_time_clarification(capture):
-        context.user_data["pending_reminder_capture"] = capture
-        context.user_data["pending_reminder_attempts"] = 0
-        _set_active_flow(context, "clarify_reminder_time")
-        await _ask_reminder_time_clarification(update, context)
-        return CLARIFY_REMINDER_TIME
-
-    if capture_type in {"task", "reminder"}:
-        task_id = _create_task_from_capture(user_id, capture)
-        await _send_created_task(update, capture, task_id, reminder=capture_type == "reminder")
-        return ConversationHandler.END
-
-    brief = capture["title"]
-    details = capture["body"]
-    if _openai_client and capture.get("source") != "gpt":
-        parsed = await parse_idea_with_gpt(text)
-        if parsed:
-            brief, details = parsed
-
-    if not brief:
-        first = text.split(".")[0].strip() or text.strip()
-        brief = first[:120]
-        details = text.strip()
-
-    idea_id = db.add_idea(user_id, brief, details)
-    schedule_user_reminders(context.application, user_id)
-    await update.message.reply_html(
-        f"✅ Идея сохранена!\n\n{brief_message(brief)}",
+async def legacy_mode_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Локальные идеи, задачи и напоминания отключены. Теперь Mira создаёт задачи только в Weeek.",
         reply_markup=main_menu_keyboard(),
     )
-    if details and details.casefold() != brief.casefold():
-        await update.message.reply_html(f"<b>Описание:</b> {html.escape(details)}", reply_markup=main_menu_keyboard())
-    await update.message.reply_text("Что дальше?", reply_markup=post_save_keyboard(idea_id))
     return ConversationHandler.END
 
 
@@ -5070,7 +4940,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await weeek_column_callback(update, context)
     if data.startswith("weeek_"):
         return await weeek_preview_callback(update, context)
-    return await _legacy_handle_callback(update, context)
+    await query.answer(
+        "Локальный режим отключён. Создай новую задачу в Weeek.",
+        show_alert=True,
+    )
+    return ConversationHandler.END
 
 
 def main():
@@ -5087,58 +4961,8 @@ def main():
         .build()
     )
 
-    add_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("add", add_start),
-            MessageHandler(filters.Regex(f"^{BTN_ADD}$"), add_start),
-        ],
-        states={
-            BRIEF: [
-                MessageHandler(filters.VOICE | filters.AUDIO, add_brief_voice),
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{BTN_CANCEL}$"),
-                    add_brief_text,
-                ),
-            ],
-            DETAILS: [
-                MessageHandler(filters.VOICE | filters.AUDIO, add_details_voice),
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{BTN_CANCEL}$"),
-                    add_details_text,
-                ),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex(f"^{BTN_CANCEL}$"), cancel),
-        ],
-        allow_reentry=True,
-    )
-
-    task_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("addtask", task_add_start),
-            MessageHandler(filters.Regex(f"^{BTN_ADD_TASK}$"), task_add_start),
-        ],
-        states={
-            TASK_TEXT: [
-                MessageHandler(filters.VOICE | filters.AUDIO, task_add_voice),
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{BTN_CANCEL}$"),
-                    task_add_text,
-                ),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex(f"^{BTN_CANCEL}$"), cancel),
-        ],
-        allow_reentry=True,
-    )
-
     weeek_conv = ConversationHandler(
         entry_points=[
-            CommandHandler("addweeek", weeek_add_start),
             MessageHandler(filters.Regex(f"^{re.escape(BTN_ADD_WEEEK_TASK)}$"), weeek_add_start),
         ],
         states={
@@ -5177,70 +5001,20 @@ def main():
         allow_reentry=True,
     )
 
-    add_reminder_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(reminders_add_start, pattern="^rem_add$")],
-        states={
-            ADD_REMINDER_TIME: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{BTN_CANCEL}$"),
-                    reminders_add_apply,
-                ),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex(f"^{BTN_CANCEL}$"), cancel),
-        ],
-        allow_reentry=True,
-    )
-
-    capture_conv = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.VOICE | filters.AUDIO, voice_top_level),
-            MessageHandler(
-                filters.TEXT & ~filters.COMMAND & ~filters.Regex(MENU_BUTTON_PATTERN),
-                text_top_level,
-            ),
-        ],
-        states={
-            CLARIFY_REMINDER_TIME: [
-                CallbackQueryHandler(clarify_reminder_time_callback, pattern="^clarify_(save_without_time|cancel)$"),
-                MessageHandler(filters.VOICE | filters.AUDIO, clarify_reminder_time_voice),
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{BTN_CANCEL}$"),
-                    clarify_reminder_time_text,
-                ),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex(f"^{BTN_CANCEL}$"), cancel),
-        ],
-        allow_reentry=True,
-    )
-
     application.add_handler(CommandHandler("start", start), group=-1)
     application.add_handler(CommandHandler("help", show_help))
-    application.add_handler(CommandHandler("list", list_ideas))
-    application.add_handler(CommandHandler("test", test_reminder))
-    application.add_handler(CommandHandler("reminders", reminders_show))
-    application.add_handler(CommandHandler("settime", reminders_show))
     application.add_handler(CommandHandler("voice", voice_instructions))
-    application.add_handler(CommandHandler("tasks", list_tasks))
+    application.add_handler(CommandHandler("cancel", cancel))
 
-    application.add_handler(add_conv)
-    application.add_handler(task_conv)
     application.add_handler(weeek_conv)
-    application.add_handler(add_reminder_conv)
-    application.add_handler(capture_conv)
-
-    # Кнопки главного меню (вне диалогов)
-    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_LIST}$"), list_ideas))
-    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_LIST_TASKS}$"), list_tasks))
-    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_ADD_WEEEK_TASK)}$"), weeek_add_start))
-    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_TEST}$"), test_reminder))
-    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_HELP}$"), show_help))
-    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_REMINDERS}$"), reminders_show))
+    application.add_handler(MessageHandler(filters.Regex(LEGACY_MENU_BUTTON_PATTERN), legacy_mode_disabled))
+    application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, voice_top_level))
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & ~filters.Regex(MENU_BUTTON_PATTERN),
+            text_top_level,
+        )
+    )
 
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_error_handler(error_handler)
