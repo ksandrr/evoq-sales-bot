@@ -404,9 +404,9 @@ class RouteAndSubtaskTests(unittest.TestCase):
         self.assertEqual(route["project"]["project_id"], "5")
         self.assertIn("разобраться", route["parent_task_candidate"].lower())
 
-    def test_detect_top_level_route_local_task(self):
+    def test_detect_top_level_route_plain_task_goes_to_weeek(self):
         route = bot.detect_top_level_route("добавь задачу завтра в 10 написать Кате")
-        self.assertEqual(route["target"], "local_task")
+        self.assertEqual(route["target"], "weeek_task")
 
     def test_weeek_routing_metadata_does_not_leak_into_task_content(self):
         raw_text = "Мира, запиши задачу в личное, что нужно написать Мише завтра в 15:30 и поставь статус к работе"
@@ -454,6 +454,29 @@ class RouteAndSubtaskTests(unittest.TestCase):
         self.assertEqual(source_exact, "exact")
         self.assertEqual(fuzzy["id"], "1")
         self.assertIn(source_fuzzy, {"normalized", "fuzzy"})
+
+    def test_format_weeek_tasks_overview_groups_by_status(self):
+        tasks = [
+            {"id": "1", "name": "Подготовить смету", "raw": {"boardId": 10, "boardColumnId": 101}},
+            {"id": "2", "name": "Позвонить клиенту", "raw": {"boardId": 10, "boardColumnId": 102}},
+            {"id": "3", "name": "Закрыть акт", "raw": {"boardId": 10, "boardColumnId": 103}},
+        ]
+
+        text = bot._format_weeek_tasks_overview(
+            "Личное",
+            tasks,
+            {
+                ("10", "101"): "К работе",
+                ("10", "102"): "В работе",
+                ("10", "103"): "Готово",
+            },
+        )
+
+        self.assertIn("Личное", text)
+        self.assertIn("К работе", text)
+        self.assertIn("В работе", text)
+        self.assertIn("Готово", text)
+        self.assertIn("Подготовить смету", text)
 
 
 class WeeekPayloadTests(unittest.TestCase):

@@ -398,3 +398,75 @@ Results:
 - Server-side `git commit` failed because `user.name` / `user.email` are not configured there.
 - Server-side `git push` failed because the server itself does not have GitHub HTTPS credentials configured.
 - The safe fallback is to push from a local authenticated clone and then run `git pull` on the server.
+
+## Follow-Up On 2026-06-07: VIK-first menu and Weeek task browser
+
+### Session Goal
+
+- Remove the old main-menu buttons for ideas, local tasks, reminders, test, and manual `Задача ВИК`.
+- Make plain phrases like `Мира, привет, запиши задачу ...` route straight into the Weeek/VIK task flow by default.
+- Add a single main-menu button to browse VIK tasks by project and see their statuses.
+
+### Code Changes
+
+- In `bot.py`:
+  - added `BTN_LIST_WEEEK_TASKS = "📂 Задачи в ВИК"`
+  - simplified `main_menu_keyboard()` to only show `📂 Задачи в ВИК` and `ℹ️ Помощь`
+  - narrowed `MENU_BUTTON_PATTERN` to the remaining visible menu buttons
+  - changed `detect_top_level_route(...)` so generic task phrases now map to `weeek_task` instead of `local_task`
+  - rewrote `/start`, help, and voice-help copy for the new VIK-first flow
+  - added Weeek project browser helpers:
+    - `_weeek_browser_keyboard(...)`
+    - `_extract_weeek_task_board_id(...)`
+    - `_extract_weeek_task_column_id(...)`
+    - `_extract_weeek_task_column_name(...)`
+    - `_weeek_status_rank(...)`
+    - `_format_weeek_tasks_overview(...)`
+  - added new handlers:
+    - `weeek_list_start(...)`
+    - `weeek_list_project_callback(...)`
+    - `weeek_list_nav_callback(...)`
+  - wired new callback routes `weeek_list_project:*`, `weeek_list_back`, `weeek_list_close`
+  - wired the new main-menu message handler for `📂 Задачи в ВИК`
+- In `tests/test_time_parsing.py`:
+  - changed the generic task routing expectation from `local_task` to `weeek_task`
+  - added a test for Weeek task overview grouping by statuses
+
+### Files Edited
+
+- `bot.py`
+- `tests/test_time_parsing.py`
+- `NEXT_CODEX_HANDOFF.md`
+
+### Validation Commands
+
+Run locally in this Codex workspace:
+
+```powershell
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m unittest tests.test_time_parsing
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m py_compile bot.py weeek_client.py tests\test_time_parsing.py
+```
+
+### Validation Results
+
+- `unittest`: passed (`36 tests`, `OK`)
+- `py_compile`: passed
+- `python` and default `py` launcher were not usable in this shell; the bundled Codex Python runtime was used instead
+
+### Deploy Status
+
+- Linux deploy: not performed in this session
+- Server config / server `.env`: not changed in this session
+- Pushed commit: none in this session
+
+### Remaining Risks / Manual Checks
+
+1. The new `📂 Задачи в ВИК` screen assumes Weeek task list items either contain a readable status name in task payload or can be resolved through project boards/columns.
+2. Projects with many boards/tasks may produce a long Telegram message; a real manual smoke test is still needed.
+3. Old local-task / idea / reminder code paths still exist in the codebase, but are no longer exposed from the main keyboard.
+
+### First Checks For Next Codex
+
+1. In Telegram, send voice/text: `Мира, привет, запиши задачу написать Кате по смете` and confirm the bot opens the Weeek project picker immediately.
+2. Open `📂 Задачи в ВИК`, choose `Личное`, and verify statuses are grouped correctly (`К работе`, `В работе`, `Готово` or equivalent real column names).
+3. If task statuses show up as `Без статуса`, inspect the real Weeek `/tm/tasks` payload fields for column metadata and extend `_extract_weeek_task_column_name(...)`.
