@@ -3,6 +3,7 @@ import os
 import sys
 import types
 import unittest
+from unittest.mock import AsyncMock, patch
 
 
 class _Dummy:
@@ -86,20 +87,35 @@ class ExtractCaptureDueTimeTests(unittest.TestCase):
 
 
 class WeeekProjectCallbackTests(unittest.IsolatedAsyncioTestCase):
+    class FakeTask:
+        def __init__(self, coro=None):
+            self.coro = coro
+            self.cancelled = False
+
+        def done(self):
+            return False
+
+        def cancel(self):
+            self.cancelled = True
+            if self.coro:
+                self.coro.close()
+
     async def test_project_callback_schedules_next_step_and_releases_conversation(self):
         scheduled = []
 
         class FakeApplication:
             def create_task(self, coro):
-                scheduled.append(coro)
+                task = WeeekProjectCallbackTests.FakeTask(coro)
+                scheduled.append(task)
+                return task
 
         class FakeQuery:
             id = "cb-1"
-            data = "weeek_project:6"
+            data = "weeek_project:draft1:6"
             from_user = types.SimpleNamespace(id=123)
             message = types.SimpleNamespace(message_id=456)
 
-            async def answer(self, **kwargs):
+            async def answer(self, text=None, **kwargs):
                 return None
 
         update = types.SimpleNamespace(callback_query=FakeQuery())
@@ -107,6 +123,7 @@ class WeeekProjectCallbackTests(unittest.IsolatedAsyncioTestCase):
             user_data={
                 "_active_flow": "weeek_capture",
                 "weeek_draft": {
+                    "draft_id": "draft1",
                     "projects": [{"id": "6", "name": "Personal"}],
                     "target": "weeek_task",
                 },
@@ -120,7 +137,145 @@ class WeeekProjectCallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(context.user_data.get("_active_flow"))
         self.assertEqual(context.user_data["weeek_draft"]["project_id"], "6")
         self.assertEqual(len(scheduled), 1)
-        scheduled[0].close()
+        scheduled[0].cancel()
+
+    async def test_start_clears_active_weeek_state(self):
+        pending = self.FakeTask()
+
+        class FakeMessage:
+            async def reply_html(self, *args, **kwargs):
+                return None
+
+        update = types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=123),
+            message=FakeMessage(),
+        )
+        context = types.SimpleNamespace(
+            user_data={
+                "_active_flow": "weeek_capture",
+                "weeek_draft": {"draft_id": "draft1"},
+                "_weeek_background_task": pending,
+                "_weeek_background_draft_id": "draft1",
+            },
+            application=types.SimpleNamespace(),
+        )
+
+        with (
+            patch.object(bot.db, "upsert_user"),
+            patch.object(bot, "schedule_user_reminders"),
+            patch.object(bot, "effective_user_timezone", return_value="Asia/Omsk"),
+            patch.object(bot.db, "get_user_reminders", return_value=[]),
+        ):
+            await bot.start(update, context)
+
+        self.assertNotIn("weeek_draft", context.user_data)
+        self.assertNotIn("_active_flow", context.user_data)
+        self.assertNotIn("_weeek_background_task", context.user_data)
+        self.assertTrue(pending.cancelled)
+
+    async def test_stale_project_callback_does_not_mutate_current_draft(self):
+        class FakeQuery:
+            id = "cb-stale-project"
+            data = "weeek_project:old123:6"
+            from_user = types.SimpleNamespace(id=123)
+            message = types.SimpleNamespace(message_id=456)
+
+            def __init__(self):
+                self.answers = []
+
+            async def answer(self, text=None, **kwargs):
+                self.answers.append(text)
+
+        query = FakeQuery()
+        update = types.SimpleNamespace(callback_query=query)
+        current_draft = {
+            "draft_id": "new456",
+            "projects": [{"id": "7", "name": "Current"}],
+        }
+        context = types.SimpleNamespace(
+            user_data={"_active_flow": "weeek_capture", "weeek_draft": current_draft},
+            application=types.SimpleNamespace(),
+        )
+
+        result = await bot.weeek_project_callback(update, context)
+
+        self.assertEqual(result, bot.ConversationHandler.END)
+        self.assertIs(context.user_data["weeek_draft"], current_draft)
+        self.assertNotIn("project_id", current_draft)
+        self.assertIn("Этот черновик уже устарел, начни заново.", query.answers)
+
+    async def test_stale_cancel_does_not_clear_current_draft(self):
+        class FakeQuery:
+            id = "cb-stale-cancel"
+            data = "weeek_cancel:old123"
+            from_user = types.SimpleNamespace(id=123)
+            message = types.SimpleNamespace(message_id=456)
+
+            async def answer(self, text=None, **kwargs):
+                return None
+
+        current_draft = {"draft_id": "new456", "capture": {"title": "Current"}}
+        context = types.SimpleNamespace(
+            user_data={"_active_flow": "weeek_preview", "weeek_draft": current_draft},
+            application=types.SimpleNamespace(),
+        )
+
+        result = await bot.weeek_preview_callback(
+            types.SimpleNamespace(callback_query=FakeQuery()),
+            context,
+        )
+
+        self.assertEqual(result, bot.ConversationHandler.END)
+        self.assertIs(context.user_data["weeek_draft"], current_draft)
+        self.assertEqual(context.user_data["_active_flow"], "weeek_preview")
+
+    async def test_new_voice_clears_previous_unfinished_weeek_draft(self):
+        pending = self.FakeTask()
+        update = types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=123),
+            message=types.SimpleNamespace(),
+        )
+        context = types.SimpleNamespace(
+            user_data={
+                "_active_flow": "weeek_capture",
+                "weeek_draft": {"draft_id": "draft1"},
+                "_weeek_background_task": pending,
+                "_weeek_background_draft_id": "draft1",
+            },
+            application=types.SimpleNamespace(),
+        )
+
+        with (
+            patch.object(bot, "voice_available", return_value=True),
+            patch.object(bot, "_transcribe_or_warn", new=AsyncMock(return_value=None)),
+        ):
+            result = await bot.voice_top_level(update, context)
+
+        self.assertEqual(result, bot.ConversationHandler.END)
+        self.assertNotIn("weeek_draft", context.user_data)
+        self.assertNotIn("_active_flow", context.user_data)
+        self.assertTrue(pending.cancelled)
+
+    async def test_background_task_exits_when_draft_id_is_stale(self):
+        context = types.SimpleNamespace(
+            user_data={
+                "weeek_draft": {
+                    "draft_id": "new456",
+                    "project_id": "6",
+                    "project_name": "Current",
+                }
+            }
+        )
+
+        with patch.object(bot, "_send_weeek_column_picker", new=AsyncMock()) as picker:
+            await bot._run_weeek_project_next_step(
+                types.SimpleNamespace(),
+                context,
+                "cb-stale-background",
+                "old123",
+            )
+
+        picker.assert_not_awaited()
 
 
 class CaptureTitleFallbackTests(unittest.TestCase):
