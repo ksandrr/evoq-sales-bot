@@ -780,3 +780,55 @@ journalctl -u mira-task-bot.service --since '2026-06-06 12:59:29' --no-pager
 3. Press an old cancel button after starting a new draft; it must not cancel the new draft.
 4. While a project continuation is waiting, send `/start`; the menu must respond immediately and old work must become obsolete.
 5. Investigate server proxy/network reliability to Weeek API and `api.telegram.org`; the observed upstream timeouts are not fixed by application state scoping.
+
+## Session 2026-06-06: Roll back OpenAI parse strategy experiment
+
+### Goal
+
+Remove the `rules_first` / `gpt_first` experiment introduced by commit `4789695` and restore the earlier single GPT-first parsing flow without reverting later Weeek callback fixes.
+
+### Code Changes
+
+- Removed `OPENAI_PARSE_STRATEGY` and `OPENAI_PARSE_ENABLED` from runtime configuration.
+- Restored unconditional GPT-first capture parsing with local rules only as fallback.
+- Restored default models to `OPENAI_PARSE_MODEL=gpt-5.5` and `OPENAI_STT_MODEL=gpt-4o-transcribe`.
+- Removed `/cost`, `/costmode`, strategy documentation, and strategy-specific tests.
+- Preserved all later Weeek callback timeout, conversation release, and draft-scoping changes.
+
+### Files Edited
+
+- `.env.example`
+- `README.md`
+- `bot.py`
+- `docs/API_COST_CONTROL.md` (deleted)
+- `tests/test_time_parsing.py`
+- `NEXT_CODEX_HANDOFF.md`
+
+### Validation
+
+```powershell
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m py_compile bot.py database.py weeek_client.py tests\test_time_parsing.py
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m unittest discover -s tests
+rg -n -i "OPENAI_PARSE_STRATEGY|rules_first|gpt_first|OPENAI_PARSE_ENABLED|cost_mode|cost_settings_message" .
+git diff --check
+```
+
+- `py_compile`: passed.
+- Full tests: passed, `42 tests`, `OK`.
+- Strategy search: no matches.
+- `git diff --check`: passed.
+
+### Commit And Deployment
+
+- Code commit: `095ce5b` (`Remove OpenAI parse strategy experiment`).
+- Pushed to `origin/tembo/telegram-idea-bot-daily-reminders`.
+- Linux deployment was not performed: the production change approval was rejected because the user had not explicitly authorized editing server `.env` and restarting the service.
+- No server `.env` values were changed in this session.
+
+### Remaining Work
+
+1. Obtain explicit user approval to deploy commit `095ce5b`.
+2. On the server, remove `OPENAI_PARSE_STRATEGY` and `OPENAI_PARSE_ENABLED` from `.env`.
+3. Set the non-secret model names back to `gpt-5.5` and `gpt-4o-transcribe`, then run tests and restart `mira-task-bot.service`.
+4. Run a real Telegram voice-to-Weeek smoke test.
+5. If project selection still hangs, investigate the already observed server outbound timeout to Weeek/Telegram; parse strategy is not proven to be the root cause.
