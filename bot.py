@@ -59,6 +59,21 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
+def _int_env(name: str, default: int) -> int:
+    raw_value = (os.getenv(name) or "").strip()
+    if not raw_value:
+        return default
+    try:
+        return int(raw_value)
+    except ValueError:
+        logger.warning("%s must be an integer; using default %s", name, default)
+        return default
+
+
+OPENAI_TIMEOUT_SECONDS = _int_env("OPENAI_TIMEOUT_SECONDS", 90)
+OPENAI_MAX_RETRIES = _int_env("OPENAI_MAX_RETRIES", 3)
+
+
 class SecretRedactionFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()
@@ -76,6 +91,14 @@ for handler in logging.getLogger().handlers:
     handler.addFilter(SecretRedactionFilter())
 
 
+def _openai_client_kwargs() -> dict:
+    return {
+        "api_key": OPENAI_API_KEY,
+        "timeout": OPENAI_TIMEOUT_SECONDS,
+        "max_retries": OPENAI_MAX_RETRIES,
+    }
+
+
 # OpenAI client is used for text/chat parsing and the primary STT path.
 _openai_client = None
 _openai_stt_client = None
@@ -83,11 +106,21 @@ if OPENAI_API_KEY:
     try:
         from openai import OpenAI
 
-        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
-        logger.info("OpenAI client initialized: official_api=true, parse_model=%s", OPENAI_PARSE_MODEL)
+        _openai_client = OpenAI(**_openai_client_kwargs())
+        logger.info(
+            "OpenAI client initialized: official_api=true, parse_model=%s, timeout=%s, max_retries=%s",
+            OPENAI_PARSE_MODEL,
+            OPENAI_TIMEOUT_SECONDS,
+            OPENAI_MAX_RETRIES,
+        )
         if OPENAI_STT_ENABLED and OPENAI_STT_MODEL:
             _openai_stt_client = _openai_client
-            logger.info("OpenAI STT client initialized: official_api=true, model=%s", OPENAI_STT_MODEL)
+            logger.info(
+                "OpenAI STT client initialized: official_api=true, model=%s, timeout=%s, max_retries=%s",
+                OPENAI_STT_MODEL,
+                OPENAI_TIMEOUT_SECONDS,
+                OPENAI_MAX_RETRIES,
+            )
         elif OPENAI_STT_ENABLED:
             logger.info("OpenAI STT is enabled, but OPENAI_STT_MODEL is empty.")
         else:
