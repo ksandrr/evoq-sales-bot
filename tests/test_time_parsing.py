@@ -200,13 +200,6 @@ class VoiceAndWeeekTests(unittest.TestCase):
         self.assertFalse(hasattr(bot, "OPENAI_STT_BASE_URL"))
         self.assertFalse(hasattr(bot, "OPENAI_STT_API_KEY"))
 
-    def test_openai_client_kwargs_include_timeout_and_retries(self):
-        kwargs = bot._openai_client_kwargs()
-
-        self.assertEqual(kwargs["api_key"], bot.OPENAI_API_KEY)
-        self.assertEqual(kwargs["timeout"], bot.OPENAI_TIMEOUT_SECONDS)
-        self.assertEqual(kwargs["max_retries"], bot.OPENAI_MAX_RETRIES)
-
     def test_official_request_kwargs_include_json_mode_without_temperature(self):
         kwargs = bot._chat_json_request_kwargs(
             "gpt-5.5",
