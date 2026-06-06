@@ -221,7 +221,6 @@ BTN_ADD = "➕ Идея"
 BTN_LIST = "💡 Мои идеи"
 BTN_ADD_TASK = "✅ Задача"
 BTN_LIST_TASKS = "📋 Мои задачи"
-BTN_LIST_WEEEK_TASKS = "📂 Задачи в ВИК"
 BTN_REMINDERS = "⏰ Напоминания"
 BTN_TEST = "🔔 Тест"
 BTN_HELP = "ℹ️ Помощь"
@@ -230,7 +229,13 @@ BTN_ADD_WEEEK_TASK = "🧩 Задача ВИК"
 MENU_BUTTON_PATTERN = "^(" + "|".join(
     re.escape(label)
     for label in (
-        BTN_LIST_WEEEK_TASKS,
+        BTN_ADD,
+        BTN_LIST,
+        BTN_ADD_TASK,
+        BTN_ADD_WEEEK_TASK,
+        BTN_LIST_TASKS,
+        BTN_REMINDERS,
+        BTN_TEST,
         BTN_HELP,
         BTN_CANCEL,
     )
@@ -258,7 +263,10 @@ PRESET_TIMEZONES = [
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [BTN_LIST_WEEEK_TASKS],
+            [BTN_ADD, BTN_ADD_TASK],
+            [BTN_ADD_WEEEK_TASK, BTN_LIST_TASKS],
+            [BTN_LIST, BTN_REMINDERS],
+            [BTN_TEST],
             [BTN_HELP],
         ],
         resize_keyboard=True,
@@ -509,10 +517,10 @@ def detect_top_level_route(text: str) -> dict:
         target = "weeek_task"
     elif project and re.search(r"\b(?:добавь|создай|запиши)\b", normalized):
         target = "weeek_task"
-    elif any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in LOCAL_TASK_PATTERNS):
-        target = "weeek_task"
     elif any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in REMINDER_PATTERNS):
         target = "reminder"
+    elif any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in LOCAL_TASK_PATTERNS):
+        target = "local_task"
     elif any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in IDEA_PATTERNS):
         target = "idea"
     return {
@@ -1682,12 +1690,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reminders = db.get_user_reminders(user_id)
     times_txt = ", ".join(f"{h:02d}:{m:02d}" for _, h, m in reminders) or "—"
     text = (
-        "👋 Привет! Я помогаю быстро записывать задачи в Weeek голосом или текстом.\n\n"
-        "Просто скажи что-то вроде: «Мира, привет, запиши задачу написать Кате по смете».\n"
-        "Если проект не назван, я сразу спрошу, куда её положить.\n\n"
+        "👋 Привет! Я бот-задачник и идейник в одном.\n\n"
+        f"💡 <b>Идеи</b> — то, что хочется обдумать. Каждый день в удобное время "
+        "я буду напоминать о них списком.\n"
+        f"✅ <b>Задачи</b> — то, что нужно сделать. Хранятся с галочками «сделано/не сделано».\n\n"
         f"🌍 Часовой пояс: <b>{html.escape(tz)}</b>\n"
         f"⏰ Напоминания: <b>{times_txt}</b>\n\n"
-        f"Кнопка «{BTN_LIST_WEEEK_TASKS}» показывает задачи по проектам и их статусы."
+        "Используй кнопки внизу. Идею или задачу можно ввести текстом или голосом."
     )
     await update.message.reply_html(text, reply_markup=main_menu_keyboard())
 
@@ -1699,13 +1708,14 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         voice_status = "выключен — команда /voice покажет, как включить"
     text = (
         "<b>Как это работает</b>\n\n"
-        "Наговори или напиши задачу в свободной форме, например:\n"
-        "• <b>Мира, запиши задачу написать Кате по смете</b>\n"
-        "• <b>Добавь задачу в личное к работе оплатить счёт</b>\n"
-        "• <b>В Vibecoding добавь подзадачу к задаче \"Разобраться с API\"</b>\n\n"
-        f"• <b>{BTN_LIST_WEEEK_TASKS}</b> — выбрать проект и посмотреть задачи в ВИК со статусами.\n"
-        "• Если проект не назван, бот предложит выбрать его кнопками.\n"
-        "• Если в фразе есть статус вроде «к работе» или «в работу», бот подставит подходящую колонку.\n"
+        "<b>Идеи</b> — то, что хочется обдумать и не забыть.\n"
+        f"• <b>{BTN_ADD}</b> — ввести краткое название и подробное описание.\n"
+        f"• <b>{BTN_LIST}</b> — посмотреть все идеи. У каждой «📖 Подробнее» и «🗑 Удалить».\n\n"
+        "<b>Задачи</b> — то, что нужно сделать.\n"
+        f"• <b>{BTN_ADD_TASK}</b> — наговорить или ввести задачу одной строкой.\n"
+        f"• <b>{BTN_LIST_TASKS}</b> — список задач с галочками «сделано».\n\n"
+        f"• <b>{BTN_REMINDERS}</b> — ежедневные напоминания (по идеям) и часовой пояс.\n"
+        f"• <b>{BTN_TEST}</b> — отправить тестовое напоминание прямо сейчас.\n"
         f"• <b>/voice</b> — инструкция по голосовому вводу (сейчас {voice_status})."
     )
     await update.message.reply_html(text, reply_markup=main_menu_keyboard())
@@ -1719,9 +1729,9 @@ async def voice_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "Mira сначала пробует OpenAI STT через официальный API, а при сбое переключается на локальный Vosk. "
             "Качество ниже Whisper, но для коротких фраз вполне приемлемо.\n\n"
             "Просто запиши голосовое прямо в чате:\n"
-            "• Вне диалогов — бот поймёт, что обычную задачу нужно отправить в Weeek.\n"
-            "• Если проект не назван, бот попросит выбрать его кнопками.\n"
-            "• Можно сразу сказать статус вроде «к работе» или «в работу».\n"
+            "• Вне диалогов — бот поймёт, это идея, задача или напоминание.\n"
+            f"• В режиме «{BTN_ADD_TASK}» — текст голоса сохранится как задача.\n"
+            f"• На шагах «{BTN_ADD}» — голос подставится в текущий шаг.\n"
         )
     else:
         text = (
@@ -3493,169 +3503,6 @@ def _sort_weeek_columns(columns: list[dict], hint: str) -> list[dict]:
     return sorted(filtered, key=score)
 
 
-def _weeek_browser_keyboard(options: list[dict], prefix: str, include_back: bool = False) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(option["name"][:60], callback_data=f"{prefix}:{option['id']}")]
-        for option in options
-    ]
-    if include_back:
-        rows.append([InlineKeyboardButton("⬅️ К проектам", callback_data="weeek_list_back")])
-    rows.append([InlineKeyboardButton("✖️ Закрыть", callback_data="weeek_list_close")])
-    return InlineKeyboardMarkup(rows)
-
-
-def _extract_weeek_task_board_id(task: dict) -> str:
-    raw = task.get("raw") or {}
-    value = (
-        raw.get("boardId")
-        or raw.get("board", {}).get("id")
-        or raw.get("location", {}).get("boardId")
-    )
-    return str(value or "")
-
-
-def _extract_weeek_task_column_id(task: dict) -> str:
-    raw = task.get("raw") or {}
-    value = (
-        raw.get("boardColumnId")
-        or raw.get("columnId")
-        or raw.get("statusId")
-        or raw.get("boardColumn", {}).get("id")
-        or raw.get("column", {}).get("id")
-        or raw.get("status", {}).get("id")
-    )
-    return str(value or "")
-
-
-def _extract_weeek_task_column_name(task: dict, column_names: dict[tuple[str, str], str]) -> str:
-    raw = task.get("raw") or {}
-    for value in (
-        raw.get("boardColumnName"),
-        raw.get("columnName"),
-        raw.get("statusName"),
-        raw.get("boardColumn", {}).get("name"),
-        raw.get("column", {}).get("name"),
-        raw.get("status", {}).get("name"),
-    ):
-        if value:
-            return str(value)
-
-    board_id = _extract_weeek_task_board_id(task)
-    column_id = _extract_weeek_task_column_id(task)
-    if board_id and column_id:
-        return column_names.get((board_id, column_id), "")
-    return ""
-
-
-def _weeek_status_rank(status: str) -> int:
-    normalized = _normalize_text(status)
-    if any(token in normalized for token in ("к работе", "todo", "backlog", "queue")):
-        return 0
-    if any(token in normalized for token in ("в работе", "progress", "doing")):
-        return 1
-    if any(token in normalized for token in ("готово", "сделано", "done", "complete", "completed")):
-        return 2
-    if normalized:
-        return 3
-    return 4
-
-
-def _format_weeek_tasks_overview(project_name: str, tasks: list[dict], column_names: dict[tuple[str, str], str]) -> str:
-    groups: dict[str, list[str]] = {}
-    for task in tasks:
-        title = _compact_spaces(task.get("name") or "")
-        if not title:
-            continue
-        status = _extract_weeek_task_column_name(task, column_names) or "Без статуса"
-        groups.setdefault(status, []).append(title)
-
-    if not groups:
-        return f"📂 <b>{html.escape(project_name)}</b>\n\nЗадач в этом проекте пока не вижу."
-
-    lines = [f"📂 <b>{html.escape(project_name)}</b>", ""]
-    for status in sorted(groups, key=_weeek_status_rank):
-        items = sorted(groups[status], key=_normalize_text)
-        lines.append(f"<b>{html.escape(status)}</b> ({len(items)})")
-        lines.extend(f"• {html.escape(item)}" for item in items)
-        lines.append("")
-    return "\n".join(lines).strip()
-
-
-async def weeek_list_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not weeek_available():
-        await update.message.reply_text(
-            "Интеграция с Weeek пока не настроена. Проверь WEEEK_API_TOKEN.",
-            reply_markup=main_menu_keyboard(),
-        )
-        return
-
-    client = get_weeek_client()
-    projects = await client.list_projects()
-    if not projects:
-        await update.message.reply_text(
-            "Не смог найти проекты в Weeek.",
-            reply_markup=main_menu_keyboard(),
-        )
-        return
-
-    context.user_data["weeek_browser_projects"] = [
-        {"id": option.id, "name": option.name, "raw": option.raw}
-        for option in projects
-    ]
-    await update.message.reply_text(
-        "Выбери проект:",
-        reply_markup=_weeek_browser_keyboard(context.user_data["weeek_browser_projects"], "weeek_list_project"),
-    )
-
-
-async def weeek_list_project_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    projects = context.user_data.get("weeek_browser_projects") or []
-    project_id = (query.data or "").split(":", 1)[1]
-    project = next((item for item in projects if item["id"] == project_id), None)
-    if not project:
-        await query.answer("Список проектов устарел, открой заново.", show_alert=True)
-        return
-
-    client = get_weeek_client()
-    tasks = [{"id": option.id, "name": option.name, "raw": option.raw} for option in await client.list_tasks(project_id=project_id)]
-    boards = await client.list_boards(project_id)
-    column_names: dict[tuple[str, str], str] = {}
-    for board in boards:
-        board_id = str(board.id)
-        try:
-            columns = await client.list_columns(board_id)
-        except WeeekApiError:
-            continue
-        for column in columns:
-            column_names[(board_id, str(column.id))] = column.name
-
-    await query.edit_message_text(
-        _format_weeek_tasks_overview(project["name"], tasks, column_names),
-        parse_mode=ParseMode.HTML,
-        reply_markup=_weeek_browser_keyboard(projects, "weeek_list_project", include_back=True),
-    )
-
-
-async def weeek_list_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data or ""
-    if data == "weeek_list_close":
-        await query.edit_message_text("Закрыл список задач в ВИК.")
-        return
-
-    projects = context.user_data.get("weeek_browser_projects") or []
-    if not projects:
-        await query.edit_message_text("Список проектов потерялся. Нажми кнопку ещё раз.", reply_markup=None)
-        return
-    await query.edit_message_text(
-        "Выбери проект:",
-        reply_markup=_weeek_browser_keyboard(projects, "weeek_list_project"),
-    )
-
-
 async def _send_weeek_project_picker(message, context: ContextTypes.DEFAULT_TYPE):
     client = get_weeek_client()
     projects = await client.list_projects()
@@ -4351,10 +4198,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data or ""
 
-    if data.startswith("weeek_list_project:"):
-        return await weeek_list_project_callback(update, context)
-    if data in {"weeek_list_back", "weeek_list_close"}:
-        return await weeek_list_nav_callback(update, context)
     if data.startswith("weeek_project:"):
         return await weeek_project_callback(update, context)
     if data.startswith("weeek_board:"):
@@ -4529,8 +4372,12 @@ def main():
     application.add_handler(capture_conv)
 
     # Кнопки главного меню (вне диалогов)
-    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_LIST_WEEEK_TASKS)}$"), weeek_list_start))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_LIST}$"), list_ideas))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_LIST_TASKS}$"), list_tasks))
+    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_ADD_WEEEK_TASK)}$"), weeek_add_start))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_TEST}$"), test_reminder))
     application.add_handler(MessageHandler(filters.Regex(f"^{BTN_HELP}$"), show_help))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_REMINDERS}$"), reminders_show))
 
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_error_handler(error_handler)

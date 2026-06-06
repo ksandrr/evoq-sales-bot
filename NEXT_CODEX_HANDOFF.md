@@ -455,9 +455,36 @@ Run locally in this Codex workspace:
 
 ### Deploy Status
 
-- Linux deploy: not performed in this session
+- Linux deploy: attempted, then rolled back in this session
+- Temporary deployed commit: `16ce633`
+- Active rollback source: `/home/sanya/mira-task-bot-backup-20260606-183056`
+- Server service after rollback restart: `active`
 - Server config / server `.env`: not changed in this session
-- Pushed commit: none in this session
+
+### Server Validation
+
+Validated on the Linux server with the project venv:
+
+```bash
+cd /home/sanya/mira-task-bot
+.venv/bin/python -m py_compile bot.py weeek_client.py tests/test_time_parsing.py
+.venv/bin/python -m unittest tests.test_time_parsing
+sudo systemctl restart mira-task-bot.service
+systemctl is-active mira-task-bot.service
+```
+
+Results:
+
+- `py_compile`: passed
+- `unittest` on temporary VIK-first deploy: passed (`36 tests`, `OK`)
+- `unittest` after restoring pre-deploy backup state: passed (`35 tests`, `OK`)
+- `mira-task-bot.service`: `active`
+
+### Rollback Note
+
+- The VIK-first menu/task-browser changes from commit `16ce633` were rolled back after the user reported the app behavior was broken.
+- The Linux server was restored from the saved backup instead of leaving the temporary deploy live.
+- Before future deploys, check server `git status --short` first so local server-only changes are not overwritten or stranded outside git.
 
 ### Remaining Risks / Manual Checks
 
