@@ -6,7 +6,6 @@ import html
 import logging
 import os
 import re
-import secrets
 import shutil
 import subprocess
 import tempfile
@@ -17,18 +16,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 from telegram import (
-    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
     Update,
 )
 from telegram.constants import ChatAction, ParseMode
-try:
-    from telegram.error import TelegramError, TimedOut
-except Exception:  # pragma: no cover - tests can stub `telegram` as a simple module
-    TelegramError = Exception
-    TimedOut = Exception
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -46,22 +39,16 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "Asia/Omsk")
-OPENAI_PARSE_MODEL = os.getenv("OPENAI_PARSE_MODEL", "gpt-5.4-mini")
-OPENAI_STT_MODEL = (os.getenv("OPENAI_STT_MODEL") or "gpt-4o-mini-transcribe").strip()
+OPENAI_PARSE_MODEL = os.getenv("OPENAI_PARSE_MODEL", "gpt-5.5")
+OPENAI_STT_MODEL = (os.getenv("OPENAI_STT_MODEL") or "gpt-4o-transcribe").strip()
 OPENAI_STT_ENABLED = (os.getenv("OPENAI_STT_ENABLED") or "true").strip().lower() in {"1", "true", "yes", "on"}
 WEEEK_API_TOKEN = (os.getenv("WEEEK_API_TOKEN") or "").strip()
 WEEEK_API_BASE_URL = (os.getenv("WEEEK_API_BASE_URL") or "https://api.weeek.net/public/v1").strip()
 WEEEK_DEFAULT_WORKSPACE_ID = (os.getenv("WEEEK_DEFAULT_WORKSPACE_ID") or "").strip()
-TELEGRAM_SHORT_TIMEOUT = 4
-WEEEK_PROJECT_CALLBACK_TIMEOUT = 16
 
 
 def _normalize_text(text: str) -> str:
     return _compact_spaces(text).lower().replace("ё", "е")
-
-
-def _is_real_ru_text(text: str) -> bool:
-    return bool(re.search(r"[\u0400-\u04ff]", text or ""))
 
 
 logging.basicConfig(
@@ -205,48 +192,6 @@ def voice_available() -> bool:
     return _vosk_available() and bool(shutil.which("ffmpeg"))
 
 
-def _voice_mode() -> str:
-    if _openai_stt_available():
-        return "openai"
-    if _vosk_available() and shutil.which("ffmpeg"):
-        return "vosk"
-    return "disabled"
-
-
-def _log_openai_usage(feature: str, model: str, response) -> None:
-    usage = getattr(response, "usage", None)
-    input_tokens = (
-        getattr(usage, "prompt_tokens", None)
-        if usage is not None else None
-    )
-    if input_tokens is None and usage is not None:
-        input_tokens = getattr(usage, "input_tokens", None)
-    output_tokens = (
-        getattr(usage, "completion_tokens", None)
-        if usage is not None else None
-    )
-    if output_tokens is None and usage is not None:
-        output_tokens = getattr(usage, "output_tokens", None)
-    total_tokens = getattr(usage, "total_tokens", None) if usage is not None else None
-    logger.info(
-        "openai_usage feature=%s model=%s input_tokens=%s output_tokens=%s total_tokens=%s",
-        feature,
-        model,
-        input_tokens if input_tokens is not None else "-",
-        output_tokens if output_tokens is not None else "-",
-        total_tokens if total_tokens is not None else "-",
-    )
-
-
-def _log_openai_stt_usage(duration="", file_size="") -> None:
-    logger.info(
-        "openai_usage feature=openai_stt model=%s duration=%s file_size=%s",
-        OPENAI_STT_MODEL or "-",
-        duration if duration not in (None, "") else "-",
-        file_size if file_size not in (None, "") else "-",
-    )
-
-
 logger.info(
     "STT health primary=%s official_api=%s model=%s fallback_vosk=%s status=%s",
     bool(_openai_stt_available()),
@@ -281,22 +226,18 @@ BTN_TEST = "🔔 Тест"
 BTN_HELP = "ℹ️ Помощь"
 BTN_CANCEL = "✖️ Отмена"
 BTN_ADD_WEEEK_TASK = "🧩 Задача ВИК"
-LEGACY_MENU_BUTTONS = (
-    BTN_ADD,
-    BTN_LIST,
-    BTN_ADD_TASK,
-    BTN_LIST_TASKS,
-    BTN_REMINDERS,
-    BTN_TEST,
-    BTN_HELP,
-)
-LEGACY_MENU_BUTTON_PATTERN = "^(" + "|".join(re.escape(label) for label in LEGACY_MENU_BUTTONS) + ")$"
 MENU_BUTTON_PATTERN = "^(" + "|".join(
     re.escape(label)
     for label in (
+        BTN_ADD,
+        BTN_LIST,
+        BTN_ADD_TASK,
         BTN_ADD_WEEEK_TASK,
+        BTN_LIST_TASKS,
+        BTN_REMINDERS,
+        BTN_TEST,
+        BTN_HELP,
         BTN_CANCEL,
-        *LEGACY_MENU_BUTTONS,
     )
 ) + ")$"
 
@@ -321,9 +262,15 @@ PRESET_TIMEZONES = [
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [[BTN_ADD_WEEEK_TASK]],
+        [
+            [BTN_ADD, BTN_ADD_TASK],
+            [BTN_ADD_WEEEK_TASK, BTN_LIST_TASKS],
+            [BTN_LIST, BTN_REMINDERS],
+            [BTN_TEST],
+            [BTN_HELP],
+        ],
         resize_keyboard=True,
-        input_field_placeholder="Напиши или наговори задачу для Weeek...",
+        input_field_placeholder="Тапни кнопку, напиши или наговори...",
     )
 
 
@@ -956,7 +903,6 @@ async def parse_idea_with_gpt(text: str):
     )
     try:
         response = await _async_call(_openai_client.chat.completions.create, **request_kwargs)
-        _log_openai_usage("idea_parse", OPENAI_PARSE_MODEL, response)
         raw = response.choices[0].message.content
         data = _extract_json_object(raw)
         if not data:
@@ -979,7 +925,7 @@ async def parse_idea_with_gpt(text: str):
         return None
 
 
-async def parse_capture_with_gpt(text: str, default_timezone: str, feature: str = "capture_parse"):
+async def parse_capture_with_gpt(text: str, default_timezone: str):
     if not _openai_client:
         return None
 
@@ -1025,7 +971,6 @@ async def parse_capture_with_gpt(text: str, default_timezone: str, feature: str 
     )
     try:
         response = await _async_call(_openai_client.chat.completions.create, **request_kwargs)
-        _log_openai_usage(feature, OPENAI_PARSE_MODEL, response)
         raw = response.choices[0].message.content
         data = _extract_json_object(raw)
         if not data:
@@ -1417,21 +1362,6 @@ def extract_capture_timezone(text: str, default_tz: str = "") -> str:
 
 def extract_capture_due_time(text: str) -> str:
     low = (text or "").lower().replace("ё", "е")
-    if _is_real_ru_text(low):
-        m = re.search(r"\b(?:к|на|в)\s+([01]?\d|2[0-3])[:.](\d{2})\b", low)
-        if m:
-            return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}"
-        m = re.search(r"\b(?:к|на|в)\s+([01]?\d|2[0-3])\s*(?:час(?:ов|а)?|ч)?\s*(утра|дня|вечера|ночи)?\b", low)
-        if m:
-            hour = int(m.group(1))
-            part = m.group(2) or ("вечера" if "вечером" in low else "")
-            if part in {"дня", "вечера"} and hour < 12:
-                hour += 12
-            if part == "ночи" and hour == 12:
-                hour = 0
-            return f"{hour:02d}:00"
-        if "вечером" in low:
-            return "22:00"
 
     m = re.search(r"\b(?:к|на|в)\s+([01]?\d|2[0-3])[:.](\d{2})\b", low)
     if m:
@@ -1486,13 +1416,6 @@ def extract_capture_due_time(text: str) -> str:
 def extract_capture_due_date(text: str, timezone: str) -> str:
     low = (text or "").lower().replace("ё", "е")
     now = _today_in_timezone(timezone or _default_timezone())
-    if _is_real_ru_text(low):
-        if "послезавтра" in low:
-            return (now + timedelta(days=2)).date().isoformat()
-        if "завтра" in low:
-            return (now + timedelta(days=1)).date().isoformat()
-        if "сегодня" in low:
-            return now.date().isoformat()
     if "послезавтра" in low:
         return (now + timedelta(days=2)).date().isoformat()
     if "завтра" in low:
@@ -1569,44 +1492,6 @@ def classify_capture_text(text: str) -> dict:
         "transcript": clean,
         "source": "rules",
     }
-
-
-def _capture_title_is_weak(title: str, text: str = "") -> bool:
-    title = _compact_spaces(title or "")
-    if not title:
-        return True
-    low = title.lower()
-    weak_titles = {
-        "РРґРµСЏ",
-        "Р—Р°РґР°С‡Р°",
-        "РќР°РїРѕРјРёРЅР°РЅРёРµ",
-        "idea",
-        "task",
-        "reminder",
-    }
-    if title in weak_titles:
-        return True
-    if len(title) <= 2:
-        return True
-    if title.count(",") >= 2:
-        return True
-    if any(token in low for token in ("СЃРјРѕС‚СЂРё", "РєРѕСЂРѕС‡Рµ", "РїСЂРёРІРµС‚")) and len(title.split()) <= 4:
-        return True
-    return False
-
-
-def _capture_type_is_obvious(rule_capture: dict, text: str, forced_type: str | None = None) -> bool:
-    if forced_type:
-        return True
-    low = _normalize_text(text or "")
-    capture_type = rule_capture.get("type", "")
-    if capture_type == "reminder":
-        return "напом" in low or "РЅР°РїРѕРј" in low or "remind" in low
-    if capture_type == "task":
-        return any(word in low for word in CAPTURE_INTENT_WORDS) or any(re.search(rf"\b{word}\b", low) for word in ACTION_WORDS)
-    if capture_type == "idea":
-        return any(re.search(pattern, low) for pattern in IDEA_INTENT_PATTERNS) or not any(word in low for word in CAPTURE_INTENT_WORDS)
-    return False
 
 
 async def classify_capture(update: Update, text: str, forced_type: str | None = None) -> dict:
@@ -1798,34 +1683,22 @@ async def _async_call(fn, *args, **kwargs):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    _hard_reset_weeek_flow(context, "start")
-    _reset_transient_flow_state(context)
-    logger.info("start_hard_reset user_id=%s", user_id)
     db.upsert_user(user_id)
+    schedule_user_reminders(context.application, user_id)
+
+    tz = effective_user_timezone(user_id)
+    reminders = db.get_user_reminders(user_id)
+    times_txt = ", ".join(f"{h:02d}:{m:02d}" for _, h, m in reminders) or "—"
     text = (
-        "👋 <b>Привет! Я Mira.</b>\n\n"
-        "Я создаю задачи и подзадачи только в Weeek.\n"
-        "Просто напиши или наговори, что нужно сделать. Затем выбери проект, колонку и подтверди создание."
+        "👋 Привет! Я бот-задачник и идейник в одном.\n\n"
+        f"💡 <b>Идеи</b> — то, что хочется обдумать. Каждый день в удобное время "
+        "я буду напоминать о них списком.\n"
+        f"✅ <b>Задачи</b> — то, что нужно сделать. Хранятся с галочками «сделано/не сделано».\n\n"
+        f"🌍 Часовой пояс: <b>{html.escape(tz)}</b>\n"
+        f"⏰ Напоминания: <b>{times_txt}</b>\n\n"
+        "Используй кнопки внизу. Идею или задачу можно ввести текстом или голосом."
     )
-    try:
-        await update.message.reply_html(
-            text,
-            reply_markup=main_menu_keyboard(),
-            read_timeout=TELEGRAM_SHORT_TIMEOUT,
-            write_timeout=TELEGRAM_SHORT_TIMEOUT,
-            connect_timeout=TELEGRAM_SHORT_TIMEOUT,
-            pool_timeout=TELEGRAM_SHORT_TIMEOUT,
-        )
-    except TelegramError as exc:
-        logger.warning("start_recovery_reply_failed user_id=%s error=%s", user_id, exc)
-
-
-async def start_conversation_recovery(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id if update.effective_user else None
-    _hard_reset_weeek_flow(context, "start_conversation_recovery")
-    _reset_transient_flow_state(context)
-    logger.info("start_conversation_recovery_state_cleared user_id=%s", user_id)
-    return ConversationHandler.END
+    await update.message.reply_html(text, reply_markup=main_menu_keyboard())
 
 
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1835,10 +1708,14 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         voice_status = "выключен — команда /voice покажет, как включить"
     text = (
         "<b>Как это работает</b>\n\n"
-        "• Напиши задачу обычным сообщением или отправь голосовое.\n"
-        f"• Кнопка <b>{BTN_ADD_WEEEK_TASK}</b> запускает пошаговый ввод.\n"
-        "• Для подзадачи явно скажи или напиши «создай подзадачу» и укажи родительскую задачу.\n"
-        "• После разбора выбери проект, колонку и подтверди создание.\n\n"
+        "<b>Идеи</b> — то, что хочется обдумать и не забыть.\n"
+        f"• <b>{BTN_ADD}</b> — ввести краткое название и подробное описание.\n"
+        f"• <b>{BTN_LIST}</b> — посмотреть все идеи. У каждой «📖 Подробнее» и «🗑 Удалить».\n\n"
+        "<b>Задачи</b> — то, что нужно сделать.\n"
+        f"• <b>{BTN_ADD_TASK}</b> — наговорить или ввести задачу одной строкой.\n"
+        f"• <b>{BTN_LIST_TASKS}</b> — список задач с галочками «сделано».\n\n"
+        f"• <b>{BTN_REMINDERS}</b> — ежедневные напоминания (по идеям) и часовой пояс.\n"
+        f"• <b>{BTN_TEST}</b> — отправить тестовое напоминание прямо сейчас.\n"
         f"• <b>/voice</b> — инструкция по голосовому вводу (сейчас {voice_status})."
     )
     await update.message.reply_html(text, reply_markup=main_menu_keyboard())
@@ -1851,8 +1728,10 @@ async def voice_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"🧠 Парсинг смысла: <b>{html.escape(OPENAI_PARSE_MODEL)}</b>.\n\n"
             "Mira сначала пробует OpenAI STT через официальный API, а при сбое переключается на локальный Vosk. "
             "Качество ниже Whisper, но для коротких фраз вполне приемлемо.\n\n"
-            "Просто запиши голосовое прямо в чате. Mira распознает задачу, затем предложит выбрать проект и колонку Weeek.\n"
-            "Если нужна подзадача, произнеси слово «подзадача» и название родительской задачи.\n"
+            "Просто запиши голосовое прямо в чате:\n"
+            "• Вне диалогов — бот поймёт, это идея, задача или напоминание.\n"
+            f"• В режиме «{BTN_ADD_TASK}» — текст голоса сохранится как задача.\n"
+            f"• На шагах «{BTN_ADD}» — голос подставится в текущий шаг.\n"
         )
     else:
         text = (
@@ -2087,8 +1966,7 @@ async def add_details_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _hard_reset_weeek_flow(context, "cancel_command")
-    _reset_transient_flow_state(context)
+    context.user_data.clear()
     await update.message.reply_text("❌ Отменено.", reply_markup=main_menu_keyboard())
     return ConversationHandler.END
 
@@ -2422,12 +2300,12 @@ async def task_add_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Голос вне диалога: классифицируем в идею / задачу / напоминание ---
 
-def _weeek_options_keyboard(options: list[dict], prefix: str, draft_id: str = "") -> InlineKeyboardMarkup:
+def _weeek_options_keyboard(options: list[dict], prefix: str) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(option["name"][:60], callback_data=f"{prefix}:{draft_id}:{option['id']}")]
+        [InlineKeyboardButton(option["name"][:60], callback_data=f"{prefix}:{option['id']}")]
         for option in options[:20]
     ]
-    rows.append([InlineKeyboardButton("✖️ Отмена", callback_data=f"weeek_cancel:{draft_id}")])
+    rows.append([InlineKeyboardButton("✖️ Отмена", callback_data="weeek_cancel")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -2460,16 +2338,7 @@ def _sort_weeek_columns(columns: list[dict], hint: str) -> list[dict]:
 
 async def _send_weeek_project_picker(message, context: ContextTypes.DEFAULT_TYPE):
     client = get_weeek_client()
-    try:
-        projects = await client.list_projects()
-    except WeeekApiError as exc:
-        await message.reply_text(
-            f"Не удалось получить проекты Weeek: {exc}",
-            reply_markup=main_menu_keyboard(),
-        )
-        _clear_weeek_draft(context)
-        _clear_active_flow(context)
-        return ConversationHandler.END
+    projects = await client.list_projects()
     if not projects:
         await message.reply_text(
             "Не смог найти проекты в Weeek. Проверь WEEEK_API_TOKEN, WEEEK_API_BASE_URL и доступы у токена.",
@@ -2482,7 +2351,7 @@ async def _send_weeek_project_picker(message, context: ContextTypes.DEFAULT_TYPE
     draft["projects"] = [{"id": option.id, "name": option.name, "raw": option.raw} for option in projects]
     await message.reply_text(
         "Выбери проект для задачи в Weeek:",
-        reply_markup=_weeek_options_keyboard(draft["projects"], "weeek_project", draft.get("draft_id", "")),
+        reply_markup=_weeek_options_keyboard(draft["projects"], "weeek_project"),
     )
     return WEEEK_PROJECT
 
@@ -2491,16 +2360,7 @@ async def _send_weeek_board_picker(message, context: ContextTypes.DEFAULT_TYPE):
     draft = _get_weeek_draft(context)
     project_id = draft.get("project_id")
     client = get_weeek_client()
-    try:
-        boards = await client.list_boards(project_id)
-    except WeeekApiError as exc:
-        await message.reply_text(
-            f"Не удалось получить доски Weeek: {exc}",
-            reply_markup=main_menu_keyboard(),
-        )
-        _clear_weeek_draft(context)
-        _clear_active_flow(context)
-        return ConversationHandler.END
+    boards = await client.list_boards(project_id)
     if not boards:
         await message.reply_text(
             "Для выбранного проекта не нашёл доски Weeek. Проверь структуру проекта в Weeek.",
@@ -2512,7 +2372,7 @@ async def _send_weeek_board_picker(message, context: ContextTypes.DEFAULT_TYPE):
     draft["boards"] = [{"id": option.id, "name": option.name, "raw": option.raw} for option in boards]
     await message.reply_text(
         "Теперь выбери доску:",
-        reply_markup=_weeek_options_keyboard(draft["boards"], "weeek_board", draft.get("draft_id", "")),
+        reply_markup=_weeek_options_keyboard(draft["boards"], "weeek_board"),
     )
     return WEEEK_BOARD
 
@@ -2521,16 +2381,7 @@ async def _send_weeek_column_picker(message, context: ContextTypes.DEFAULT_TYPE)
     draft = _get_weeek_draft(context)
     board_id = draft.get("board_id")
     client = get_weeek_client()
-    try:
-        columns = await client.list_columns(board_id)
-    except WeeekApiError as exc:
-        await message.reply_text(
-            f"Не удалось получить колонки Weeek: {exc}",
-            reply_markup=main_menu_keyboard(),
-        )
-        _clear_weeek_draft(context)
-        _clear_active_flow(context)
-        return ConversationHandler.END
+    columns = await client.list_columns(board_id)
     if not columns:
         await message.reply_text(
             "Не смог получить колонки этой доски Weeek. Возможно, API вернул непривычный формат.",
@@ -2550,7 +2401,7 @@ async def _send_weeek_column_picker(message, context: ContextTypes.DEFAULT_TYPE)
             return await _show_weeek_preview(message, context)
     await message.reply_text(
         "И последним шагом выбери колонку:",
-        reply_markup=_weeek_options_keyboard(draft["columns"], "weeek_column", draft.get("draft_id", "")),
+        reply_markup=_weeek_options_keyboard(draft["columns"], "weeek_column"),
     )
     return WEEEK_COLUMN
 
@@ -2558,16 +2409,7 @@ async def _send_weeek_column_picker(message, context: ContextTypes.DEFAULT_TYPE)
 async def _send_weeek_parent_picker(message, context: ContextTypes.DEFAULT_TYPE):
     draft = _get_weeek_draft(context)
     client = get_weeek_client()
-    try:
-        tasks = await client.list_tasks(draft.get("project_id", ""), draft.get("board_id", ""))
-    except WeeekApiError as exc:
-        await message.reply_text(
-            f"Не удалось получить задачи Weeek: {exc}",
-            reply_markup=main_menu_keyboard(),
-        )
-        _clear_weeek_draft(context)
-        _clear_active_flow(context)
-        return ConversationHandler.END
+    tasks = await client.list_tasks(draft.get("project_id", ""), draft.get("board_id", ""))
     if not tasks:
         await message.reply_text(
             "Не смог получить список задач в этой доске Weeek.",
@@ -2590,12 +2432,12 @@ async def _send_weeek_parent_picker(message, context: ContextTypes.DEFAULT_TYPE)
     if candidate:
         await message.reply_text(
             "Не смог однозначно найти родительскую задачу. Выбери её вручную:",
-            reply_markup=_weeek_options_keyboard(mapped, "weeek_parent", draft.get("draft_id", "")),
+            reply_markup=_weeek_options_keyboard(mapped, "weeek_parent"),
         )
     else:
         await message.reply_text(
             "Выбери родительскую задачу для подзадачи:",
-            reply_markup=_weeek_options_keyboard(mapped, "weeek_parent", draft.get("draft_id", "")),
+            reply_markup=_weeek_options_keyboard(mapped, "weeek_parent"),
         )
     return WEEEK_PARENT
 
@@ -2766,8 +2608,7 @@ async def weeek_parent_callback(update: Update, context: ContextTypes.DEFAULT_TY
 async def weeek_preview_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = (query.data or "").split(":", 1)[0]
-    callback_draft_id = _current_weeek_draft_id(context)
+    data = query.data or ""
 
     if data == "weeek_cancel":
         _clear_weeek_draft(context)
@@ -2917,7 +2758,7 @@ async def _send_created_task(update: Update, capture: dict, task_id: int, recogn
 async def _extract_clarified_due(update: Update, text: str, pending: dict) -> dict:
     user_id = update.effective_user.id
     default_timezone = effective_user_timezone(user_id)
-    parsed = await parse_capture_with_gpt(text, default_timezone, feature="reminder_clarification")
+    parsed = await parse_capture_with_gpt(text, default_timezone)
     timezone = (parsed or {}).get("timezone") or pending.get("timezone") or default_timezone
     due_time = (parsed or {}).get("due_time") or extract_capture_due_time(text)
     due_date = (parsed or {}).get("due_date") or extract_capture_due_date(text, timezone)
@@ -3128,7 +2969,6 @@ async def _transcribe_or_warn(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return None
 
-    await update.message.reply_text("Распознаю голосовое...")
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
     voice = update.message.voice or update.message.audio
     if not voice:
@@ -3422,15 +3262,10 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(application: Application):
     db.init_db()
-    await application.bot.set_my_commands(
-        [
-            BotCommand("start", "Главное меню"),
-            BotCommand("help", "Как создать задачу в Weeek"),
-            BotCommand("voice", "Модели GPT и распознавания голоса"),
-            BotCommand("cancel", "Отменить текущий ввод"),
-        ]
-    )
-    logger.info("Bot started in Weeek-only mode; local reminders are disabled.")
+    for user_id in db.get_all_user_ids():
+        schedule_user_reminders(application, user_id)
+    schedule_task_reminder_checker(application)
+    logger.info("Bot started; reminders scheduled.")
 
 
 def _log_event(event: str, **fields):
@@ -3464,72 +3299,6 @@ def _set_active_flow(context: ContextTypes.DEFAULT_TYPE, flow: str):
 
 def _clear_active_flow(context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("_active_flow", None)
-
-
-def _new_weeek_draft_id() -> str:
-    return secrets.token_hex(4)
-
-
-def _current_weeek_draft_id(context: ContextTypes.DEFAULT_TYPE) -> str:
-    draft = context.user_data.get("weeek_draft") or {}
-    return str(draft.get("draft_id") or "")
-
-
-def _weeek_draft_is_current(context: ContextTypes.DEFAULT_TYPE, draft_id: str) -> bool:
-    return bool(draft_id and draft_id == _current_weeek_draft_id(context))
-
-
-def _cancel_pending_weeek_background(context: ContextTypes.DEFAULT_TYPE, reason: str):
-    task = context.user_data.pop("_weeek_background_task", None)
-    task_draft_id = context.user_data.pop("_weeek_background_draft_id", "")
-    try:
-        current_task = asyncio.current_task()
-    except RuntimeError:
-        current_task = None
-    if task and task is not current_task and not task.done():
-        task.cancel()
-        logger.info("weeek_background_task_cancelled draft_id=%s reason=%s", task_draft_id, reason)
-    elif task is current_task:
-        logger.info("weeek_background_task_marked_obsolete draft_id=%s reason=%s", task_draft_id, reason)
-
-
-def _hard_reset_weeek_flow(context: ContextTypes.DEFAULT_TYPE, reason: str):
-    draft_id = _current_weeek_draft_id(context)
-    _cancel_pending_weeek_background(context, reason)
-    _clear_weeek_draft(context)
-    _clear_active_flow(context)
-    logger.info("weeek_state_cleared draft_id=%s reason=%s", draft_id, reason)
-
-
-def _parse_weeek_callback_data(data: str, prefix: str) -> tuple[str, str]:
-    expected = f"{prefix}:"
-    if not data.startswith(expected):
-        return "", ""
-    remainder = data[len(expected):]
-    if ":" in remainder:
-        draft_id, payload = remainder.split(":", 1)
-        return draft_id, payload
-    return remainder, ""
-
-
-async def _reject_stale_weeek_callback(query, context: ContextTypes.DEFAULT_TYPE, callback_draft_id: str):
-    logger.info(
-        "weeek_stale_callback_rejected data=%r callback_draft_id=%s current_draft_id=%s",
-        query.data,
-        callback_draft_id,
-        _current_weeek_draft_id(context),
-    )
-    try:
-        await query.answer(
-            "Этот черновик уже устарел, начни заново.",
-            show_alert=True,
-            read_timeout=TELEGRAM_SHORT_TIMEOUT,
-            write_timeout=TELEGRAM_SHORT_TIMEOUT,
-            connect_timeout=TELEGRAM_SHORT_TIMEOUT,
-            pool_timeout=TELEGRAM_SHORT_TIMEOUT,
-        )
-    except TelegramError as exc:
-        logger.warning("weeek_stale_callback_answer_failed data=%r error=%s", query.data, exc)
 
 
 def _reset_transient_flow_state(context: ContextTypes.DEFAULT_TYPE):
@@ -3604,11 +3373,9 @@ async def transcribe_voice(voice_file, update: Update | None = None):
         if _openai_stt_available():
             try:
                 _log_event("openai_stt_request_started", model=OPENAI_STT_MODEL, **meta)
-                stt_file_size = meta.get("file_size") or os.path.getsize(tmp_path)
                 text = await _async_call(_openai_transcribe_file, tmp_path)
-                _log_openai_stt_usage(meta.get("duration", ""), stt_file_size)
                 if text:
-                    _log_event("openai_stt_request_succeeded", model=OPENAI_STT_MODEL, **meta)
+                    _log_event("openai_stt_request_succeeded", model=OPENAI_STT_MODEL, transcript=text, **meta)
                     logger.info("voice transcription engine=%s", _openai_stt_engine_label())
                     return {"text": text, "engine": _openai_stt_engine_label()}
             except Exception as exc:
@@ -3693,12 +3460,11 @@ def weeek_preview_message(draft: dict) -> str:
 
 def weeek_preview_keyboard(draft: dict | None = None) -> InlineKeyboardMarkup:
     draft = draft or {}
-    draft_id = draft.get("draft_id", "")
-    rows = [[InlineKeyboardButton("✅ Создать в Weeek", callback_data=f"weeek_create:{draft_id}")]]
+    rows = [[InlineKeyboardButton("✅ Создать в Weeek", callback_data="weeek_create")]]
     if draft.get("target") == "weeek_subtask":
-        rows.append([InlineKeyboardButton("🔁 Выбрать родителя заново", callback_data=f"weeek_repick_parent:{draft_id}")])
-    rows.append([InlineKeyboardButton("🔁 Выбрать колонку заново", callback_data=f"weeek_repick_column:{draft_id}")])
-    rows.append([InlineKeyboardButton("✖️ Отмена", callback_data=f"weeek_cancel:{draft_id}")])
+        rows.append([InlineKeyboardButton("🔁 Выбрать родителя заново", callback_data="weeek_repick_parent")])
+    rows.append([InlineKeyboardButton("🔁 Выбрать колонку заново", callback_data="weeek_repick_column")])
+    rows.append([InlineKeyboardButton("✖️ Отмена", callback_data="weeek_cancel")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -3738,13 +3504,8 @@ def _sort_weeek_columns(columns: list[dict], hint: str) -> list[dict]:
 
 
 async def _send_weeek_project_picker(message, context: ContextTypes.DEFAULT_TYPE):
-    draft = _get_weeek_draft(context)
-    draft_id = draft.get("draft_id", "")
     client = get_weeek_client()
     projects = await client.list_projects()
-    if not _weeek_draft_is_current(context, draft_id):
-        logger.info("weeek_background_task_skipped_stale draft_id=%s step=projects", draft_id)
-        return ConversationHandler.END
     if not projects:
         await message.reply_text(
             "Не смог найти проекты в Weeek. Проверь WEEEK_API_TOKEN, WEEEK_API_BASE_URL и доступы у токена.",
@@ -3754,11 +3515,12 @@ async def _send_weeek_project_picker(message, context: ContextTypes.DEFAULT_TYPE
         _clear_active_flow(context)
         return ConversationHandler.END
 
+    draft = _get_weeek_draft(context)
     draft["projects"] = [{"id": option.id, "name": option.name, "raw": option.raw} for option in projects]
     _log_event("weeek_projects_loaded", count=len(draft["projects"]))
     await message.reply_text(
         "Выбери проект для задачи в Weeek:",
-        reply_markup=_weeek_options_keyboard(draft["projects"], "weeek_project", draft.get("draft_id", "")),
+        reply_markup=_weeek_options_keyboard(draft["projects"], "weeek_project"),
     )
     return WEEEK_PROJECT
 
@@ -3781,7 +3543,7 @@ async def _send_weeek_board_picker(message, context: ContextTypes.DEFAULT_TYPE):
     _log_event("weeek_boards_loaded", count=len(draft["boards"]), project_id=project_id)
     await message.reply_text(
         "Теперь выбери доску:",
-        reply_markup=_weeek_options_keyboard(draft["boards"], "weeek_board", draft.get("draft_id", "")),
+        reply_markup=_weeek_options_keyboard(draft["boards"], "weeek_board"),
     )
     return WEEEK_BOARD
 
@@ -3815,7 +3577,7 @@ async def _send_weeek_column_picker(message, context: ContextTypes.DEFAULT_TYPE)
             return await _show_weeek_preview(message, context)
     await message.reply_text(
         "И последним шагом выбери колонку:",
-        reply_markup=_weeek_options_keyboard(filtered, "weeek_column", draft.get("draft_id", "")),
+        reply_markup=_weeek_options_keyboard(filtered, "weeek_column"),
     )
     return WEEEK_COLUMN
 
@@ -3847,12 +3609,12 @@ async def _send_weeek_parent_picker(message, context: ContextTypes.DEFAULT_TYPE)
     if candidate:
         await message.reply_text(
             "Не смог точно подобрать родительскую задачу. Выбери её вручную:",
-            reply_markup=_weeek_options_keyboard(mapped, "weeek_parent", draft.get("draft_id", "")),
+            reply_markup=_weeek_options_keyboard(mapped, "weeek_parent"),
         )
     else:
         await message.reply_text(
             "Выбери родительскую задачу:",
-            reply_markup=_weeek_options_keyboard(mapped, "weeek_parent", draft.get("draft_id", "")),
+            reply_markup=_weeek_options_keyboard(mapped, "weeek_parent"),
         )
     return WEEEK_PARENT
 
@@ -3911,32 +3673,38 @@ async def _start_weeek_capture(update: Update, context: ContextTypes.DEFAULT_TYP
     capture["transcript_clean"] = capture.get("transcript_clean") or content_text
     capture["speech_engine"] = context.user_data.get("_last_speech_engine", "")
 
-    _cancel_pending_weeek_background(context, "new_weeek_draft")
     draft = _get_weeek_draft(context)
     draft.clear()
-    draft_id = _new_weeek_draft_id()
     draft.update(
         {
-            "draft_id": draft_id,
             "capture": capture,
-            "target": "weeek_subtask" if route.get("target") == "weeek_subtask" else "weeek_task",
+            "target": route.get("target") or capture.get("target") or "weeek_task",
             "column_hint": route.get("column_hint") or capture.get("column_hint") or normalize_weeek_column_hint(raw_text),
             "parent_task_candidate": route.get("parent_task_candidate") or capture.get("parent_task_candidate") or "",
         }
     )
+    auto_project = route.get("project") or match_weeek_target(capture.get("project_name_candidate") or "")
+    if auto_project:
+        draft.update(auto_project)
+
     _set_active_flow(context, "weeek_capture")
-    logger.info("weeek_draft_created draft_id=%s", draft_id)
     _log_event(
         "weeek_capture_started",
         transcript=raw_text,
         transcript_clean=content_text,
         target=draft.get("target", ""),
-        project_candidate=((route.get("project") or {}).get("project_name") or capture.get("project_name_candidate") or ""),
+        project_candidate=(auto_project or {}).get("project_name", ""),
         column_hint=draft.get("column_hint", ""),
         speech_engine=capture.get("speech_engine", ""),
     )
 
-    next_state = await _send_weeek_project_picker(update.message, context)
+    if auto_project:
+        if draft.get("target") == "weeek_subtask":
+            next_state = await _send_weeek_parent_picker(update.message, context)
+        else:
+            next_state = await _send_weeek_column_picker(update.message, context)
+    else:
+        next_state = await _send_weeek_project_picker(update.message, context)
     return next_state if return_state else ConversationHandler.END
 
 
@@ -3949,7 +3717,6 @@ async def _transcribe_or_warn(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return None
 
-    await update.message.reply_text("Распознаю голосовое...")
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
     voice = update.message.voice or update.message.audio
     if not voice:
@@ -4066,7 +3833,7 @@ async def clarify_reminder_time_voice(update: Update, context: ContextTypes.DEFA
 async def classify_capture(update: Update, text: str, forced_type: str | None = None) -> dict:
     user_id = update.effective_user.id
     default_timezone = effective_user_timezone(user_id)
-    _log_event("capture_gpt_parse_started", model=OPENAI_PARSE_MODEL, forced_type=forced_type or "")
+    _log_event("capture_gpt_parse_started", model=OPENAI_PARSE_MODEL, forced_type=forced_type or "", transcript=text)
     parsed = await parse_capture_with_gpt(text, default_timezone)
     if parsed:
         capture = parsed
@@ -4107,45 +3874,85 @@ async def classify_capture(update: Update, text: str, forced_type: str | None = 
     capture["due_time"] = due_time
     capture["due_date"] = due_date
     capture["timezone"] = timezone
-    capture["body"] = capture.get("body") or text
-    capture["title"] = _compact_spaces(capture.get("title") or generate_capture_title(text, capture["type"]))
-    capture["target"] = capture.get("target") or ""
-    capture["project_name_candidate"] = capture.get("project_name_candidate") or ""
-    capture["board_name_candidate"] = capture.get("board_name_candidate") or ""
-    capture["column_hint"] = capture.get("column_hint") or normalize_weeek_column_hint(text)
-    capture["parent_task_candidate"] = capture.get("parent_task_candidate") or extract_parent_task_candidate(text)
-    capture["transcript_clean"] = _compact_spaces(capture.get("transcript_clean") or text)
-    capture["transcript"] = _compact_spaces(capture.get("transcript") or text)
-    capture["confidence"] = _coerce_confidence(capture.get("confidence"), 0.75)
-    capture["time_confidence"] = _coerce_confidence(capture.get("time_confidence"), _rule_time_confidence(text, due_time))
-    if capture["type"] != "reminder":
-        capture["needs_time_clarification"] = False
     return capture
 
 
 async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        if not voice_available():
-            await update.message.reply_text(
-                "🎤 Голосовой ввод сейчас не настроен. Команда /voice покажет, как включить.",
-                reply_markup=main_menu_keyboard(),
-            )
-            return
-
-        _hard_reset_weeek_flow(context, "new_top_level_voice")
-        logger.info("weeek_new_voice_hard_reset user_id=%s", update.effective_user.id)
-        text = await _transcribe_or_warn(update, context)
-        if not text:
-            return ConversationHandler.END
-
-        return await _start_weeek_capture(update, context, text, return_state=False)
-    except Exception:
-        logger.exception("Voice top-level flow failed")
+    if not voice_available():
         await update.message.reply_text(
-            "Не удалось обработать голосовое. Попробуй ещё раз или введи текстом.",
+            "🎤 Голосовой ввод сейчас не настроен. Команда /voice покажет, как включить.",
             reply_markup=main_menu_keyboard(),
         )
+        return
+
+    _clear_active_flow(context)
+    await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
+    text = await _transcribe_or_warn(update, context)
+    if not text:
         return ConversationHandler.END
+
+    route = detect_top_level_route(text)
+    _log_event(
+        "voice_route_detected",
+        previous_state="top_level",
+        active_flow=context.user_data.get("_active_flow", ""),
+        new_target=route.get("target", ""),
+        project=((route.get("project") or {}).get("project_name") or ""),
+        column_hint=route.get("column_hint", ""),
+    )
+    if route.get("target") in {"weeek_task", "weeek_subtask"}:
+        return await _start_weeek_capture(update, context, text, return_state=False)
+
+    user_id = update.effective_user.id
+    db.upsert_user(user_id)
+    forced_type = "task" if route.get("target") == "local_task" else "reminder" if route.get("target") == "reminder" else None
+    capture = await classify_capture(update, text, forced_type=forced_type)
+    capture_type = capture["type"]
+    speech_engine = context.user_data.pop("_last_speech_engine", "")
+    capture["speech_engine"] = speech_engine
+    capture["transcript"] = text
+    capture["transcript_clean"] = capture.get("transcript_clean") or text
+    _log_voice_capture(text, capture, speech_engine)
+
+    if _needs_reminder_time_clarification(capture):
+        context.user_data["pending_reminder_capture"] = capture
+        context.user_data["pending_reminder_attempts"] = 0
+        _set_active_flow(context, "clarify_reminder_time")
+        await _ask_reminder_time_clarification(update, context)
+        return CLARIFY_REMINDER_TIME
+
+    if capture_type in {"task", "reminder"}:
+        task_id = _create_task_from_capture(user_id, capture)
+        await _send_created_task(update, capture, task_id, recognized_text=text, reminder=capture_type == "reminder")
+        _clear_active_flow(context)
+        return ConversationHandler.END
+
+    brief = capture["title"]
+    details = capture["body"]
+    if _openai_client and capture.get("source") != "gpt":
+        parsed = await parse_idea_with_gpt(text)
+        if parsed:
+            brief, details = parsed
+
+    if not brief:
+        first = text.split(".")[0].strip() or text.strip()
+        brief = first[:120]
+        details = text.strip()
+
+    idea_id = db.add_idea(user_id, brief, details)
+    schedule_user_reminders(context.application, user_id)
+    await update.message.reply_html(
+        f"✅ Идея сохранена!\n\n{brief_message(brief)}",
+        reply_markup=main_menu_keyboard(),
+    )
+    if details and details.casefold() != brief.casefold():
+        await update.message.reply_html(f"<b>Описание:</b> {html.escape(details)}", reply_markup=main_menu_keyboard())
+    transcription = transcription_message(text, speech_engine)
+    if transcription:
+        await update.message.reply_html(transcription.lstrip(), reply_markup=main_menu_keyboard())
+    await update.message.reply_text("Что дальше?", reply_markup=post_save_keyboard(idea_id))
+    _clear_active_flow(context)
+    return ConversationHandler.END
 
 
 async def weeek_project_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4290,19 +4097,14 @@ async def weeek_preview_callback(update: Update, context: ContextTypes.DEFAULT_T
             )
     except WeeekApiError as exc:
         _log_event("weeek_task_create_failed", error=str(exc))
-        if not _weeek_draft_is_current(context, callback_draft_id):
-            logger.info("weeek_background_task_skipped_stale draft_id=%s step=create_error", callback_draft_id)
-            return ConversationHandler.END
         await query.message.reply_text(
             f"Не удалось создать задачу в Weeek: {exc}",
             reply_markup=main_menu_keyboard(),
         )
-        _hard_reset_weeek_flow(context, "create_failed")
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
         return ConversationHandler.END
 
-    if not _weeek_draft_is_current(context, callback_draft_id):
-        logger.info("weeek_background_task_skipped_stale draft_id=%s step=create_finished", callback_draft_id)
-        return ConversationHandler.END
     title = build_weeek_task_title(capture)
     task_id = client.extract_task_display_id(response)
     _log_event("weeek_task_create_succeeded", task_id=task_id, title=title)
@@ -4318,8 +4120,8 @@ async def weeek_preview_callback(update: Update, context: ContextTypes.DEFAULT_T
     transcription = transcription_message(capture.get("transcript_clean") or capture.get("transcript") or "", capture.get("speech_engine", ""))
     if transcription:
         await query.message.reply_html(transcription.lstrip(), reply_markup=main_menu_keyboard())
-    if _weeek_draft_is_current(context, callback_draft_id):
-        _hard_reset_weeek_flow(context, "create_succeeded")
+    _clear_weeek_draft(context)
+    _clear_active_flow(context)
     return ConversationHandler.END
 
 
@@ -4328,599 +4130,65 @@ async def text_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return ConversationHandler.END
 
-    _hard_reset_weeek_flow(context, "new_top_level_text")
-    return await _start_weeek_capture(update, context, text, return_state=False)
+    route = detect_top_level_route(text)
+    if route.get("target") in {"weeek_task", "weeek_subtask"}:
+        return await _start_weeek_capture(update, context, text, return_state=False)
 
+    user_id = update.effective_user.id
+    db.upsert_user(user_id)
 
-async def legacy_mode_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Локальные идеи, задачи и напоминания отключены. Теперь Mira создаёт задачи только в Weeek.",
+    forced_type = "task" if route.get("target") == "local_task" else "reminder" if route.get("target") == "reminder" else None
+    capture = await classify_capture(update, text, forced_type=forced_type)
+    capture_type = capture["type"]
+    logger.info(
+        "text_capture raw_text=%r type=%s title=%r body=%r due_date=%s due_time=%s timezone=%s source=%s confidence=%.2f time_confidence=%.2f needs_time_clarification=%s",
+        text,
+        capture.get("type", ""),
+        capture.get("title", ""),
+        capture.get("body", ""),
+        capture.get("due_date", ""),
+        capture.get("due_time", ""),
+        capture.get("timezone", ""),
+        capture.get("source", ""),
+        _coerce_confidence(capture.get("confidence"), 0.0),
+        _coerce_confidence(capture.get("time_confidence"), 0.0),
+        bool(capture.get("needs_time_clarification")),
+    )
+
+    if _needs_reminder_time_clarification(capture):
+        context.user_data["pending_reminder_capture"] = capture
+        context.user_data["pending_reminder_attempts"] = 0
+        _set_active_flow(context, "clarify_reminder_time")
+        await _ask_reminder_time_clarification(update, context)
+        return CLARIFY_REMINDER_TIME
+
+    if capture_type in {"task", "reminder"}:
+        task_id = _create_task_from_capture(user_id, capture)
+        await _send_created_task(update, capture, task_id, reminder=capture_type == "reminder")
+        return ConversationHandler.END
+
+    brief = capture["title"]
+    details = capture["body"]
+    if _openai_client and capture.get("source") != "gpt":
+        parsed = await parse_idea_with_gpt(text)
+        if parsed:
+            brief, details = parsed
+
+    if not brief:
+        first = text.split(".")[0].strip() or text.strip()
+        brief = first[:120]
+        details = text.strip()
+
+    idea_id = db.add_idea(user_id, brief, details)
+    schedule_user_reminders(context.application, user_id)
+    await update.message.reply_html(
+        f"✅ Идея сохранена!\n\n{brief_message(brief)}",
         reply_markup=main_menu_keyboard(),
     )
+    if details and details.casefold() != brief.casefold():
+        await update.message.reply_html(f"<b>Описание:</b> {html.escape(details)}", reply_markup=main_menu_keyboard())
+    await update.message.reply_text("Что дальше?", reply_markup=post_save_keyboard(idea_id))
     return ConversationHandler.END
-
-
-async def _send_weeek_board_picker(message, context: ContextTypes.DEFAULT_TYPE):
-    draft = _get_weeek_draft(context)
-    draft_id = draft.get("draft_id", "")
-    project_id = draft.get("project_id")
-    client = get_weeek_client()
-    logger.info("weeek_boards_loading_started project_id=%r", project_id)
-    try:
-        boards = await client.list_boards(project_id)
-        logger.info("weeek_boards_loading_finished project_id=%r count=%s", project_id, len(boards))
-    except WeeekApiError as exc:
-        logger.warning("weeek_boards_loading_failed project_id=%r error=%s", project_id, exc)
-        try:
-            await message.reply_text(
-                f"Не удалось получить доски Weeek: {exc}",
-                reply_markup=main_menu_keyboard(),
-                read_timeout=4,
-                write_timeout=4,
-                connect_timeout=4,
-                pool_timeout=4,
-            )
-        except TelegramError as telegram_exc:
-            logger.warning("weeek_boards_error_message_failed project_id=%r error=%s", project_id, telegram_exc)
-        if _weeek_draft_is_current(context, draft_id):
-            _hard_reset_weeek_flow(context, "boards_load_failed")
-        return ConversationHandler.END
-    if not _weeek_draft_is_current(context, draft_id):
-        logger.info("weeek_background_task_skipped_stale draft_id=%s step=boards", draft_id)
-        return ConversationHandler.END
-    if not boards:
-        logger.warning("weeek_boards_empty project_id=%r", project_id)
-        try:
-            await message.reply_text(
-                "Для выбранного проекта не нашёл доски Weeek. Проверь структуру проекта в Weeek.",
-                reply_markup=main_menu_keyboard(),
-                read_timeout=4,
-                write_timeout=4,
-                connect_timeout=4,
-                pool_timeout=4,
-            )
-        except TelegramError as telegram_exc:
-            logger.warning("weeek_boards_empty_message_failed project_id=%r error=%s", project_id, telegram_exc)
-        if _weeek_draft_is_current(context, draft_id):
-            _hard_reset_weeek_flow(context, "boards_empty")
-        return ConversationHandler.END
-    logger.info("weeek_draft_board_state_update_started project_id=%r", project_id)
-    draft["boards"] = [{"id": option.id, "name": option.name, "raw": option.raw} for option in boards]
-    logger.info("weeek_draft_board_state_update_finished project_id=%r count=%s", project_id, len(draft["boards"]))
-    logger.info("weeek_board_message_send_started project_id=%r", project_id)
-    await message.reply_text(
-        "Теперь выбери доску:",
-        reply_markup=_weeek_options_keyboard(draft["boards"], "weeek_board", draft.get("draft_id", "")),
-        read_timeout=4,
-        write_timeout=4,
-        connect_timeout=4,
-        pool_timeout=4,
-    )
-    logger.info("weeek_board_message_send_finished project_id=%r", project_id)
-    return WEEEK_BOARD
-
-
-async def _send_weeek_column_picker(message, context: ContextTypes.DEFAULT_TYPE):
-    draft = _get_weeek_draft(context)
-    draft_id = draft.get("draft_id", "")
-    board_id = draft.get("board_id")
-    client = get_weeek_client()
-    logger.info("weeek_columns_loading_started board_id=%r", board_id)
-    try:
-        columns = await client.list_columns(board_id)
-        logger.info("weeek_columns_loading_finished board_id=%r count=%s", board_id, len(columns))
-    except WeeekApiError as exc:
-        logger.warning("weeek_columns_loading_failed board_id=%r error=%s", board_id, exc)
-        try:
-            await message.reply_text(
-                f"Не удалось получить колонки Weeek: {exc}",
-                reply_markup=main_menu_keyboard(),
-                read_timeout=4,
-                write_timeout=4,
-                connect_timeout=4,
-                pool_timeout=4,
-            )
-        except TelegramError as telegram_exc:
-            logger.warning("weeek_columns_error_message_failed board_id=%r error=%s", board_id, telegram_exc)
-        if _weeek_draft_is_current(context, draft_id):
-            _hard_reset_weeek_flow(context, "columns_load_failed")
-        return ConversationHandler.END
-    if not _weeek_draft_is_current(context, draft_id):
-        logger.info("weeek_background_task_skipped_stale draft_id=%s step=columns", draft_id)
-        return ConversationHandler.END
-    if not columns:
-        logger.warning("weeek_columns_empty board_id=%r", board_id)
-        try:
-            await message.reply_text(
-                "Не смог получить колонки этой доски Weeek. Возможно, API вернул непривычный формат.",
-                reply_markup=main_menu_keyboard(),
-                read_timeout=4,
-                write_timeout=4,
-                connect_timeout=4,
-                pool_timeout=4,
-            )
-        except TelegramError as telegram_exc:
-            logger.warning("weeek_columns_empty_message_failed board_id=%r error=%s", board_id, telegram_exc)
-        if _weeek_draft_is_current(context, draft_id):
-            _hard_reset_weeek_flow(context, "columns_empty")
-        return ConversationHandler.END
-    logger.info("weeek_draft_column_state_update_started board_id=%r", board_id)
-    mapped = [{"id": option.id, "name": option.name, "raw": option.raw} for option in columns]
-    draft["columns"] = _sort_weeek_columns(mapped, draft.get("column_hint", ""))
-    logger.info("weeek_draft_column_state_update_finished board_id=%r count=%s", board_id, len(draft["columns"]))
-    hint = draft.get("column_hint", "")
-    if hint:
-        matched = [column for column in draft["columns"] if _column_matches_hint(column.get("name", ""), hint)]
-        if len(matched) == 1:
-            draft["column_id"] = matched[0]["id"]
-            draft["column_name"] = matched[0]["name"]
-            logger.info("weeek_column_auto_selected board_id=%r column_id=%r column_name=%r", board_id, matched[0]["id"], matched[0]["name"])
-            return await _show_weeek_preview(message, context)
-    logger.info("weeek_column_message_send_started board_id=%r", board_id)
-    await message.reply_text(
-        "И последним шагом выбери колонку:",
-        reply_markup=_weeek_options_keyboard(draft["columns"], "weeek_column", draft.get("draft_id", "")),
-        read_timeout=4,
-        write_timeout=4,
-        connect_timeout=4,
-        pool_timeout=4,
-    )
-    logger.info("weeek_column_message_send_finished board_id=%r", board_id)
-    return WEEEK_COLUMN
-
-
-async def _send_weeek_parent_picker(message, context: ContextTypes.DEFAULT_TYPE):
-    draft = _get_weeek_draft(context)
-    draft_id = draft.get("draft_id", "")
-    project_id = draft.get("project_id", "")
-    board_id = draft.get("board_id", "")
-    client = get_weeek_client()
-    logger.info("weeek_parent_tasks_loading_started project_id=%r board_id=%r", project_id, board_id)
-    try:
-        tasks = await client.list_tasks(project_id, board_id)
-        logger.info("weeek_parent_tasks_loading_finished project_id=%r board_id=%r count=%s", project_id, board_id, len(tasks))
-    except WeeekApiError as exc:
-        logger.warning("weeek_parent_tasks_loading_failed project_id=%r board_id=%r error=%s", project_id, board_id, exc)
-        try:
-            await message.reply_text(
-                f"Не удалось получить задачи Weeek: {exc}",
-                reply_markup=main_menu_keyboard(),
-                read_timeout=4,
-                write_timeout=4,
-                connect_timeout=4,
-                pool_timeout=4,
-            )
-        except TelegramError as telegram_exc:
-            logger.warning("weeek_parent_tasks_error_message_failed project_id=%r board_id=%r error=%s", project_id, board_id, telegram_exc)
-        if _weeek_draft_is_current(context, draft_id):
-            _hard_reset_weeek_flow(context, "parents_load_failed")
-        return ConversationHandler.END
-    if not _weeek_draft_is_current(context, draft_id):
-        logger.info("weeek_background_task_skipped_stale draft_id=%s step=parents", draft_id)
-        return ConversationHandler.END
-    if not tasks:
-        logger.warning("weeek_parent_tasks_empty project_id=%r board_id=%r", project_id, board_id)
-        try:
-            await message.reply_text(
-                "Не смог получить список задач в этой доске Weeek.",
-                reply_markup=main_menu_keyboard(),
-                read_timeout=4,
-                write_timeout=4,
-                connect_timeout=4,
-                pool_timeout=4,
-            )
-        except TelegramError as telegram_exc:
-            logger.warning("weeek_parent_tasks_empty_message_failed project_id=%r board_id=%r error=%s", project_id, board_id, telegram_exc)
-        if _weeek_draft_is_current(context, draft_id):
-            _hard_reset_weeek_flow(context, "parents_empty")
-        return ConversationHandler.END
-    logger.info("weeek_draft_parent_state_update_started project_id=%r board_id=%r", project_id, board_id)
-    mapped = [{"id": option.id, "name": option.name, "raw": option.raw} for option in tasks]
-    draft["parent_tasks"] = mapped
-    logger.info("weeek_draft_parent_state_update_finished project_id=%r board_id=%r count=%s", project_id, board_id, len(mapped))
-    candidate = draft.get("parent_task_candidate") or ""
-    parent_task, match_source = _match_parent_task(mapped, candidate)
-    if parent_task:
-        draft["parent_task_id"] = parent_task["id"]
-        draft["parent_task_name"] = parent_task["name"]
-        draft["parent_task_match_source"] = match_source
-        logger.info("weeek_parent_auto_selected project_id=%r board_id=%r parent_id=%r parent_name=%r", project_id, board_id, parent_task["id"], parent_task["name"])
-        return await _send_weeek_column_picker(message, context)
-    logger.info("weeek_parent_message_send_started project_id=%r board_id=%r candidate=%r", project_id, board_id, candidate)
-    if candidate:
-        await message.reply_text(
-            "Не смог однозначно найти родительскую задачу. Выбери её вручную:",
-            reply_markup=_weeek_options_keyboard(mapped, "weeek_parent", draft.get("draft_id", "")),
-            read_timeout=4,
-            write_timeout=4,
-            connect_timeout=4,
-            pool_timeout=4,
-        )
-    else:
-        await message.reply_text(
-            "Выбери родительскую задачу:",
-            reply_markup=_weeek_options_keyboard(mapped, "weeek_parent", draft.get("draft_id", "")),
-            read_timeout=4,
-            write_timeout=4,
-            connect_timeout=4,
-            pool_timeout=4,
-        )
-    logger.info("weeek_parent_message_send_finished project_id=%r board_id=%r", project_id, board_id)
-    return WEEEK_PARENT
-
-
-async def weeek_project_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    logger.info(
-        "weeek_project_callback_received data=%r user_id=%s message_id=%s",
-        query.data,
-        query.from_user.id if query.from_user else None,
-        query.message.message_id if query.message else None,
-    )
-    logger.info("weeek_project_callback_answer_started query_id=%r", query.id)
-    try:
-        await query.answer(read_timeout=4, write_timeout=4, connect_timeout=4, pool_timeout=4)
-        logger.info("weeek_project_callback_answer_finished query_id=%r", query.id)
-    except TimedOut:
-        logger.warning("weeek_project_callback_answer_timed_out query_id=%r", query.id)
-    except TelegramError as exc:
-        logger.warning("weeek_project_callback_answer_failed query_id=%r error=%s", query.id, exc)
-    draft = _get_weeek_draft(context)
-    if not draft:
-        logger.warning("weeek_project_callback_missing_draft query_id=%r", query.id)
-        try:
-            await query.answer(
-                "Черновик задачи Weeek потерян. Начни заново.",
-                show_alert=True,
-                read_timeout=4,
-                write_timeout=4,
-                connect_timeout=4,
-                pool_timeout=4,
-            )
-        except TelegramError as exc:
-            logger.warning("weeek_project_callback_missing_draft_answer_failed query_id=%r error=%s", query.id, exc)
-        _clear_weeek_draft(context)
-        _clear_active_flow(context)
-        return ConversationHandler.END
-    project_id = (query.data or "").split(":", 1)[1]
-    project = next((item for item in draft.get("projects", []) if item["id"] == project_id), None)
-    if not project:
-        logger.warning("weeek_project_callback_stale_project project_id=%r", project_id)
-        try:
-            await query.answer(
-                "Проект устарел, выбери ещё раз.",
-                show_alert=True,
-                read_timeout=4,
-                write_timeout=4,
-                connect_timeout=4,
-                pool_timeout=4,
-            )
-        except TelegramError as exc:
-            logger.warning("weeek_project_callback_stale_project_answer_failed project_id=%r error=%s", project_id, exc)
-        return await _send_weeek_project_picker(query.message, context)
-    logger.info("weeek_draft_project_state_update_started project_id=%r project_name=%r", project["id"], project["name"])
-    draft["project_id"] = project["id"]
-    draft["project_name"] = project["name"]
-    logger.info("weeek_draft_project_state_update_finished project_id=%r project_name=%r", project["id"], project["name"])
-    _log_event("weeek_project_selected", project_id=project["id"], project_name=project["name"])
-    known_project = WEEEK_TARGETS.get(str(project["id"]))
-    if known_project:
-        logger.info(
-            "weeek_known_project_mapping_found project_id=%r board_id=%r board_name=%r",
-            project["id"],
-            known_project["board_id"],
-            known_project["board_name"],
-        )
-        draft["board_id"] = known_project["board_id"]
-        draft["board_name"] = known_project["board_name"]
-        logger.info("weeek_draft_known_project_state_update_finished project_id=%r board_id=%r", project["id"], known_project["board_id"])
-        try:
-            if draft.get("target") == "weeek_subtask":
-                return await _send_weeek_parent_picker(query.message, context)
-            return await _send_weeek_column_picker(query.message, context)
-        except TelegramError as exc:
-            logger.warning("weeek_project_callback_known_project_step_failed project_id=%r error=%s", project["id"], exc)
-            _clear_weeek_draft(context)
-            _clear_active_flow(context)
-            return ConversationHandler.END
-    try:
-        return await _send_weeek_board_picker(query.message, context)
-    except TelegramError as exc:
-        logger.warning("weeek_project_callback_board_step_failed project_id=%r error=%s", project["id"], exc)
-        _clear_weeek_draft(context)
-        _clear_active_flow(context)
-        return ConversationHandler.END
-
-def _callback_trace_id(query) -> str:
-    return str(getattr(query, "id", "") or "no-query-id")
-
-
-async def _safe_answer_weeek_project_callback(query, callback_id: str, text: str = "", show_alert: bool = False):
-    logger.info("weeek_project_callback_answer_started callback_id=%s", callback_id)
-    try:
-        kwargs = {
-            "read_timeout": TELEGRAM_SHORT_TIMEOUT,
-            "write_timeout": TELEGRAM_SHORT_TIMEOUT,
-            "connect_timeout": TELEGRAM_SHORT_TIMEOUT,
-            "pool_timeout": TELEGRAM_SHORT_TIMEOUT,
-        }
-        if text:
-            kwargs["text"] = text
-            kwargs["show_alert"] = show_alert
-        await query.answer(**kwargs)
-        logger.info("weeek_project_callback_answer_finished callback_id=%s", callback_id)
-        return True
-    except TimedOut:
-        logger.warning("weeek_project_callback_answer_timed_out callback_id=%s", callback_id)
-        return False
-    except TelegramError as exc:
-        logger.warning("weeek_project_callback_answer_failed callback_id=%s error=%s", callback_id, exc)
-        return False
-
-
-async def _safe_weeek_project_error_message(
-    message,
-    context: ContextTypes.DEFAULT_TYPE,
-    callback_id: str,
-    draft_id: str,
-    text: str,
-):
-    if not _weeek_draft_is_current(context, draft_id):
-        logger.info("weeek_background_task_skipped_stale callback_id=%s draft_id=%s", callback_id, draft_id)
-        return
-    try:
-        await message.reply_text(
-            text,
-            reply_markup=main_menu_keyboard(),
-            read_timeout=TELEGRAM_SHORT_TIMEOUT,
-            write_timeout=TELEGRAM_SHORT_TIMEOUT,
-            connect_timeout=TELEGRAM_SHORT_TIMEOUT,
-            pool_timeout=TELEGRAM_SHORT_TIMEOUT,
-        )
-        logger.info("weeek_project_callback_error_message_sent callback_id=%s", callback_id)
-    except TelegramError as exc:
-        logger.warning("weeek_project_callback_error_message_failed callback_id=%s error=%s", callback_id, exc)
-    finally:
-        if _weeek_draft_is_current(context, draft_id):
-            _hard_reset_weeek_flow(context, "project_background_error")
-            logger.info("weeek_project_callback_state_cleared callback_id=%s draft_id=%s", callback_id, draft_id)
-
-
-async def _run_weeek_project_next_step(message, context: ContextTypes.DEFAULT_TYPE, callback_id: str, draft_id: str):
-    if not _weeek_draft_is_current(context, draft_id):
-        logger.info("weeek_background_task_skipped_stale callback_id=%s draft_id=%s", callback_id, draft_id)
-        return
-    draft = context.user_data.get("weeek_draft") or {}
-    project_id = draft.get("project_id", "")
-    project_name = draft.get("project_name", "")
-    logger.info("weeek_project_callback_next_step_started callback_id=%s project_id=%r", callback_id, project_id)
-    try:
-        known_project = WEEEK_TARGETS.get(str(project_id))
-        if known_project:
-            logger.info(
-                "weeek_known_project_mapping_found callback_id=%s project_id=%r board_id=%r board_name=%r",
-                callback_id,
-                project_id,
-                known_project["board_id"],
-                known_project["board_name"],
-            )
-            draft["board_id"] = known_project["board_id"]
-            draft["board_name"] = known_project["board_name"]
-            logger.info("weeek_draft_known_project_state_update_finished callback_id=%s project_id=%r board_id=%r", callback_id, project_id, known_project["board_id"])
-            if draft.get("target") == "weeek_subtask":
-                await _send_weeek_parent_picker(message, context)
-            else:
-                await _send_weeek_column_picker(message, context)
-        else:
-            await _send_weeek_board_picker(message, context)
-        if not _weeek_draft_is_current(context, draft_id):
-            logger.info("weeek_background_task_skipped_stale callback_id=%s draft_id=%s", callback_id, draft_id)
-            return
-        logger.info("weeek_project_callback_next_step_finished callback_id=%s project_id=%r", callback_id, project_id)
-    except (TelegramError, WeeekApiError) as exc:
-        logger.warning("weeek_project_callback_next_step_failed callback_id=%s project_id=%r error=%s", callback_id, project_id, exc)
-        await _safe_weeek_project_error_message(
-            message,
-            context,
-            callback_id,
-            draft_id,
-            f"Не удалось продолжить создание задачи в Weeek после выбора проекта {project_name or project_id}: {exc}",
-        )
-    except Exception:
-        logger.exception("weeek_project_callback_next_step_unhandled callback_id=%s project_id=%r", callback_id, project_id)
-        await _safe_weeek_project_error_message(
-            message,
-            context,
-            callback_id,
-            draft_id,
-            "Не удалось продолжить создание задачи в Weeek после выбора проекта. Начни заново.",
-        )
-    finally:
-        logger.info("weeek_project_callback_background_exited callback_id=%s", callback_id)
-
-
-async def _bounded_weeek_project_next_step(
-    message,
-    context: ContextTypes.DEFAULT_TYPE,
-    callback_id: str,
-    draft_id: str,
-):
-    try:
-        await asyncio.wait_for(
-            _run_weeek_project_next_step(message, context, callback_id, draft_id),
-            timeout=WEEEK_PROJECT_CALLBACK_TIMEOUT,
-        )
-    except asyncio.CancelledError:
-        logger.info("weeek_background_task_cancelled_exit callback_id=%s draft_id=%s", callback_id, draft_id)
-        raise
-    except asyncio.TimeoutError:
-        logger.warning("weeek_project_callback_background_timed_out callback_id=%s", callback_id)
-        await _safe_weeek_project_error_message(
-            message,
-            context,
-            callback_id,
-            draft_id,
-            "Не удалось продолжить выбор проекта Weeek: операция заняла слишком много времени. Начни заново.",
-        )
-    finally:
-        if context.user_data.get("_weeek_background_draft_id") == draft_id:
-            context.user_data.pop("_weeek_background_task", None)
-            context.user_data.pop("_weeek_background_draft_id", None)
-
-
-async def weeek_project_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    callback_id = _callback_trace_id(query)
-    callback_draft_id, project_id = _parse_weeek_callback_data(query.data or "", "weeek_project")
-    logger.info(
-        "weeek_project_callback_received callback_id=%s data=%r user_id=%s message_id=%s matched_handler=weeek_project_callback current_user_state=%r",
-        callback_id,
-        query.data,
-        query.from_user.id if query.from_user else None,
-        query.message.message_id if query.message else None,
-        context.user_data.get("_active_flow", ""),
-    )
-    if not _weeek_draft_is_current(context, callback_draft_id):
-        await _reject_stale_weeek_callback(query, context, callback_draft_id)
-        logger.info("weeek_project_callback_exited callback_id=%s reason=stale_draft", callback_id)
-        return ConversationHandler.END
-    await _safe_answer_weeek_project_callback(query, callback_id)
-    draft = context.user_data.get("weeek_draft") or {}
-    if not draft:
-        logger.warning("weeek_project_callback_missing_draft callback_id=%s", callback_id)
-        await _safe_answer_weeek_project_callback(
-            query,
-            callback_id,
-            "Черновик задачи Weeek потерян. Начни заново.",
-            show_alert=True,
-        )
-        _clear_weeek_draft(context)
-        _clear_active_flow(context)
-        logger.info("weeek_project_callback_state_cleared callback_id=%s reason=missing_draft", callback_id)
-        logger.info("weeek_project_callback_exited callback_id=%s", callback_id)
-        return ConversationHandler.END
-    project = next((item for item in draft.get("projects", []) if item["id"] == project_id), None)
-    if not project:
-        logger.warning("weeek_project_callback_stale_project callback_id=%s project_id=%r", callback_id, project_id)
-        await _safe_answer_weeek_project_callback(
-            query,
-            callback_id,
-            "Проект устарел. Начни создание задачи заново.",
-            show_alert=True,
-        )
-        _clear_weeek_draft(context)
-        _clear_active_flow(context)
-        logger.info("weeek_project_callback_state_cleared callback_id=%s reason=stale_project", callback_id)
-        logger.info("weeek_project_callback_exited callback_id=%s", callback_id)
-        return ConversationHandler.END
-    logger.info("weeek_draft_project_state_update_started callback_id=%s project_id=%r project_name=%r", callback_id, project["id"], project["name"])
-    draft["project_id"] = project["id"]
-    draft["project_name"] = project["name"]
-    logger.info("weeek_draft_project_state_update_finished callback_id=%s project_id=%r project_name=%r", callback_id, project["id"], project["name"])
-    _log_event("weeek_project_selected", callback_id=callback_id, project_id=project["id"], project_name=project["name"])
-    if not query.message:
-        logger.warning("weeek_project_callback_missing_message callback_id=%s", callback_id)
-        _clear_weeek_draft(context)
-        _clear_active_flow(context)
-        logger.info("weeek_project_callback_state_cleared callback_id=%s reason=missing_message", callback_id)
-        logger.info("weeek_project_callback_exited callback_id=%s", callback_id)
-        return ConversationHandler.END
-    logger.info("weeek_project_callback_next_step_scheduled callback_id=%s", callback_id)
-    background_task = context.application.create_task(
-        _bounded_weeek_project_next_step(query.message, context, callback_id, callback_draft_id)
-    )
-    context.user_data["_weeek_background_task"] = background_task
-    context.user_data["_weeek_background_draft_id"] = callback_draft_id
-    _clear_active_flow(context)
-    logger.info("weeek_project_callback_state_cleared callback_id=%s reason=conversation_released", callback_id)
-    logger.info("weeek_project_callback_exited callback_id=%s", callback_id)
-    return ConversationHandler.END
-
-
-async def weeek_board_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    callback_draft_id, board_id = _parse_weeek_callback_data(query.data or "", "weeek_board")
-    if not _weeek_draft_is_current(context, callback_draft_id):
-        await _reject_stale_weeek_callback(query, context, callback_draft_id)
-        return ConversationHandler.END
-    await _safe_answer_weeek_project_callback(query, _callback_trace_id(query))
-    draft = context.user_data.get("weeek_draft") or {}
-    board = next((item for item in draft.get("boards", []) if item["id"] == board_id), None)
-    if not board:
-        await _reject_stale_weeek_callback(query, context, callback_draft_id)
-        return ConversationHandler.END
-    draft["board_id"] = board["id"]
-    draft["board_name"] = board["name"]
-    _log_event("weeek_board_selected", draft_id=callback_draft_id, board_id=board["id"], board_name=board["name"])
-    if draft.get("target") == "weeek_subtask":
-        return await _send_weeek_parent_picker(query.message, context)
-    return await _send_weeek_column_picker(query.message, context)
-
-
-async def weeek_column_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    callback_draft_id, column_id = _parse_weeek_callback_data(query.data or "", "weeek_column")
-    if not _weeek_draft_is_current(context, callback_draft_id):
-        await _reject_stale_weeek_callback(query, context, callback_draft_id)
-        return ConversationHandler.END
-    await _safe_answer_weeek_project_callback(query, _callback_trace_id(query))
-    draft = context.user_data.get("weeek_draft") or {}
-    column = next((item for item in draft.get("columns", []) if item["id"] == column_id), None)
-    if not column:
-        await _reject_stale_weeek_callback(query, context, callback_draft_id)
-        return ConversationHandler.END
-    draft["column_id"] = column["id"]
-    draft["column_name"] = column["name"]
-    _log_event("weeek_column_selected", draft_id=callback_draft_id, column_id=column["id"], column_name=column["name"])
-    return await _show_weeek_preview(query.message, context)
-
-
-async def weeek_parent_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    callback_draft_id, parent_id = _parse_weeek_callback_data(query.data or "", "weeek_parent")
-    if not _weeek_draft_is_current(context, callback_draft_id):
-        await _reject_stale_weeek_callback(query, context, callback_draft_id)
-        return ConversationHandler.END
-    await _safe_answer_weeek_project_callback(query, _callback_trace_id(query))
-    draft = context.user_data.get("weeek_draft") or {}
-    parent = next((item for item in draft.get("parent_tasks", []) if item["id"] == parent_id), None)
-    if not parent:
-        await _reject_stale_weeek_callback(query, context, callback_draft_id)
-        return ConversationHandler.END
-    draft["parent_task_id"] = parent["id"]
-    draft["parent_task_name"] = parent["name"]
-    draft["parent_task_match_source"] = "manual"
-    _log_event("weeek_parent_selected", draft_id=callback_draft_id, parent_task_id=parent["id"], parent_task_name=parent["name"])
-    return await _send_weeek_column_picker(query.message, context)
-
-
-_unscoped_weeek_preview_callback = weeek_preview_callback
-
-
-async def weeek_preview_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    action = (query.data or "").split(":", 1)[0]
-    callback_draft_id, _ = _parse_weeek_callback_data(query.data or "", action)
-    if not _weeek_draft_is_current(context, callback_draft_id):
-        await _reject_stale_weeek_callback(query, context, callback_draft_id)
-        return ConversationHandler.END
-    if action == "weeek_cancel":
-        await _safe_answer_weeek_project_callback(query, _callback_trace_id(query))
-        _hard_reset_weeek_flow(context, "cancel")
-        logger.info("weeek_cancel_hard_reset draft_id=%s", callback_draft_id)
-        try:
-            await query.message.reply_text(
-                "Ок, отменил создание задачи в Weeek.",
-                reply_markup=main_menu_keyboard(),
-                read_timeout=TELEGRAM_SHORT_TIMEOUT,
-                write_timeout=TELEGRAM_SHORT_TIMEOUT,
-                connect_timeout=TELEGRAM_SHORT_TIMEOUT,
-                pool_timeout=TELEGRAM_SHORT_TIMEOUT,
-            )
-        except TelegramError as exc:
-            logger.warning("weeek_cancel_reply_failed draft_id=%s error=%s", callback_draft_id, exc)
-        return ConversationHandler.END
-    return await _unscoped_weeek_preview_callback(update, context)
 
 
 _legacy_handle_callback = handle_callback
@@ -4940,11 +4208,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await weeek_column_callback(update, context)
     if data.startswith("weeek_"):
         return await weeek_preview_callback(update, context)
-    await query.answer(
-        "Локальный режим отключён. Создай новую задачу в Weeek.",
-        show_alert=True,
-    )
-    return ConversationHandler.END
+    return await _legacy_handle_callback(update, context)
 
 
 def main():
@@ -4961,8 +4225,58 @@ def main():
         .build()
     )
 
+    add_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("add", add_start),
+            MessageHandler(filters.Regex(f"^{BTN_ADD}$"), add_start),
+        ],
+        states={
+            BRIEF: [
+                MessageHandler(filters.VOICE | filters.AUDIO, add_brief_voice),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{BTN_CANCEL}$"),
+                    add_brief_text,
+                ),
+            ],
+            DETAILS: [
+                MessageHandler(filters.VOICE | filters.AUDIO, add_details_voice),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{BTN_CANCEL}$"),
+                    add_details_text,
+                ),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex(f"^{BTN_CANCEL}$"), cancel),
+        ],
+        allow_reentry=True,
+    )
+
+    task_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("addtask", task_add_start),
+            MessageHandler(filters.Regex(f"^{BTN_ADD_TASK}$"), task_add_start),
+        ],
+        states={
+            TASK_TEXT: [
+                MessageHandler(filters.VOICE | filters.AUDIO, task_add_voice),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{BTN_CANCEL}$"),
+                    task_add_text,
+                ),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex(f"^{BTN_CANCEL}$"), cancel),
+        ],
+        allow_reentry=True,
+    )
+
     weeek_conv = ConversationHandler(
         entry_points=[
+            CommandHandler("addweeek", weeek_add_start),
             MessageHandler(filters.Regex(f"^{re.escape(BTN_ADD_WEEEK_TASK)}$"), weeek_add_start),
         ],
         states={
@@ -4975,46 +4289,95 @@ def main():
             ],
             WEEEK_PROJECT: [
                 CallbackQueryHandler(weeek_project_callback, pattern="^weeek_project:"),
-                CallbackQueryHandler(weeek_preview_callback, pattern="^weeek_cancel:"),
+                CallbackQueryHandler(weeek_preview_callback, pattern="^weeek_cancel$"),
             ],
             WEEEK_BOARD: [
                 CallbackQueryHandler(weeek_board_callback, pattern="^weeek_board:"),
-                CallbackQueryHandler(weeek_preview_callback, pattern="^weeek_cancel:"),
+                CallbackQueryHandler(weeek_preview_callback, pattern="^weeek_cancel$"),
             ],
             WEEEK_PARENT: [
                 CallbackQueryHandler(weeek_parent_callback, pattern="^weeek_parent:"),
-                CallbackQueryHandler(weeek_preview_callback, pattern="^weeek_cancel:"),
+                CallbackQueryHandler(weeek_preview_callback, pattern="^weeek_cancel$"),
             ],
             WEEEK_COLUMN: [
                 CallbackQueryHandler(weeek_column_callback, pattern="^weeek_column:"),
-                CallbackQueryHandler(weeek_preview_callback, pattern="^weeek_cancel:"),
+                CallbackQueryHandler(weeek_preview_callback, pattern="^weeek_cancel$"),
             ],
             WEEEK_PREVIEW: [
-                CallbackQueryHandler(weeek_preview_callback, pattern="^weeek_(create|repick_column|repick_parent|cancel):"),
+                CallbackQueryHandler(weeek_preview_callback, pattern="^weeek_(create|repick_column|repick_parent|cancel)$"),
             ],
         },
         fallbacks=[
-            CommandHandler("start", start_conversation_recovery),
             CommandHandler("cancel", cancel),
             MessageHandler(filters.Regex(f"^{BTN_CANCEL}$"), cancel),
         ],
         allow_reentry=True,
     )
 
-    application.add_handler(CommandHandler("start", start), group=-1)
-    application.add_handler(CommandHandler("help", show_help))
-    application.add_handler(CommandHandler("voice", voice_instructions))
-    application.add_handler(CommandHandler("cancel", cancel))
-
-    application.add_handler(weeek_conv)
-    application.add_handler(MessageHandler(filters.Regex(LEGACY_MENU_BUTTON_PATTERN), legacy_mode_disabled))
-    application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, voice_top_level))
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND & ~filters.Regex(MENU_BUTTON_PATTERN),
-            text_top_level,
-        )
+    add_reminder_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(reminders_add_start, pattern="^rem_add$")],
+        states={
+            ADD_REMINDER_TIME: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{BTN_CANCEL}$"),
+                    reminders_add_apply,
+                ),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex(f"^{BTN_CANCEL}$"), cancel),
+        ],
+        allow_reentry=True,
     )
+
+    capture_conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.VOICE | filters.AUDIO, voice_top_level),
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND & ~filters.Regex(MENU_BUTTON_PATTERN),
+                text_top_level,
+            ),
+        ],
+        states={
+            CLARIFY_REMINDER_TIME: [
+                CallbackQueryHandler(clarify_reminder_time_callback, pattern="^clarify_(save_without_time|cancel)$"),
+                MessageHandler(filters.VOICE | filters.AUDIO, clarify_reminder_time_voice),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{BTN_CANCEL}$"),
+                    clarify_reminder_time_text,
+                ),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex(f"^{BTN_CANCEL}$"), cancel),
+        ],
+        allow_reentry=True,
+    )
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", show_help))
+    application.add_handler(CommandHandler("list", list_ideas))
+    application.add_handler(CommandHandler("test", test_reminder))
+    application.add_handler(CommandHandler("reminders", reminders_show))
+    application.add_handler(CommandHandler("settime", reminders_show))
+    application.add_handler(CommandHandler("voice", voice_instructions))
+    application.add_handler(CommandHandler("tasks", list_tasks))
+
+    application.add_handler(add_conv)
+    application.add_handler(task_conv)
+    application.add_handler(weeek_conv)
+    application.add_handler(add_reminder_conv)
+    application.add_handler(capture_conv)
+
+    # Кнопки главного меню (вне диалогов)
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_LIST}$"), list_ideas))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_LIST_TASKS}$"), list_tasks))
+    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_ADD_WEEEK_TASK)}$"), weeek_add_start))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_TEST}$"), test_reminder))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_HELP}$"), show_help))
+    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_REMINDERS}$"), reminders_show))
 
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_error_handler(error_handler)

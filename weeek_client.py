@@ -70,19 +70,14 @@ class WeeekClient:
 
     async def _request(self, method: str, path: str, *, params: dict | None = None, json_body: dict | None = None):
         url = f"{self.base_url}/{path.lstrip('/')}"
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=10.0)) as client:
-                response = await client.request(
-                    method,
-                    url,
-                    headers=self._headers(),
-                    params=params,
-                    json=json_body,
-                )
-        except httpx.TimeoutException as exc:
-            raise WeeekApiError("Weeek API timed out") from exc
-        except httpx.HTTPError as exc:
-            raise WeeekApiError(f"Weeek API request failed: {exc.__class__.__name__}") from exc
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.request(
+                method,
+                url,
+                headers=self._headers(),
+                params=params,
+                json=json_body,
+            )
         if response.status_code >= 400:
             snippet = response.text[:300]
             raise WeeekApiError(f"{response.status_code} {snippet}")
