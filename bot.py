@@ -575,6 +575,16 @@ def match_weeek_target(text: str) -> dict | None:
     return None
 
 
+def _should_auto_select_project_board(project: dict | None) -> bool:
+    if not project:
+        return False
+    return bool(
+        str(project.get("project_id") or "") == "5"
+        and project.get("board_id")
+        and project.get("board_name")
+    )
+
+
 def extract_parent_task_candidate(text: str) -> str:
     normalized = _compact_spaces(text)
     quoted = re.search(r"[\"«](.+?)[\"»]", normalized)
@@ -2704,7 +2714,7 @@ async def weeek_project_callback(update: Update, context: ContextTypes.DEFAULT_T
     draft["project_id"] = project["id"]
     draft["project_name"] = project["name"]
     known_project = WEEEK_TARGETS.get(str(project["id"]))
-    if known_project:
+    if _should_auto_select_project_board(known_project):
         draft["board_id"] = known_project["board_id"]
         draft["board_name"] = known_project["board_name"]
         if draft.get("target") == "weeek_subtask":
@@ -4431,7 +4441,7 @@ async def weeek_project_callback(update: Update, context: ContextTypes.DEFAULT_T
     draft["project_name"] = project["name"]
     _log_event("weeek_project_selected", project_id=project["id"], project_name=project["name"])
     known_project = WEEEK_TARGETS.get(str(project["id"]))
-    if known_project:
+    if _should_auto_select_project_board(known_project):
         draft["board_id"] = known_project["board_id"]
         draft["board_name"] = known_project["board_name"]
         if draft.get("target") == "weeek_subtask":

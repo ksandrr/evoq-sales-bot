@@ -3,6 +3,7 @@ import os
 import sys
 import types
 import unittest
+from unittest.mock import AsyncMock, patch
 
 
 class _Dummy:
@@ -660,6 +661,59 @@ class WeeekClientTransportTests(unittest.TestCase):
         self.assertEqual(calls["kwargs"]["timeout"], 30.0)
         self.assertFalse(calls["kwargs"]["trust_env"])
         self.assertIn("Weeek request failed", str(ctx.exception))
+
+class WeeekProjectBoardSelectionTests(unittest.TestCase):
+    def test_personal_project_opens_board_picker(self):
+        draft = {
+            "projects": [
+                {"id": "6", "name": "Ð›Ð¸Ñ‡Ð½Ð¾Ðµ", "raw": {}},
+            ],
+            "target": "weeek_task",
+        }
+        context = types.SimpleNamespace(user_data={"weeek_draft": draft})
+        query = types.SimpleNamespace(
+            data="weeek_project:6",
+            answer=AsyncMock(),
+            message=object(),
+        )
+        update = types.SimpleNamespace(callback_query=query)
+
+        with patch.object(bot, "_send_weeek_board_picker", AsyncMock(return_value=bot.WEEEK_BOARD)) as board_picker, patch.object(
+            bot, "_send_weeek_column_picker", AsyncMock(return_value=bot.WEEEK_COLUMN)
+        ) as column_picker:
+            result = asyncio.run(bot.weeek_project_callback(update, context))
+
+        self.assertEqual(result, bot.WEEEK_BOARD)
+        self.assertEqual(draft["project_id"], "6")
+        self.assertEqual(draft["project_name"], "Ð›Ð¸Ñ‡Ð½Ð¾Ðµ")
+        board_picker.assert_awaited_once()
+        column_picker.assert_not_awaited()
+
+    def test_vibecoding_project_keeps_auto_board(self):
+        draft = {
+            "projects": [
+                {"id": "5", "name": "Vibecoding SANYA&EGOR", "raw": {}},
+            ],
+            "target": "weeek_task",
+        }
+        context = types.SimpleNamespace(user_data={"weeek_draft": draft})
+        query = types.SimpleNamespace(
+            data="weeek_project:5",
+            answer=AsyncMock(),
+            message=object(),
+        )
+        update = types.SimpleNamespace(callback_query=query)
+
+        with patch.object(bot, "_send_weeek_board_picker", AsyncMock(return_value=bot.WEEEK_BOARD)) as board_picker, patch.object(
+            bot, "_send_weeek_column_picker", AsyncMock(return_value=bot.WEEEK_COLUMN)
+        ) as column_picker:
+            result = asyncio.run(bot.weeek_project_callback(update, context))
+
+        self.assertEqual(result, bot.WEEEK_COLUMN)
+        self.assertEqual(draft["board_id"], "9")
+        self.assertEqual(draft["board_name"], "SaaS Deck - Ð·Ð°Ð´Ð°Ñ‡Ð¸")
+        column_picker.assert_awaited_once()
+        board_picker.assert_not_awaited()
 
 
 class WeeekPayloadTests(unittest.TestCase):
