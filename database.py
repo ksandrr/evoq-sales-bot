@@ -74,6 +74,9 @@ def init_db():
                 due_time TEXT NOT NULL DEFAULT '',
                 timezone TEXT NOT NULL DEFAULT '',
                 notified_at TEXT NOT NULL DEFAULT '',
+                reminder_day_sent_at TEXT NOT NULL DEFAULT '',
+                reminder_30_sent_at TEXT NOT NULL DEFAULT '',
+                reminder_15_sent_at TEXT NOT NULL DEFAULT '',
                 done INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             )
@@ -93,6 +96,12 @@ def init_db():
             c.execute("ALTER TABLE tasks ADD COLUMN timezone TEXT NOT NULL DEFAULT ''")
         if "notified_at" not in task_cols:
             c.execute("ALTER TABLE tasks ADD COLUMN notified_at TEXT NOT NULL DEFAULT ''")
+        if "reminder_day_sent_at" not in task_cols:
+            c.execute("ALTER TABLE tasks ADD COLUMN reminder_day_sent_at TEXT NOT NULL DEFAULT ''")
+        if "reminder_30_sent_at" not in task_cols:
+            c.execute("ALTER TABLE tasks ADD COLUMN reminder_30_sent_at TEXT NOT NULL DEFAULT ''")
+        if "reminder_15_sent_at" not in task_cols:
+            c.execute("ALTER TABLE tasks ADD COLUMN reminder_15_sent_at TEXT NOT NULL DEFAULT ''")
 
         # Миграция: если в старой схеме были reminder_hour/reminder_minute —
         # перенесём их в таблицу reminders, чтобы существующие напоминания не пропали.
@@ -294,12 +303,13 @@ def get_due_tasks():
                 COALESCE(NULLIF(body, ''), text) AS body,
                 due_date,
                 due_time,
-                timezone
+                timezone,
+                reminder_day_sent_at,
+                reminder_30_sent_at,
+                reminder_15_sent_at
             FROM tasks
             WHERE done = 0
-              AND due_time != ''
               AND due_date != ''
-              AND notified_at = ''
             ORDER BY due_date, due_time, id
             """
         ).fetchall()
@@ -310,6 +320,23 @@ def mark_task_notified(task_id: int, user_id: int):
         c.execute(
             "UPDATE tasks SET notified_at = ? WHERE id = ? AND user_id = ?",
             (datetime.utcnow().isoformat(), task_id, user_id),
+        )
+
+
+def mark_task_reminder_sent(task_id: int, user_id: int, reminder_kind: str):
+    columns = {
+        "day": "reminder_day_sent_at",
+        "pre30": "reminder_30_sent_at",
+        "pre15": "reminder_15_sent_at",
+    }
+    column = columns.get(reminder_kind)
+    if not column:
+        raise ValueError(f"Unknown reminder kind: {reminder_kind}")
+    now_iso = datetime.utcnow().isoformat()
+    with _conn() as c:
+        c.execute(
+            f"UPDATE tasks SET {column} = ?, notified_at = CASE WHEN notified_at = '' THEN ? ELSE notified_at END WHERE id = ? AND user_id = ?",
+            (now_iso, now_iso, task_id, user_id),
         )
 
 

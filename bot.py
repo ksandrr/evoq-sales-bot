@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import urllib.request
 import zipfile
-from datetime import datetime, timedelta, time
+from datetime import date, datetime, timedelta, time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
@@ -1903,12 +1903,70 @@ async def check_task_reminders(context: ContextTypes.DEFAULT_TYPE):
             logger.exception("Не удалось отправить напоминание по задаче %s пользователю %s", task_id, user_id)
 
 
+async def check_task_reminders_v2(context: ContextTypes.DEFAULT_TYPE):
+    for task in db.get_due_tasks():
+        (
+            task_id,
+            user_id,
+            title,
+            _done,
+            body,
+            due_date,
+            due_time,
+            timezone,
+            reminder_day_sent_at,
+            reminder_30_sent_at,
+            reminder_15_sent_at,
+        ) = task
+        timezone = timezone or effective_user_timezone(user_id)
+        try:
+            tz = ZoneInfo(timezone)
+        except ZoneInfoNotFoundError:
+            timezone = _default_timezone()
+            tz = ZoneInfo(timezone)
+
+        try:
+            due_day = date.fromisoformat(due_date)
+        except ValueError:
+            logger.warning("Некорректная дата задачи id=%s: %s", task_id, due_date)
+            continue
+
+        now = datetime.now(tz)
+        due_reminders = []
+        if due_time:
+            try:
+                due_at = datetime.fromisoformat(f"{due_date}T{due_time}:00").replace(tzinfo=tz)
+            except ValueError:
+                logger.warning("Некорректный срок задачи id=%s: %s %s", task_id, due_date, due_time)
+                continue
+            if not reminder_30_sent_at and now >= due_at - timedelta(minutes=30):
+                due_reminders.append("pre30")
+            if not reminder_15_sent_at and now >= due_at - timedelta(minutes=15):
+                due_reminders.append("pre15")
+        else:
+            midday_at = datetime.combine(due_day, time(hour=12, minute=0), tzinfo=tz)
+            if not reminder_day_sent_at and now >= midday_at:
+                due_reminders.append("day")
+
+        for reminder_kind in due_reminders:
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=task_reminder_message_for_kind(title, body, due_date, due_time, timezone, reminder_kind),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=main_menu_keyboard(),
+                )
+                db.mark_task_reminder_sent(task_id, user_id, reminder_kind)
+            except Exception:
+                logger.exception("Не удалось отправить напоминание %s по задаче %s пользователю %s", reminder_kind, task_id, user_id)
+
+
 def schedule_task_reminder_checker(application: Application):
     for job in list(application.job_queue.jobs()):
         if job.name == "check_task_reminders":
             job.schedule_removal()
     application.job_queue.run_repeating(
-        check_task_reminders,
+        check_task_reminders_v2,
         interval=60,
         first=10,
         name="check_task_reminders",
@@ -2117,9 +2175,10 @@ def _task_row_parts(task) -> tuple[int, str, bool, str, str, str, str]:
 def task_message(title: str, done: bool, body: str = "", due_date: str = "", due_time: str = "", timezone: str = "") -> str:
     title = title or body or "Без названия"
     meta = ""
-    if due_time:
-        date_part = f"{html.escape(due_date)} " if due_date else ""
-        meta = f"\n⏰ {date_part}{html.escape(due_time)}"
+    if due_date or due_time:
+        date_part = f"{html.escape(due_date)}" if due_date else ""
+        time_part = f" {html.escape(due_time)}" if due_time else ""
+        meta = f"\n⏰ {(date_part + time_part).strip()}"
         if timezone:
             meta += f" {html.escape(format_timezone_label(timezone))}"
     if done:
@@ -2130,6 +2189,29 @@ def task_message(title: str, done: bool, body: str = "", due_date: str = "", due
 def task_reminder_message(title: str, body: str, due_date: str, due_time: str, timezone: str) -> str:
     return (
         "🔔 <b>Напоминание по задаче</b>\n\n"
+        f"{task_message(title, False, body, due_date, due_time, timezone)}"
+    )
+
+
+def task_reminder_message_for_kind(
+    title: str,
+    body: str,
+    due_date: str,
+    due_time: str,
+    timezone: str,
+    reminder_kind: str,
+) -> str:
+    if reminder_kind == "day":
+        lead_text = "Сегодня в 12:00 напоминаю про задачу на этот день."
+    elif reminder_kind == "pre30":
+        lead_text = "Напоминаю за 30 минут до задачи."
+    elif reminder_kind == "pre15":
+        lead_text = "Напоминаю за 15 минут до задачи."
+    else:
+        lead_text = "Напоминаю по задаче."
+    return (
+        "🔔 <b>Напоминание по задаче</b>\n\n"
+        f"{html.escape(lead_text)}\n\n"
         f"{task_message(title, False, body, due_date, due_time, timezone)}"
     )
 
@@ -2803,6 +2885,29 @@ def _create_task_from_capture(user_id: int, capture: dict) -> int:
         due_date=capture.get("due_date", ""),
         due_time=capture.get("due_time", ""),
         timezone=capture.get("timezone", ""),
+    )
+
+
+def _store_weeek_task_reminder_shadow(user_id: int, capture: dict, draft: dict, weeek_task_id: str = "") -> int | None:
+    due_date = capture.get("due_date", "")
+    if not due_date:
+        return None
+    title = build_weeek_task_title(capture)
+    project_name = _compact_spaces(draft.get("project_name") or "")
+    body = _compact_spaces(capture.get("body") or title)
+    if project_name and project_name.casefold() not in body.casefold():
+        body = f"{body}\n\nПроект Weeek: {project_name}"
+    reminder_text = title
+    if weeek_task_id:
+        reminder_text = f"[Weeek #{weeek_task_id}] {title}"
+    return db.add_task(
+        user_id,
+        reminder_text,
+        title=title,
+        body=body,
+        due_date=due_date,
+        due_time=capture.get("due_time", ""),
+        timezone=capture.get("timezone") or effective_user_timezone(user_id),
     )
 
 
@@ -4462,6 +4567,7 @@ async def weeek_preview_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     title = build_weeek_task_title(capture)
     task_id = client.extract_task_display_id(response)
+    reminder_shadow_id = _store_weeek_task_reminder_shadow(query.from_user.id, capture, draft, task_id)
     _log_event("weeek_task_create_succeeded", task_id=task_id, title=title)
     await query.message.reply_html(
         "✅ <b>Задача отправлена в Weeek</b>\n\n"
@@ -4469,7 +4575,14 @@ async def weeek_preview_callback(update: Update, context: ContextTypes.DEFAULT_T
         f"<b>Название:</b> {html.escape(title)}\n"
         f"<b>Проект:</b> {html.escape(draft.get('project_name', '—'))}\n"
         f"<b>Доска:</b> {html.escape(draft.get('board_name', '—'))}\n"
-        f"<b>Колонка:</b> {html.escape(draft.get('column_name', '—'))}",
+        f"<b>Колонка:</b> {html.escape(draft.get('column_name', '—'))}"
+        + (
+            f"\n<b>Напоминания:</b> в день задачи в 12:00 ({html.escape(format_timezone_label(capture.get('timezone') or effective_user_timezone(query.from_user.id)))})"
+            if reminder_shadow_id and not capture.get("due_time")
+            else f"\n<b>Напоминания:</b> за 30 и 15 минут до срока ({html.escape(format_timezone_label(capture.get('timezone') or effective_user_timezone(query.from_user.id)))})"
+            if reminder_shadow_id and capture.get("due_time")
+            else ""
+        ),
         reply_markup=main_menu_keyboard(),
     )
     _clear_weeek_draft(context)

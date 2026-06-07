@@ -1009,3 +1009,125 @@ journalctl -u mira-task-bot.service -n 18 --no-pager
    - `/start` mentions only Weeek
    - only `📂 Задачи ВИК` is shown in the keyboard
    - legacy slash commands no longer open old idea/task flows
+
+## Session 2026-06-07: Configured SSH on this PC and deployed restored Weeek-only bot to Linux
+
+### Session Goal
+
+- Configure working SSH access from this PC using the project alias from `AGENTS.md`.
+- Deploy the restored Weeek-only bot state to the Linux server and verify the live service.
+
+### What Changed
+
+- On this PC:
+  - created SSH key `C:\Users\gorbi\.ssh\codex_linux_server_rsa`
+  - created/updated SSH alias `ksandrr-linux` in `C:\Users\gorbi\.ssh\config`
+  - confirmed alias resolves to `92.124.137.131:2324`, user `sanya`
+- On the Linux server `/home/sanya/mira-task-bot`:
+  - fetched the branch `tembo/telegram-idea-bot-daily-reminders`
+  - hard-reset the tracked checkout to commit `c3c4252` (`Restore Weeek-only Mira flow`)
+  - left untracked runtime artifacts untouched: `.env.bak.`, `.env.bak_pre_voice_fix`, `data/`
+  - restarted the live bot indirectly by stopping the current PID and letting systemd auto-restart it from the updated checkout
+
+### Files / Runtime Areas Affected
+
+- Local SSH config under `C:\Users\gorbi\.ssh\`
+- Server repo checkout at `/home/sanya/mira-task-bot`
+- Live service `mira-task-bot.service`
+
+### Validation Run
+
+- Server `py_compile`: passed via `.venv/bin/python -m py_compile bot.py weeek_client.py tests/test_time_parsing.py`
+- Server `unittest`: passed via `.venv/bin/python -m unittest tests.test_time_parsing`
+  - Result: `43 tests`, `OK`
+- Live service status after restart:
+  - `mira-task-bot.service` is `active (running)`
+  - new `Main PID`: `63049`
+- Startup logs confirm live config:
+  - parse model `gpt-5.4-mini`
+  - STT model `gpt-4o-mini-transcribe`
+  - `timeout=90`, `max_retries=3`
+
+### Deploy Status
+
+- Linux deploy: performed
+- Live commit on server: `c3c4252`
+- GitHub branch already contained this commit before deploy
+- Server `.env`: not changed
+
+### Remaining Risks / Manual Checks
+
+1. Telegram UI should now show the restored Weeek-only flow, but a manual `/start` check is still recommended.
+2. PTB warning about `per_message=False` still appears on startup; it is not new and did not block the deploy.
+3. SSH access from this PC now depends on the local key `C:\Users\gorbi\.ssh\codex_linux_server_rsa`; do not delete it.
+
+### First Checks For Next Codex
+
+1. In Telegram, verify `/start` no longer shows the old idea/task text.
+2. Verify only `📂 Задачи ВИК` is present in the keyboard.
+3. Send a voice task and confirm it goes through the Weeek-only path on the live bot.
+4. If voice parsing still feels unstable, inspect live logs around OpenAI STT/GPT timeout behavior rather than the menu flow.
+
+## Session 2026-06-07: Added Weeek task reminders by due date and pre-deadline windows
+
+### Session Goal
+
+- Make Weeek-created tasks generate Telegram reminders based on the parsed due date/time.
+- Support two reminder modes:
+  - tasks with date only: remind on that date at `12:00` in the task timezone
+  - tasks with exact time: remind `30` and `15` minutes before the due time
+
+### What Changed
+
+- In `database.py`:
+  - expanded `tasks` schema with per-reminder sent markers:
+    - `reminder_day_sent_at`
+    - `reminder_30_sent_at`
+    - `reminder_15_sent_at`
+  - migrated existing DBs by adding those columns if missing
+  - expanded `get_due_tasks()` to return reminder marker fields
+  - added `mark_task_reminder_sent(task_id, user_id, reminder_kind)`
+- In `bot.py`:
+  - added `task_reminder_message_for_kind(...)`
+  - improved `task_message(...)` so date-only tasks also show their date in reminder text
+  - added `_store_weeek_task_reminder_shadow(...)` to save a local reminder-shadow record after successful Weeek task creation
+  - wired Weeek success flow so dated Weeek tasks now create that local shadow record automatically
+  - added reminder info to the success message after Weeek task creation
+  - added new scheduler handler `check_task_reminders_v2(...)`
+    - date-only tasks trigger one reminder at `12:00`
+    - timed tasks trigger reminders at `-30 min` and `-15 min`
+    - reminder messages now go out with the main Weeek-only keyboard, not legacy task action buttons
+- In `tests/test_time_parsing.py`:
+  - added tests for saving Weeek reminder-shadow tasks
+  - added tests for midday reminder behavior
+  - added tests for `-30` / `-15` minute reminder behavior
+
+### Files Edited
+
+- `bot.py`
+- `database.py`
+- `tests/test_time_parsing.py`
+- `NEXT_CODEX_HANDOFF.md`
+
+### Validation Run
+
+- Local `unittest`: passed (`47 tests`, `OK`)
+- Local `py_compile`: passed
+
+### Deploy Status
+
+- Linux deploy: pending at the moment this handoff block was appended unless a later message in this session confirms the live restart
+- Server `.env`: not changed in this code step
+
+### Remaining Risks / Manual Checks
+
+1. Existing old tasks in SQLite will gain the new reminder columns automatically on startup, but only dated tasks can participate in this flow.
+2. Weeek tasks without a parsed `due_date` still will not schedule reminders, which is intended.
+3. If the bot is down and comes back after both `-30` and `-15` windows passed, it may send both missed reminders on the next check; this is current behavior by design.
+
+### First Checks For Next Codex
+
+1. Create a Weeek task with date only and verify the success message mentions a `12:00` reminder.
+2. Create a Weeek task with exact time and verify the success message mentions `30` and `15` minute reminders.
+3. Inspect the server SQLite `tasks` table if reminders do not fire and confirm new reminder marker columns exist.
+4. If needed, fine-tune reminder text only after verifying live scheduling behavior.

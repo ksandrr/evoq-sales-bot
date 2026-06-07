@@ -698,5 +698,125 @@ class WeeekPayloadTests(unittest.TestCase):
         self.assertEqual(client.extract_task_display_id(response), "74")
 
 
+class TaskReminderSchedulingTests(unittest.TestCase):
+    def test_store_weeek_task_reminder_shadow_skips_undated_tasks(self):
+        old_add_task = bot.db.add_task
+        try:
+            bot.db.add_task = lambda *args, **kwargs: self.fail("add_task should not be called")
+            result = bot._store_weeek_task_reminder_shadow(
+                1,
+                {"title": "Купить молоко", "body": "Нужно купить молоко", "due_date": "", "due_time": "", "timezone": "Asia/Omsk"},
+                {"project_name": "Личное"},
+                "89",
+            )
+        finally:
+            bot.db.add_task = old_add_task
+
+        self.assertIsNone(result)
+
+    def test_store_weeek_task_reminder_shadow_saves_due_task(self):
+        calls = {}
+        old_add_task = bot.db.add_task
+        old_tz = bot.effective_user_timezone
+        try:
+            bot.db.add_task = lambda *args, **kwargs: calls.update({"args": args, "kwargs": kwargs}) or 55
+            bot.effective_user_timezone = lambda _user_id: "Asia/Omsk"
+            result = bot._store_weeek_task_reminder_shadow(
+                1,
+                {
+                    "title": "Купить молоко",
+                    "body": "Нужно купить молоко",
+                    "due_date": "2026-06-08",
+                    "due_time": "15:00",
+                    "timezone": "Asia/Omsk",
+                },
+                {"project_name": "Личное"},
+                "89",
+            )
+        finally:
+            bot.db.add_task = old_add_task
+            bot.effective_user_timezone = old_tz
+
+        self.assertEqual(result, 55)
+        self.assertEqual(calls["args"][0], 1)
+        self.assertIn("[Weeek #89]", calls["args"][1])
+        self.assertEqual(calls["kwargs"]["due_date"], "2026-06-08")
+        self.assertEqual(calls["kwargs"]["due_time"], "15:00")
+        self.assertIn("Проект Weeek: Личное", calls["kwargs"]["body"])
+
+    def test_check_task_reminders_v2_sends_midday_reminder_for_date_only_task(self):
+        sent = []
+        marked = []
+        old_get_due_tasks = bot.db.get_due_tasks
+        old_mark = bot.db.mark_task_reminder_sent
+        old_datetime = bot.datetime
+        old_timezone = bot.effective_user_timezone
+        try:
+            bot.db.get_due_tasks = lambda: [
+                (1, 7, "Купить молоко", 0, "Нужно купить молоко", "2026-06-08", "", "Asia/Omsk", "", "", "")
+            ]
+            bot.db.mark_task_reminder_sent = lambda task_id, user_id, kind: marked.append((task_id, user_id, kind))
+
+            class _FixedDateTime(bot.datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return cls(2026, 6, 8, 12, 0, tzinfo=tz)
+
+            bot.datetime = _FixedDateTime
+            bot.effective_user_timezone = lambda _user_id: "Asia/Omsk"
+            fake_context = types.SimpleNamespace(
+                bot=types.SimpleNamespace(
+                    send_message=lambda **kwargs: sent.append(kwargs) or asyncio.sleep(0)
+                )
+            )
+            asyncio.run(bot.check_task_reminders_v2(fake_context))
+        finally:
+            bot.db.get_due_tasks = old_get_due_tasks
+            bot.db.mark_task_reminder_sent = old_mark
+            bot.datetime = old_datetime
+            bot.effective_user_timezone = old_timezone
+
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Сегодня в 12:00", sent[0]["text"])
+        self.assertEqual(marked, [(1, 7, "day")])
+
+    def test_check_task_reminders_v2_sends_both_pre_deadline_reminders(self):
+        sent = []
+        marked = []
+        old_get_due_tasks = bot.db.get_due_tasks
+        old_mark = bot.db.mark_task_reminder_sent
+        old_datetime = bot.datetime
+        old_timezone = bot.effective_user_timezone
+        try:
+            bot.db.get_due_tasks = lambda: [
+                (2, 7, "Созвон", 0, "Созвон с клиентом", "2026-06-08", "15:00", "Asia/Omsk", "", "", "")
+            ]
+            bot.db.mark_task_reminder_sent = lambda task_id, user_id, kind: marked.append((task_id, user_id, kind))
+
+            class _FixedDateTime(bot.datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return cls(2026, 6, 8, 14, 46, tzinfo=tz)
+
+            bot.datetime = _FixedDateTime
+            bot.effective_user_timezone = lambda _user_id: "Asia/Omsk"
+            fake_context = types.SimpleNamespace(
+                bot=types.SimpleNamespace(
+                    send_message=lambda **kwargs: sent.append(kwargs) or asyncio.sleep(0)
+                )
+            )
+            asyncio.run(bot.check_task_reminders_v2(fake_context))
+        finally:
+            bot.db.get_due_tasks = old_get_due_tasks
+            bot.db.mark_task_reminder_sent = old_mark
+            bot.datetime = old_datetime
+            bot.effective_user_timezone = old_timezone
+
+        self.assertEqual(len(sent), 2)
+        self.assertIn("за 30 минут", sent[0]["text"])
+        self.assertIn("за 15 минут", sent[1]["text"])
+        self.assertEqual(marked, [(2, 7, "pre30"), (2, 7, "pre15")])
+
+
 if __name__ == "__main__":
     unittest.main()
