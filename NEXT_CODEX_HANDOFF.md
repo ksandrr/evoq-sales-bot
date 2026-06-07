@@ -2,6 +2,103 @@
 
 ## Session Goal
 
+Make Mira ask which Weeek board to use inside the `Р›РёС‡РЅРѕРµ` project now that the project contains multiple boards (`РњРѕСЏ РґРѕСЃРєР°`, `РњРёСЂР°`, `CRM Р‘РѕС‚`), push the fix, update the Linux server checkout, and verify the deploy path as far as current permissions safely allow.
+
+## What Changed
+
+- In `bot.py`:
+  - added `_should_auto_select_project_board(...)`
+  - stopped auto-selecting a board for every known Weeek project
+  - kept auto board selection only for project `5` (`Vibecoding SANYA&EGOR`)
+  - changed both active `weeek_project_callback(...)` flows so project `6` (`Р›РёС‡РЅРѕРµ`) now goes to the board picker instead of silently using a hardcoded board
+- In `tests/test_time_parsing.py`:
+  - added regression tests for Weeek project selection
+  - verified `Р›РёС‡РЅРѕРµ` opens the board picker
+  - verified `Vibecoding SANYA&EGOR` still keeps its auto-selected board
+  - normalized the new test fixtures to read expected names from `bot.WEEEK_TARGETS[...]` instead of brittle encoded literals
+
+## Files Edited
+
+- `C:\Users\vboxuser\Documents\mira-task-bot\bot.py`
+- `C:\Users\vboxuser\Documents\mira-task-bot\tests\test_time_parsing.py`
+- `C:\Users\vboxuser\Documents\mira-task-bot\NEXT_CODEX_HANDOFF.md`
+
+## Commands Run
+
+### Local Windows
+
+```powershell
+git status --short
+git log --oneline -5
+git remote -v
+git branch --show-current
+rg -n "РґРѕСЃРє|board|Р›РёС‡РЅРѕРµ|CRM Bot|CRM Р‘РѕС‚|РњРёСЂР°|mira" -S .
+git fetch origin tembo/telegram-idea-bot-daily-reminders
+git rebase origin/tembo/telegram-idea-bot-daily-reminders
+git push origin tembo/telegram-idea-bot-daily-reminders
+```
+
+Notes:
+
+- Local `python` / `py` executables were not available in PATH on this Windows machine, so local Python tests could not be executed here.
+- During rebase, `tests/test_time_parsing.py` conflicted with newer remote test additions; conflict was resolved by keeping both remote tests and the new board-selection regression tests.
+
+### Linux Server
+
+```bash
+ssh -i C:/Users/vboxuser/.ssh/codex_linux_server_rsa -p 2324 sanya@92.124.137.131
+cd /home/sanya/mira-task-bot
+git status --short
+git log --oneline -5
+git branch --show-current
+git remote -v
+git pull origin tembo/telegram-idea-bot-daily-reminders
+.venv/bin/python -m py_compile bot.py weeek_client.py tests/test_time_parsing.py
+.venv/bin/python -m unittest discover -s tests
+systemctl is-active mira-task-bot.service
+journalctl -u mira-task-bot.service -n 40 --no-pager
+```
+
+## Tests
+
+- Server-side `.venv/bin/python -m py_compile bot.py weeek_client.py tests/test_time_parsing.py`: passed
+- Server-side `.venv/bin/python -m unittest discover -s tests`: passed (`49 tests`, `OK`)
+- Local Windows tests: not run, because no `python` or `py` executable was available in local PATH
+
+## Deploy Status
+
+- GitHub branch updated: `tembo/telegram-idea-bot-daily-reminders`
+- Latest pushed commits:
+  - `837471d` `Ask for board in personal Weeek project`
+  - `65f6478` `Stabilize Weeek board selection tests`
+  - `3a1e42e` `Fix encoded Weeek personal test fixture`
+- Linux checkout at `/home/sanya/mira-task-bot` was updated successfully with `git pull`
+- `mira-task-bot.service` was confirmed `active` before the deploy work
+- Restart after pull is still pending because `sudo systemctl restart mira-task-bot.service` requires an interactive password path; an attempted non-interactive password-in-command approach was rejected by policy as unsafe
+
+## .env / Secrets
+
+- No repository secrets were added or committed
+- No `.env` values were changed locally
+- No server `.env` values were changed in this session
+
+## Remaining Issues
+
+- The working tree on the Linux server has the new code checked out, but the running systemd service still needs a safe restart path to guarantee the new code is live in Telegram.
+- A materially safe restart option is still needed:
+  - either the user runs `sudo systemctl restart mira-task-bot.service`
+  - or the user provides an approved safe way to supply sudo non-interactively for this host
+
+## What Next Codex Should Check First
+
+1. SSH to `sanya@92.124.137.131:2324` and confirm the service restart has happened after commit `3a1e42e`.
+2. Run `systemctl is-active mira-task-bot.service`.
+3. Run `journalctl -u mira-task-bot.service -n 50 --no-pager`.
+4. In Telegram, create a Weeek task into project `Р›РёС‡РЅРѕРµ` and confirm Mira now asks which board to use instead of silently picking `РњРѕСЏ РґРѕСЃРєР°`.
+
+
+## Session Goal
+
 Finish the move to official OpenAI API usage with one `OPENAI_API_KEY`, rename the GitHub repo to `mira-task-bot`, rename the Linux deploy path and systemd service to `mira-task-bot`, deploy the updated code, and verify the service starts cleanly.
 
 ## What Changed
@@ -671,8 +768,8 @@ HTTPS_PROXY=http://127.0.0.1:10809 HTTP_PROXY=http://127.0.0.1:10809 curl -I -m 
 
 ### First Checks For Next Codex
 
-1. In Telegram, send a fresh voice message like “Мира, добавь задачу в ВИК купить молоко” and confirm the bot no longer goes silent.
-2. If Weeek still has transient issues, verify the user now receives the friendly fallback message “Не удалось связаться с Weeek...” instead of no reply.
+1. In Telegram, send a fresh voice message like пїЅпїЅпїЅпїЅпїЅ, пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ пїЅ пїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ and confirm the bot no longer goes silent.
+2. If Weeek still has transient issues, verify the user now receives the friendly fallback message пїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅ Weeek...пїЅ instead of no reply.
 3. Before any further deploy, inspect server logs around `weeek_projects_load_failed`, `weeek_boards_load_failed`, `weeek_columns_load_failed`, and `weeek_parent_tasks_load_failed`.
 
 ## Session 2026-06-07: Switched main menu to Weeek-only task browser
@@ -685,10 +782,10 @@ HTTPS_PROXY=http://127.0.0.1:10809 HTTP_PROXY=http://127.0.0.1:10809 curl -I -m 
 ### Code Changes
 
 - In `bot.py`:
-  - added `BTN_LIST_WEEEK_TASKS = "?? Задачи ВИК"`
+  - added `BTN_LIST_WEEEK_TASKS = "?? пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅ"`
   - changed `main_menu_keyboard()` to show only that single button
   - added `LEGACY_MENU_BUTTONS` and rerouted old menu labels to a disabled-message handler instead of opening old flows
-  - removed old button-based `ConversationHandler` entry points for `Идея`, `Задача`, and `Задача ВИК`; slash commands still remain
+  - removed old button-based `ConversationHandler` entry points for `пїЅпїЅпїЅпїЅ`, `пїЅпїЅпїЅпїЅпїЅпїЅ`, and `пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅ`; slash commands still remain
   - added Weeek browser helpers:
     - `_weeek_browser_keyboard(...)`
     - `_weeek_browser_nav_keyboard(...)`
@@ -707,7 +804,7 @@ HTTPS_PROXY=http://127.0.0.1:10809 HTTP_PROXY=http://127.0.0.1:10809 curl -I -m 
     - `weeek_list_project:*`
     - `weeek_list_back`
     - `weeek_list_close`
-  - added message handler for the new main-menu button `?? Задачи ВИК`
+  - added message handler for the new main-menu button `?? пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅ`
 - In `tests/test_time_parsing.py`:
   - added a regression test for Weeek overview grouping by statuses
 
@@ -753,22 +850,22 @@ journalctl -u mira-task-bot.service -n 30 --no-pager
 
 ### Remaining Risks / Manual Checks
 
-1. Manual Telegram check is still required to confirm the new keyboard really shows only `?? Задачи ВИК` in the client UI.
+1. Manual Telegram check is still required to confirm the new keyboard really shows only `?? пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅ` in the client UI.
 2. For projects with multiple boards, the browser aggregates tasks by project and tries to resolve statuses from known columns; this should be smoke-tested on real data.
 3. `/start` and `/help` text were not fully redesigned in this pass; the core UI behavior is updated, but copy cleanup can still be improved later.
 
 ### First Checks For Next Codex
 
-1. Open the bot in Telegram and confirm the reply keyboard now contains only `?? Задачи ВИК`.
-2. Tap it, choose `Личное` and `Vibecoding SANYA&EGOR`, and verify task groups render in the expected order: `К работе`, `В работе`, `Готово`.
-3. If a task appears under `Без статуса`, inspect the real Weeek task payload for missing/nested column fields and extend `_extract_weeek_task_column_name(...)`.
+1. Open the bot in Telegram and confirm the reply keyboard now contains only `?? пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅ`.
+2. Tap it, choose `пїЅпїЅпїЅпїЅпїЅпїЅ` and `Vibecoding SANYA&EGOR`, and verify task groups render in the expected order: `пїЅ пїЅпїЅпїЅпїЅпїЅпїЅ`, `пїЅ пїЅпїЅпїЅпїЅпїЅпїЅ`, `пїЅпїЅпїЅпїЅпїЅпїЅ`.
+3. If a task appears under `пїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ`, inspect the real Weeek task payload for missing/nested column fields and extend `_extract_weeek_task_column_name(...)`.
 
 ## Session 2026-06-07: Forced plain task phrases into Weeek-only flow
 
 ### Session Goal
 
-- Stop plain phrases like “Мира, запиши задачу...” from creating old local tasks.
-- Make generic task capture default to Weeek, even when the user does not explicitly say “ВИК/Weeek”.
+- Stop plain phrases like пїЅпїЅпїЅпїЅпїЅ, пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ...пїЅ from creating old local tasks.
+- Make generic task capture default to Weeek, even when the user does not explicitly say пїЅпїЅпїЅпїЅ/WeeekпїЅ.
 
 ### Code Changes
 
@@ -777,7 +874,7 @@ journalctl -u mira-task-bot.service -n 30 --no-pager
   - changed both active top-level flows (`voice_top_level(...)` and `text_top_level(...)`) so `capture_type == "task"` now opens Weeek capture instead of creating a local task;
   - added `vik_only_disabled(...)` so old idea-style freeform captures no longer silently create old artifacts from the general chat path.
 - In `tests/test_time_parsing.py`:
-  - updated the route test so a plain phrase like `добавь задачу завтра в 10 написать Кате` now expects `weeek_task`.
+  - updated the route test so a plain phrase like `пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ пїЅ 10 пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅ` now expects `weeek_task`.
 
 ### Files Edited
 
@@ -821,7 +918,7 @@ journalctl -u mira-task-bot.service -n 20 --no-pager
 
 ### Remaining Risks / Manual Checks
 
-1. Manual Telegram verification is still required for the exact phrase “Мира, запиши задачу, что нужно купить молока.”
+1. Manual Telegram verification is still required for the exact phrase пїЅпїЅпїЅпїЅпїЅ, пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ, пїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ.пїЅ
 2. Old slash-command-based legacy flows still exist in code, but the main freeform routing for plain task phrases is now Weeek-first.
 
 ### First Checks For Next Codex
@@ -834,18 +931,18 @@ journalctl -u mira-task-bot.service -n 20 --no-pager
 ### Session Goal
 
 - Remove the manual column-selection step from the Weeek task flow.
-- Always place new Weeek tasks into `К работе` by default.
+- Always place new Weeek tasks into `пїЅ пїЅпїЅпїЅпїЅпїЅпїЅ` by default.
 - Remove the extra transcription message that appeared again after successful Weeek task creation.
 
 ### Code Changes
 
 - In `bot.py`:
-  - updated the active lower `weeek_preview_keyboard(...)` to remove the `Выбрать колонку заново` button;
+  - updated the active lower `weeek_preview_keyboard(...)` to remove the `пїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ` button;
   - updated the active lower `_send_weeek_column_picker(...)` so it no longer asks the user to choose a column;
-  - the picker now loads columns, prefers `К работе` (`to_work`), falls back to the first available non-done column, stores it in the draft, and immediately opens the preview;
-  - removed the extra `transcription_message(...)` reply after successful `weeek_create`, so the user no longer sees a second standalone transcription block under `Задача отправлена в Weeek`.
+  - the picker now loads columns, prefers `пїЅ пїЅпїЅпїЅпїЅпїЅпїЅ` (`to_work`), falls back to the first available non-done column, stores it in the draft, and immediately opens the preview;
+  - removed the extra `transcription_message(...)` reply after successful `weeek_create`, so the user no longer sees a second standalone transcription block under `пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅ Weeek`.
 - In `tests/test_time_parsing.py`:
-  - added a regression test proving `_send_weeek_column_picker(...)` auto-selects `К работе` and jumps straight to preview.
+  - added a regression test proving `_send_weeek_column_picker(...)` auto-selects `пїЅ пїЅпїЅпїЅпїЅпїЅпїЅ` and jumps straight to preview.
 
 ### Files Edited
 
@@ -890,13 +987,13 @@ journalctl -u mira-task-bot.service -n 18 --no-pager
 ### Remaining Risks / Manual Checks
 
 1. Manual Telegram check is still needed to confirm the project picker now goes directly to preview/creation flow without a column step.
-2. The preview still shows the chosen column (`К работе`) in the summary, which is intended.
+2. The preview still shows the chosen column (`пїЅ пїЅпїЅпїЅпїЅпїЅпїЅ`) in the summary, which is intended.
 3. The transcript still exists inside the preview draft block if needed for transparency; only the duplicate standalone message after success was removed.
 
 ### First Checks For Next Codex
 
-1. Send a new voice task, choose the project, and confirm the bot no longer asks `В работе` vs `К работе`.
-2. After success, confirm there is no second standalone transcription message under `Задача отправлена в Weeek`.
+1. Send a new voice task, choose the project, and confirm the bot no longer asks `пїЅ пїЅпїЅпїЅпїЅпїЅпїЅ` vs `пїЅ пїЅпїЅпїЅпїЅпїЅпїЅ`.
+2. After success, confirm there is no second standalone transcription message under `пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅ Weeek`.
 3. If the wrong column is ever chosen, inspect the real Weeek column names for that board and adjust `_column_matches_hint(...)` / the auto-pick rule.
 
 ## Session 2026-06-07: Prepared local OpenAI timeout/retry hardening, deploy blocked by environment limit
