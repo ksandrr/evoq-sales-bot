@@ -133,6 +133,35 @@ class _FakeCompletions:
         )
 
 
+class _FakeReplyMessage:
+    def __init__(self):
+        self.reply_text_calls = []
+        self.reply_html_calls = []
+
+    async def reply_text(self, text, reply_markup=None):
+        self.reply_text_calls.append({"text": text, "reply_markup": reply_markup})
+
+    async def reply_html(self, text, reply_markup=None):
+        self.reply_html_calls.append({"text": text, "reply_markup": reply_markup})
+
+
+class _FakeContext:
+    def __init__(self):
+        self.user_data = {}
+
+
+class _FakeUpdate:
+    def __init__(self, user_id=123):
+        self.effective_user = types.SimpleNamespace(id=user_id)
+        self.message = _FakeReplyMessage()
+
+
+class _FakeAppContext(_FakeContext):
+    def __init__(self):
+        super().__init__()
+        self.application = object()
+
+
 class GptJsonParsingTests(unittest.TestCase):
     def _parse_with_fake_client(self, content):
         completions = _FakeCompletions(content)
@@ -387,6 +416,89 @@ class VoiceAndWeeekTests(unittest.TestCase):
         self.assertEqual([item["name"] for item in filtered], ["В работе", "К работе"])
 
 
+class WeeekFlowResilienceTests(unittest.TestCase):
+    def test_weeek_project_picker_replies_on_api_error(self):
+        async def _raise_projects():
+            raise weeek_client.WeeekApiError("Request timed out")
+
+        message = _FakeReplyMessage()
+        context = _FakeContext()
+        context.user_data["weeek_draft"] = {"capture": {"title": "Buy milk"}}
+        context.user_data["_active_flow"] = "weeek_capture"
+        old_get_client = bot.get_weeek_client
+        bot.get_weeek_client = lambda: types.SimpleNamespace(list_projects=_raise_projects)
+        try:
+            result = asyncio.run(bot._send_weeek_project_picker(message, context))
+        finally:
+            bot.get_weeek_client = old_get_client
+
+        self.assertEqual(result, bot.ConversationHandler.END)
+        self.assertEqual(len(message.reply_text_calls), 1)
+        self.assertIn("Не удалось связаться с Weeek", message.reply_text_calls[0]["text"])
+        self.assertNotIn("weeek_draft", context.user_data)
+        self.assertNotIn("_active_flow", context.user_data)
+
+
+class WeeekBrowserOverviewTests(unittest.TestCase):
+    def test_format_overview_groups_tasks_by_status(self):
+        tasks = [
+            {"id": "101", "name": "Write offer", "raw": {"boardColumnId": "1", "number": 101}},
+            {"id": "102", "name": "Call client", "raw": {"boardColumnId": "2", "number": 102}},
+            {"id": "103", "name": "Archive notes", "raw": {"boardColumnId": "3", "number": 103}},
+        ]
+        columns_by_id = {
+            "1": {"id": "1", "name": "К работе", "raw": {}},
+            "2": {"id": "2", "name": "В работе", "raw": {}},
+            "3": {"id": "3", "name": "Готово", "raw": {}},
+        }
+
+        message = bot._format_weeek_tasks_overview("Личное", tasks, columns_by_id)
+
+        self.assertIn("Личное", message)
+        self.assertIn("К работе", message)
+        self.assertIn("В работе", message)
+        self.assertIn("Готово", message)
+        self.assertIn("#101 Write offer", message)
+        self.assertLess(message.index("К работе"), message.index("В работе"))
+        self.assertLess(message.index("В работе"), message.index("Готово"))
+
+
+class WeeekColumnSelectionTests(unittest.TestCase):
+    def test_send_weeek_column_picker_auto_selects_to_work(self):
+        async def _list_columns(_board_id):
+            return [
+                types.SimpleNamespace(id="2", name="В работе", raw={}),
+                types.SimpleNamespace(id="1", name="К работе", raw={}),
+                types.SimpleNamespace(id="3", name="Готово", raw={}),
+            ]
+
+        old_get_client = bot.get_weeek_client
+        old_show_preview = bot._show_weeek_preview
+        message = _FakeReplyMessage()
+        context = _FakeContext()
+        context.user_data["weeek_draft"] = {"board_id": "10", "column_hint": ""}
+        preview_calls = []
+
+        async def _fake_show_preview(_message, _context):
+            preview_calls.append(True)
+            return bot.WEEEK_PREVIEW
+
+        bot.get_weeek_client = lambda: types.SimpleNamespace(list_columns=_list_columns)
+        bot._show_weeek_preview = _fake_show_preview
+        try:
+            result = asyncio.run(bot._send_weeek_column_picker(message, context))
+        finally:
+            bot.get_weeek_client = old_get_client
+            bot._show_weeek_preview = old_show_preview
+
+        draft = context.user_data["weeek_draft"]
+        self.assertEqual(result, bot.WEEEK_PREVIEW)
+        self.assertEqual(draft["column_id"], "1")
+        self.assertEqual(draft["column_name"], "К работе")
+        self.assertEqual(len(preview_calls), 1)
+        self.assertEqual(message.reply_text_calls, [])
+
+
 class RouteAndSubtaskTests(unittest.TestCase):
     def test_transcription_message_shows_fallback_label(self):
         old_stt_available = bot._openai_stt_available
@@ -411,9 +523,9 @@ class RouteAndSubtaskTests(unittest.TestCase):
         self.assertEqual(route["project"]["project_id"], "5")
         self.assertIn("разобраться", route["parent_task_candidate"].lower())
 
-    def test_detect_top_level_route_local_task(self):
+    def test_detect_top_level_route_plain_task_defaults_to_weeek(self):
         route = bot.detect_top_level_route("добавь задачу завтра в 10 написать Кате")
-        self.assertEqual(route["target"], "local_task")
+        self.assertEqual(route["target"], "weeek_task")
 
     def test_weeek_routing_metadata_does_not_leak_into_task_content(self):
         raw_text = "Мира, запиши задачу в личное, что нужно написать Мише завтра в 15:30 и поставь статус к работе"
@@ -461,6 +573,93 @@ class RouteAndSubtaskTests(unittest.TestCase):
         self.assertEqual(source_exact, "exact")
         self.assertEqual(fuzzy["id"], "1")
         self.assertIn(source_fuzzy, {"normalized", "fuzzy"})
+
+
+class WeeekOnlyUxTests(unittest.TestCase):
+    def test_start_text_mentions_only_weeek(self):
+        update = _FakeUpdate()
+        context = _FakeAppContext()
+        old_upsert_user = bot.db.upsert_user
+        old_schedule = bot.schedule_user_reminders
+        old_timezone = bot.effective_user_timezone
+        try:
+            bot.db.upsert_user = lambda _user_id: None
+            bot.schedule_user_reminders = lambda _app, _user_id: None
+            bot.effective_user_timezone = lambda _user_id: "Asia/Omsk"
+            asyncio.run(bot.start(update, context))
+        finally:
+            bot.db.upsert_user = old_upsert_user
+            bot.schedule_user_reminders = old_schedule
+            bot.effective_user_timezone = old_timezone
+
+        self.assertEqual(len(update.message.reply_html_calls), 1)
+        text = update.message.reply_html_calls[0]["text"]
+        self.assertIn("Weeek", text)
+        self.assertIn(bot.BTN_LIST_WEEEK_TASKS, text)
+        self.assertNotIn("Идеи", text)
+        self.assertNotIn("Напоминания", text)
+
+    def test_help_text_describes_weeek_only_flow(self):
+        update = _FakeUpdate()
+        context = _FakeContext()
+        old_voice_available = bot.voice_available
+        try:
+            bot.voice_available = lambda: True
+            asyncio.run(bot.show_help(update, context))
+        finally:
+            bot.voice_available = old_voice_available
+
+        self.assertEqual(len(update.message.reply_html_calls), 1)
+        text = update.message.reply_html_calls[0]["text"]
+        self.assertIn(bot.BTN_LIST_WEEEK_TASKS, text)
+        self.assertIn("К работе", text)
+        self.assertNotIn("Мои идеи", text)
+        self.assertNotIn("Мои задачи", text)
+
+    def test_legacy_command_disabled_redirects_to_weeek(self):
+        update = _FakeUpdate()
+        context = _FakeContext()
+
+        asyncio.run(bot.vik_only_command_disabled(update, context))
+
+        self.assertEqual(len(update.message.reply_text_calls), 1)
+        text = update.message.reply_text_calls[0]["text"]
+        self.assertIn("Weeek", text)
+        self.assertIn("Задачи ВИК", text)
+
+
+class WeeekClientTransportTests(unittest.TestCase):
+    def test_request_bypasses_env_proxy_and_wraps_network_error(self):
+        calls = {}
+
+        class _Boom(Exception):
+            pass
+
+        class _FakeAsyncClient:
+            def __init__(self, **kwargs):
+                calls["kwargs"] = kwargs
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def request(self, *args, **kwargs):
+                raise _Boom("proxy timeout")
+
+        old_httpx = weeek_client.httpx
+        weeek_client.httpx = types.SimpleNamespace(AsyncClient=_FakeAsyncClient, HTTPError=_Boom)
+        client = weeek_client.WeeekClient(api_token="token", base_url="https://api.weeek.net/public/v1")
+        try:
+            with self.assertRaises(weeek_client.WeeekApiError) as ctx:
+                asyncio.run(client._request("GET", "/tm/projects"))
+        finally:
+            weeek_client.httpx = old_httpx
+
+        self.assertEqual(calls["kwargs"]["timeout"], 30.0)
+        self.assertFalse(calls["kwargs"]["trust_env"])
+        self.assertIn("Weeek request failed", str(ctx.exception))
 
 
 class WeeekPayloadTests(unittest.TestCase):

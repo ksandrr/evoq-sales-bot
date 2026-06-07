@@ -497,3 +497,515 @@ Results:
 1. In Telegram, send voice/text: `РњРёСЂР°, РїСЂРёРІРµС‚, Р·Р°РїРёС€Рё Р·Р°РґР°С‡Сѓ РЅР°РїРёСЃР°С‚СЊ РљР°С‚Рµ РїРѕ СЃРјРµС‚Рµ` and confirm the bot opens the Weeek project picker immediately.
 2. Open `рџ“‚ Р—Р°РґР°С‡Рё РІ Р’РРљ`, choose `Р›РёС‡РЅРѕРµ`, and verify statuses are grouped correctly (`Рљ СЂР°Р±РѕС‚Рµ`, `Р’ СЂР°Р±РѕС‚Рµ`, `Р“РѕС‚РѕРІРѕ` or equivalent real column names).
 3. If task statuses show up as `Р‘РµР· СЃС‚Р°С‚СѓСЃР°`, inspect the real Weeek `/tm/tasks` payload fields for column metadata and extend `_extract_weeek_task_column_name(...)`.
+
+## Session 2026-06-07: Re-applied accepted rollback and refreshed running server process
+
+### Session Goal
+
+- Return the project to the previously accepted working rollback state.
+- Sync the Linux server to that same git state and make the live bot process reload it so the user can test immediately.
+
+### What Changed
+
+- No repository code was changed.
+- Confirmed local workspace `HEAD` is still `c01204d` (`Restore pre-deploy Mira flow from server backup`).
+- On the Linux server, fetched refs and force-synced `/home/sanya/mira-task-bot` to commit `c01204d0cd86b047ce6ce0559bff70782bc5ec3b`.
+- Confirmed server tracked files are clean after reset; remaining untracked items were:
+  - `.env.bak.`
+  - `.env.bak_pre_voice_fix`
+  - `data/`
+- Because `sudo systemctl restart` required a password in non-interactive mode, the live process was refreshed by stopping `/home/sanya/mira-task-bot/bot.py` as user `sanya`; systemd (`Restart=always`) automatically started a new process from the reset checkout.
+
+### Files Edited
+
+- `NEXT_CODEX_HANDOFF.md`
+
+### Validation Commands
+
+Local:
+
+```powershell
+git status --short
+git log --oneline -10
+git rev-parse HEAD
+git branch --show-current
+git remote -v
+```
+
+Linux server:
+
+```bash
+cd /home/sanya/mira-task-bot
+pwd
+whoami
+git status --short
+git log --oneline -5
+git remote -v
+git fetch origin
+git reset --hard c01204d0cd86b047ce6ce0559bff70782bc5ec3b
+.venv/bin/python -m py_compile bot.py weeek_client.py tests/test_time_parsing.py
+.venv/bin/python -m unittest tests.test_time_parsing
+systemctl cat mira-task-bot.service
+systemctl show mira-task-bot.service -p Restart -p User -p ExecStart -p WorkingDirectory
+pkill -f '/home/sanya/mira-task-bot/bot.py'
+systemctl status mira-task-bot.service --no-pager -l
+journalctl -u mira-task-bot.service -n 40 --no-pager
+```
+
+### Validation Results
+
+- Local workspace: clean tracked state; `HEAD` = `c01204d0cd86b047ce6ce0559bff70782bc5ec3b`.
+- Server `git reset --hard`: succeeded.
+- Server `py_compile`: passed.
+- Server `unittest`: passed (`35 tests`, `OK`).
+- `mira-task-bot.service`: running after refresh with new `Main PID`.
+- Journal shows the old process stopped at `2026-06-06 19:04:44 UTC`, systemd restarted it at `2026-06-06 19:04:49 UTC`, and the new process logged `Bot started` and `Application started`.
+
+### Deploy Status
+
+- Linux deploy/sync: performed.
+- Active commit on server after sync: `c01204d`.
+- GitHub push/commit in this session: none.
+- Server `.env`: not changed.
+
+### Remaining Risks / Manual Checks
+
+1. The server repo still contains untracked runtime artifacts (`.env` backups and `data/`), which were intentionally left untouched.
+2. `sudo` restart is still password-protected for non-interactive sessions; future service restarts may need either direct server shell access or the same systemd-safe process refresh approach.
+3. The best confirmation is still a manual Telegram smoke test against the live bot after this refresh.
+
+### First Checks For Next Codex
+
+1. Ask the user whether the live Telegram bot now behaves correctly on the accepted rollback.
+2. If the bot still behaves incorrectly, compare the observed behavior against commit `c01204d` rather than newer VIK-first changes.
+3. Before any new deploy, inspect `/home/sanya/mira-task-bot` for untracked runtime files again so they are not deleted accidentally.
+
+## Session 2026-06-07: Fixed voice->Weeek silent failure after transcription
+
+### Session Goal
+
+- Investigate why voice messages were transcribed but the bot then went silent instead of continuing the Weeek task flow.
+- Make the voice/Weeek flow resilient, deploy the fix to the Linux server, and restart the live bot.
+
+### Root Cause
+
+- Voice transcription itself was working.
+- Server logs showed `voice_transcribed` followed by an unhandled `httpx.ConnectTimeout` while loading Weeek projects inside `_send_weeek_project_picker(...)`.
+- Separate connectivity checks showed `https://api.weeek.net/public/v1/...` responds directly from the server, but requests routed through the configured proxy hang and time out.
+- Because the Weeek picker path did not catch that exception, Telegram users saw silence after the voice transcription step.
+
+### Code Changes
+
+- In `weeek_client.py`:
+  - changed Weeek HTTP requests to `httpx.AsyncClient(timeout=30.0, trust_env=False)` so Weeek bypasses the global proxy env and uses the direct route;
+  - wrapped HTTP transport failures into `WeeekApiError` with a controlled message.
+- In `bot.py`:
+  - added `_fail_weeek_flow(...)` helper;
+  - wrapped project/board/column/parent-task Weeek picker loaders with `try/except WeeekApiError`;
+  - when Weeek is unavailable, the bot now replies with a friendly error, clears the draft/active flow, and exits cleanly instead of crashing the update handler.
+- In `tests/test_time_parsing.py`:
+  - added a regression test for Weeek project picker failure handling;
+  - added a transport test that verifies Weeek requests bypass env proxy and convert network errors into `WeeekApiError`.
+
+### Files Edited
+
+- `bot.py`
+- `weeek_client.py`
+- `tests/test_time_parsing.py`
+- `NEXT_CODEX_HANDOFF.md`
+
+### Validation Commands
+
+Local:
+
+```powershell
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m unittest tests.test_time_parsing
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m py_compile bot.py weeek_client.py tests\test_time_parsing.py
+```
+
+Linux server:
+
+```bash
+cd /home/sanya/mira-task-bot
+pwd
+whoami
+git status --short
+git log --oneline -5
+git remote -v
+.venv/bin/python -m py_compile bot.py weeek_client.py tests/test_time_parsing.py
+.venv/bin/python -m unittest tests.test_time_parsing
+systemctl status mira-task-bot.service --no-pager -l
+journalctl -u mira-task-bot.service -n 40 --no-pager
+```
+
+Additional connectivity evidence:
+
+```bash
+curl -I -m 15 https://api.weeek.net/public/v1/tm/projects
+HTTPS_PROXY=http://127.0.0.1:10809 HTTP_PROXY=http://127.0.0.1:10809 curl -I -m 15 https://api.weeek.net/public/v1/tm/projects
+```
+
+### Validation Results
+
+- Local `unittest`: passed (`37 tests`, `OK`).
+- Local `py_compile`: passed.
+- Server `unittest`: passed (`37 tests`, `OK`).
+- Server `py_compile`: passed.
+- Direct unauthenticated Weeek HTTP check returned `401`, confirming the host is reachable directly.
+- The same endpoint timed out via the configured proxy route, matching the production failure mode.
+- Live service was refreshed by stopping `/home/sanya/mira-task-bot/bot.py`; systemd restarted it successfully.
+- Current live service after refresh: `active (running)` with new PID `47894` and startup logs `Bot started` / `Application started`.
+
+### Deploy Status
+
+- Linux deploy/sync: performed by copying updated files directly to `/home/sanya/mira-task-bot`.
+- GitHub commit/push: none in this session.
+- Server `.env`: not changed.
+- Server proxy/systemd config: not changed in this session.
+
+### Remaining Risks / Manual Checks
+
+1. The key functional smoke test is still a real Telegram voice message that should now either open the Weeek picker or return a friendly Weeek error instead of going silent.
+2. `bot.py` still contains duplicate legacy/new sections; the live lower definitions were fixed, but the file would benefit from cleanup in a separate careful refactor.
+3. The shell-level authenticated curl probe to Weeek was not finalized because PowerShell/SSH quoting kept collapsing the remote `$WEEEK_...` variables, but the direct-vs-proxy connectivity evidence and live code change already explain the timeout path.
+
+### First Checks For Next Codex
+
+1. In Telegram, send a fresh voice message like “Мира, добавь задачу в ВИК купить молоко” and confirm the bot no longer goes silent.
+2. If Weeek still has transient issues, verify the user now receives the friendly fallback message “Не удалось связаться с Weeek...” instead of no reply.
+3. Before any further deploy, inspect server logs around `weeek_projects_load_failed`, `weeek_boards_load_failed`, `weeek_columns_load_failed`, and `weeek_parent_tasks_load_failed`.
+
+## Session 2026-06-07: Switched main menu to Weeek-only task browser
+
+### Session Goal
+
+- Remove the old main menu buttons for ideas, local tasks, reminders, test, and the old Weeek create entry button.
+- Leave a single main menu button that opens a Weeek project browser and shows tasks grouped by statuses.
+
+### Code Changes
+
+- In `bot.py`:
+  - added `BTN_LIST_WEEEK_TASKS = "?? Задачи ВИК"`
+  - changed `main_menu_keyboard()` to show only that single button
+  - added `LEGACY_MENU_BUTTONS` and rerouted old menu labels to a disabled-message handler instead of opening old flows
+  - removed old button-based `ConversationHandler` entry points for `Идея`, `Задача`, and `Задача ВИК`; slash commands still remain
+  - added Weeek browser helpers:
+    - `_weeek_browser_keyboard(...)`
+    - `_weeek_browser_nav_keyboard(...)`
+    - `_extract_weeek_task_board_id(...)`
+    - `_extract_weeek_task_column_id(...)`
+    - `_extract_weeek_task_column_name(...)`
+    - `_weeek_status_rank(...)`
+    - `_format_weeek_tasks_overview(...)`
+    - `_load_weeek_project_options(...)`
+  - added new handlers:
+    - `weeek_list_start(...)`
+    - `weeek_list_project_callback(...)`
+    - `weeek_list_nav_callback(...)`
+    - `legacy_menu_disabled(...)`
+  - routed new callback data:
+    - `weeek_list_project:*`
+    - `weeek_list_back`
+    - `weeek_list_close`
+  - added message handler for the new main-menu button `?? Задачи ВИК`
+- In `tests/test_time_parsing.py`:
+  - added a regression test for Weeek overview grouping by statuses
+
+### Files Edited
+
+- `bot.py`
+- `tests/test_time_parsing.py`
+- `NEXT_CODEX_HANDOFF.md`
+
+### Validation Commands
+
+Local:
+
+```powershell
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m unittest tests.test_time_parsing
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m py_compile bot.py weeek_client.py tests\test_time_parsing.py
+```
+
+Linux server:
+
+```bash
+cd /home/sanya/mira-task-bot
+.venv/bin/python -m py_compile bot.py weeek_client.py tests/test_time_parsing.py
+.venv/bin/python -m unittest tests.test_time_parsing
+systemctl status mira-task-bot.service --no-pager -l
+journalctl -u mira-task-bot.service -n 30 --no-pager
+```
+
+### Validation Results
+
+- Local `unittest`: passed (`38 tests`, `OK`).
+- Local `py_compile`: passed.
+- Server `unittest`: passed (`38 tests`, `OK`).
+- Server `py_compile`: passed.
+- Live service was refreshed by terminating the current `MainPID`; systemd restarted the bot successfully.
+- Current live process after refresh: `Main PID 49617`.
+
+### Deploy Status
+
+- Linux deploy: performed by copying updated files directly to `/home/sanya/mira-task-bot`.
+- GitHub commit/push: none in this session.
+- Server `.env`: not changed.
+
+### Remaining Risks / Manual Checks
+
+1. Manual Telegram check is still required to confirm the new keyboard really shows only `?? Задачи ВИК` in the client UI.
+2. For projects with multiple boards, the browser aggregates tasks by project and tries to resolve statuses from known columns; this should be smoke-tested on real data.
+3. `/start` and `/help` text were not fully redesigned in this pass; the core UI behavior is updated, but copy cleanup can still be improved later.
+
+### First Checks For Next Codex
+
+1. Open the bot in Telegram and confirm the reply keyboard now contains only `?? Задачи ВИК`.
+2. Tap it, choose `Личное` and `Vibecoding SANYA&EGOR`, and verify task groups render in the expected order: `К работе`, `В работе`, `Готово`.
+3. If a task appears under `Без статуса`, inspect the real Weeek task payload for missing/nested column fields and extend `_extract_weeek_task_column_name(...)`.
+
+## Session 2026-06-07: Forced plain task phrases into Weeek-only flow
+
+### Session Goal
+
+- Stop plain phrases like “Мира, запиши задачу...” from creating old local tasks.
+- Make generic task capture default to Weeek, even when the user does not explicitly say “ВИК/Weeek”.
+
+### Code Changes
+
+- In `bot.py`:
+  - changed top-level route detection so old `LOCAL_TASK_PATTERNS` now map to `weeek_task` instead of `local_task`;
+  - changed both active top-level flows (`voice_top_level(...)` and `text_top_level(...)`) so `capture_type == "task"` now opens Weeek capture instead of creating a local task;
+  - added `vik_only_disabled(...)` so old idea-style freeform captures no longer silently create old artifacts from the general chat path.
+- In `tests/test_time_parsing.py`:
+  - updated the route test so a plain phrase like `добавь задачу завтра в 10 написать Кате` now expects `weeek_task`.
+
+### Files Edited
+
+- `bot.py`
+- `tests/test_time_parsing.py`
+- `NEXT_CODEX_HANDOFF.md`
+
+### Validation Commands
+
+Local:
+
+```powershell
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m unittest tests.test_time_parsing
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m py_compile bot.py weeek_client.py tests\test_time_parsing.py
+```
+
+Linux server:
+
+```bash
+cd /home/sanya/mira-task-bot
+.venv/bin/python -m py_compile bot.py weeek_client.py tests/test_time_parsing.py
+.venv/bin/python -m unittest tests.test_time_parsing
+systemctl status mira-task-bot.service --no-pager -l
+journalctl -u mira-task-bot.service -n 20 --no-pager
+```
+
+### Validation Results
+
+- Local `unittest`: passed (`38 tests`, `OK`).
+- Local `py_compile`: passed.
+- Server `unittest`: passed (`38 tests`, `OK`).
+- Server `py_compile`: passed.
+- Live service was refreshed successfully after the code upload.
+- Current live process after refresh: `Main PID 50303`.
+
+### Deploy Status
+
+- Linux deploy: performed.
+- GitHub commit/push: none in this session.
+- Server `.env`: not changed.
+
+### Remaining Risks / Manual Checks
+
+1. Manual Telegram verification is still required for the exact phrase “Мира, запиши задачу, что нужно купить молока.”
+2. Old slash-command-based legacy flows still exist in code, but the main freeform routing for plain task phrases is now Weeek-first.
+
+### First Checks For Next Codex
+
+1. Repeat the same voice phrase that previously created a local task and confirm the bot now opens/sends the Weeek task flow instead.
+2. If it still creates a local artifact, inspect fresh logs for `voice_route_detected` and confirm the live route target is now `weeek_task`, not `local_task`.
+
+## Session 2026-06-07: Auto-select Weeek column and hide duplicate transcription after success
+
+### Session Goal
+
+- Remove the manual column-selection step from the Weeek task flow.
+- Always place new Weeek tasks into `К работе` by default.
+- Remove the extra transcription message that appeared again after successful Weeek task creation.
+
+### Code Changes
+
+- In `bot.py`:
+  - updated the active lower `weeek_preview_keyboard(...)` to remove the `Выбрать колонку заново` button;
+  - updated the active lower `_send_weeek_column_picker(...)` so it no longer asks the user to choose a column;
+  - the picker now loads columns, prefers `К работе` (`to_work`), falls back to the first available non-done column, stores it in the draft, and immediately opens the preview;
+  - removed the extra `transcription_message(...)` reply after successful `weeek_create`, so the user no longer sees a second standalone transcription block under `Задача отправлена в Weeek`.
+- In `tests/test_time_parsing.py`:
+  - added a regression test proving `_send_weeek_column_picker(...)` auto-selects `К работе` and jumps straight to preview.
+
+### Files Edited
+
+- `bot.py`
+- `tests/test_time_parsing.py`
+- `NEXT_CODEX_HANDOFF.md`
+
+### Validation Commands
+
+Local:
+
+```powershell
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m unittest tests.test_time_parsing
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m py_compile bot.py weeek_client.py tests\test_time_parsing.py
+```
+
+Linux server:
+
+```bash
+cd /home/sanya/mira-task-bot
+.venv/bin/python -m py_compile bot.py weeek_client.py tests/test_time_parsing.py
+.venv/bin/python -m unittest tests.test_time_parsing
+systemctl status mira-task-bot.service --no-pager -l
+journalctl -u mira-task-bot.service -n 18 --no-pager
+```
+
+### Validation Results
+
+- Local `unittest`: passed (`39 tests`, `OK`).
+- Local `py_compile`: passed.
+- Server `unittest`: passed (`39 tests`, `OK`).
+- Server `py_compile`: passed.
+- Live service was refreshed successfully.
+- Current live process after refresh: `Main PID 50848`.
+
+### Deploy Status
+
+- Linux deploy: performed.
+- GitHub commit/push: none in this session.
+- Server `.env`: not changed.
+
+### Remaining Risks / Manual Checks
+
+1. Manual Telegram check is still needed to confirm the project picker now goes directly to preview/creation flow without a column step.
+2. The preview still shows the chosen column (`К работе`) in the summary, which is intended.
+3. The transcript still exists inside the preview draft block if needed for transparency; only the duplicate standalone message after success was removed.
+
+### First Checks For Next Codex
+
+1. Send a new voice task, choose the project, and confirm the bot no longer asks `В работе` vs `К работе`.
+2. After success, confirm there is no second standalone transcription message under `Задача отправлена в Weeek`.
+3. If the wrong column is ever chosen, inspect the real Weeek column names for that board and adjust `_column_matches_hint(...)` / the auto-pick rule.
+
+## Session 2026-06-07: Prepared local OpenAI timeout/retry hardening, deploy blocked by environment limit
+
+### Session Goal
+
+- Investigate whether the bot is really using `gpt-5.4-mini` and `gpt-4o-mini-transcribe`.
+- Reduce OpenAI timeout/fallback issues after observing strange parsing/transcription behavior.
+
+### Findings
+
+- Server `.env` currently contains:
+  - `OPENAI_PARSE_MODEL=gpt-5.4-mini`
+  - `OPENAI_STT_MODEL=gpt-4o-mini-transcribe`
+  - `OPENAI_STT_ENABLED=true`
+- This matches the `/voice` screen shown by the bot.
+- Recent live logs confirmed:
+  - parse path attempted `gpt-5.4-mini`
+  - STT path attempted `gpt-4o-mini-transcribe`
+  - in at least one bad case, GPT parse timed out and the bot fell back to `source='rules'`
+  - in that same bad case, speech engine was `vosk`, meaning OpenAI STT did not complete cleanly.
+- Connectivity evidence:
+  - service environment still forces proxy for OpenAI traffic
+  - direct unauthenticated curl to `api.openai.com` behaved differently from proxied curl
+  - proxy path appears functional at least sometimes, but production logs still show intermittent `httpx.ConnectTimeout` / `APITimeoutError`.
+
+### Local Code Changes Prepared
+
+- In `bot.py`:
+  - added `OPENAI_TIMEOUT_SECONDS` (default `90`)
+  - added `OPENAI_MAX_RETRIES` (default `3`)
+  - added `_openai_client_kwargs()` helper
+  - changed OpenAI client initialization to pass explicit `timeout` and `max_retries`
+  - expanded startup logs to print timeout/retry configuration alongside the parse/STT model names
+- In `tests/test_time_parsing.py`:
+  - added a regression test for `_openai_client_kwargs()`
+
+### Validation Results (Local Only)
+
+- `unittest`: passed (`40 tests`, `OK`)
+- `py_compile`: passed
+
+### Deploy Status
+
+- Linux deploy: NOT performed in this session
+- Reason: elevated server copy/restart commands were rejected by the environment reviewer because the Codex usage limit was reached, not because of code/test failure
+- Server live process remains on the previous deployed code from before this timeout/retry hardening
+
+### First Checks For Next Codex
+
+1. As soon as escalated SSH/SCP access is available again, upload `bot.py` and `tests/test_time_parsing.py` to `/home/sanya/mira-task-bot`.
+2. Run:
+   - `.venv/bin/python -m py_compile bot.py weeek_client.py tests/test_time_parsing.py`
+   - `.venv/bin/python -m unittest tests.test_time_parsing`
+3. Restart the service and confirm new startup logs show the same models plus explicit timeout/retry values.
+4. Re-test the problematic long voice message and inspect whether OpenAI STT/GPT still falls back to `vosk` / `rules`.
+
+## Session 2026-06-07: Restored Weeek-only UX after old local task/idea UI resurfaced
+
+### Session Goal
+
+- Return the bot UI/UX to the intended Weeek-only state after another Codex session brought back the old `РРґРµСЏ` / `Р—Р°РґР°С‡Р°` / `РќР°РїРѕРјРёРЅР°РЅРёСЏ` behavior.
+- Make the visible `/start`, `/help`, `/voice`, and legacy command routes consistent with the single-button `Р—Р°РґР°С‡Рё Р’РРљ` flow.
+
+### What Changed
+
+- In `bot.py`:
+  - re-overrode the active runtime `start(...)` text so it now describes only the Weeek workflow
+  - re-overrode the active runtime `show_help(...)` text so it no longer mentions ideas, reminders, or local tasks
+  - re-overrode the active runtime `voice_instructions(...)` text so it explains only Weeek task capture
+  - added `vik_only_command_disabled(...)` for legacy slash commands
+  - redirected legacy commands `/list`, `/test`, `/reminders`, `/settime`, `/tasks` to the Weeek-only notice instead of old handlers
+- In `tests/test_time_parsing.py`:
+  - added regression tests for Weeek-only `/start`
+  - added regression tests for Weeek-only `/help`
+  - added regression test for legacy command redirection
+
+### Files Edited
+
+- `bot.py`
+- `tests/test_time_parsing.py`
+- `NEXT_CODEX_HANDOFF.md`
+
+### Validation Run
+
+- Local `unittest`: passed (`43 tests`, `OK`)
+- Local `py_compile`: passed
+- Runtime used for local validation: bundled Codex Python at `C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe`
+
+### Deploy Status
+
+- Linux deploy: not performed in this session
+- Git commit: pending at the time of this handoff update unless a later session message confirms the commit hash
+- Server `.env`: not changed
+
+### Remaining Risks / Notes
+
+1. This session fixed the local repo state and the visible Weeek-only UX routes, but did not yet re-deploy to Linux.
+2. The repo still contains broader earlier Weeek-only and OpenAI timeout hardening changes in the working tree; this session did not try to split them apart.
+3. Manual Telegram verification is still needed after deploy to confirm `/start` no longer shows the old вЂњР±РѕС‚-Р·Р°РґР°С‡РЅРёРє Рё РёРґРµР№РЅРёРєвЂќ text.
+
+### First Checks For Next Codex
+
+1. Confirm `git status` is clean after commit.
+2. Deploy current local `bot.py`, `tests/test_time_parsing.py`, and `weeek_client.py` to `/home/sanya/mira-task-bot`.
+3. Run server checks:
+   - `.venv/bin/python -m py_compile bot.py weeek_client.py tests/test_time_parsing.py`
+   - `.venv/bin/python -m unittest tests.test_time_parsing`
+4. Restart the bot service and verify in Telegram:
+   - `/start` mentions only Weeek
+   - only `рџ“‚ Р—Р°РґР°С‡Рё Р’РРљ` is shown in the keyboard
+   - legacy slash commands no longer open old idea/task flows

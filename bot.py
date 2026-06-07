@@ -42,6 +42,8 @@ DEFAULT_TIMEZONE = os.getenv("DEFAULT_TIMEZONE", "Asia/Omsk")
 OPENAI_PARSE_MODEL = os.getenv("OPENAI_PARSE_MODEL", "gpt-5.5")
 OPENAI_STT_MODEL = (os.getenv("OPENAI_STT_MODEL") or "gpt-4o-transcribe").strip()
 OPENAI_STT_ENABLED = (os.getenv("OPENAI_STT_ENABLED") or "true").strip().lower() in {"1", "true", "yes", "on"}
+OPENAI_TIMEOUT_SECONDS = float((os.getenv("OPENAI_TIMEOUT_SECONDS") or "90").strip())
+OPENAI_MAX_RETRIES = int((os.getenv("OPENAI_MAX_RETRIES") or "3").strip())
 WEEEK_API_TOKEN = (os.getenv("WEEEK_API_TOKEN") or "").strip()
 WEEEK_API_BASE_URL = (os.getenv("WEEEK_API_BASE_URL") or "https://api.weeek.net/public/v1").strip()
 WEEEK_DEFAULT_WORKSPACE_ID = (os.getenv("WEEEK_DEFAULT_WORKSPACE_ID") or "").strip()
@@ -259,17 +261,22 @@ BTN_TEST = "🔔 Тест"
 BTN_HELP = "ℹ️ Помощь"
 BTN_CANCEL = "✖️ Отмена"
 BTN_ADD_WEEEK_TASK = "🧩 Задача ВИК"
+BTN_LIST_WEEEK_TASKS = "📂 Задачи ВИК"
+LEGACY_MENU_BUTTONS = (
+    BTN_ADD,
+    BTN_LIST,
+    BTN_ADD_TASK,
+    BTN_LIST_TASKS,
+    BTN_REMINDERS,
+    BTN_TEST,
+    BTN_HELP,
+)
 MENU_BUTTON_PATTERN = "^(" + "|".join(
     re.escape(label)
     for label in (
-        BTN_ADD,
-        BTN_LIST,
-        BTN_ADD_TASK,
+        *LEGACY_MENU_BUTTONS,
         BTN_ADD_WEEEK_TASK,
-        BTN_LIST_TASKS,
-        BTN_REMINDERS,
-        BTN_TEST,
-        BTN_HELP,
+        BTN_LIST_WEEEK_TASKS,
         BTN_CANCEL,
     )
 ) + ")$"
@@ -296,11 +303,7 @@ PRESET_TIMEZONES = [
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [BTN_ADD, BTN_ADD_TASK],
-            [BTN_ADD_WEEEK_TASK, BTN_LIST_TASKS],
-            [BTN_LIST, BTN_REMINDERS],
-            [BTN_TEST],
-            [BTN_HELP],
+            [BTN_LIST_WEEEK_TASKS],
         ],
         resize_keyboard=True,
         input_field_placeholder="Тапни кнопку, напиши или наговори...",
@@ -553,7 +556,7 @@ def detect_top_level_route(text: str) -> dict:
     elif any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in REMINDER_PATTERNS):
         target = "reminder"
     elif any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in LOCAL_TASK_PATTERNS):
-        target = "local_task"
+        target = "weeek_task"
     elif any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in IDEA_PATTERNS):
         target = "idea"
     return {
@@ -2371,7 +2374,16 @@ def _sort_weeek_columns(columns: list[dict], hint: str) -> list[dict]:
 
 async def _send_weeek_project_picker(message, context: ContextTypes.DEFAULT_TYPE):
     client = get_weeek_client()
-    projects = await client.list_projects()
+    try:
+        projects = await client.list_projects()
+    except WeeekApiError as exc:
+        return await _fail_weeek_flow(
+            message,
+            context,
+            "Не удалось связаться с Weeek и получить список проектов. Попробуй ещё раз чуть позже.",
+            "weeek_projects_load_failed",
+            exc,
+        )
     if not projects:
         await message.reply_text(
             "Не смог найти проекты в Weeek. Проверь WEEEK_API_TOKEN, WEEEK_API_BASE_URL и доступы у токена.",
@@ -2393,7 +2405,16 @@ async def _send_weeek_board_picker(message, context: ContextTypes.DEFAULT_TYPE):
     draft = _get_weeek_draft(context)
     project_id = draft.get("project_id")
     client = get_weeek_client()
-    boards = await client.list_boards(project_id)
+    try:
+        boards = await client.list_boards(project_id)
+    except WeeekApiError as exc:
+        return await _fail_weeek_flow(
+            message,
+            context,
+            "Не удалось связаться с Weeek и получить список досок. Попробуй ещё раз чуть позже.",
+            "weeek_boards_load_failed",
+            exc,
+        )
     if not boards:
         await message.reply_text(
             "Для выбранного проекта не нашёл доски Weeek. Проверь структуру проекта в Weeek.",
@@ -2414,7 +2435,16 @@ async def _send_weeek_column_picker(message, context: ContextTypes.DEFAULT_TYPE)
     draft = _get_weeek_draft(context)
     board_id = draft.get("board_id")
     client = get_weeek_client()
-    columns = await client.list_columns(board_id)
+    try:
+        columns = await client.list_columns(board_id)
+    except WeeekApiError as exc:
+        return await _fail_weeek_flow(
+            message,
+            context,
+            "Не удалось связаться с Weeek и получить список колонок. Попробуй ещё раз чуть позже.",
+            "weeek_columns_load_failed",
+            exc,
+        )
     if not columns:
         await message.reply_text(
             "Не смог получить колонки этой доски Weeek. Возможно, API вернул непривычный формат.",
@@ -2442,7 +2472,16 @@ async def _send_weeek_column_picker(message, context: ContextTypes.DEFAULT_TYPE)
 async def _send_weeek_parent_picker(message, context: ContextTypes.DEFAULT_TYPE):
     draft = _get_weeek_draft(context)
     client = get_weeek_client()
-    tasks = await client.list_tasks(draft.get("project_id", ""), draft.get("board_id", ""))
+    try:
+        tasks = await client.list_tasks(draft.get("project_id", ""), draft.get("board_id", ""))
+    except WeeekApiError as exc:
+        return await _fail_weeek_flow(
+            message,
+            context,
+            "Не удалось связаться с Weeek и получить список задач. Попробуй ещё раз чуть позже.",
+            "weeek_parent_tasks_load_failed",
+            exc,
+        )
     if not tasks:
         await message.reply_text(
             "Не смог получить список задач в этой доске Weeek.",
@@ -2647,9 +2686,6 @@ async def weeek_preview_callback(update: Update, context: ContextTypes.DEFAULT_T
         _clear_weeek_draft(context)
         await query.message.reply_text("Ок, отменил создание задачи в Weeek.", reply_markup=main_menu_keyboard())
         return ConversationHandler.END
-
-    if data == "weeek_repick_column":
-        return await _send_weeek_column_picker(query.message, context)
 
     if data == "weeek_repick_parent":
         return await _send_weeek_parent_picker(query.message, context)
@@ -2956,13 +2992,19 @@ async def text_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bool(capture.get("needs_time_clarification")),
     )
 
+    if capture_type == "idea":
+        return await vik_only_disabled(update, context)
+
     if _needs_reminder_time_clarification(capture):
         context.user_data["pending_reminder_capture"] = capture
         context.user_data["pending_reminder_attempts"] = 0
         await _ask_reminder_time_clarification(update, context)
         return CLARIFY_REMINDER_TIME
 
-    if capture_type in {"task", "reminder"}:
+    if capture_type == "task":
+        return await _start_weeek_capture(update, context, text, return_state=False)
+
+    if capture_type == "reminder":
         task_id = _create_task_from_capture(user_id, capture)
         await _send_created_task(update, capture, task_id, reminder=capture_type == "reminder")
         return ConversationHandler.END
@@ -3496,7 +3538,6 @@ def weeek_preview_keyboard(draft: dict | None = None) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("✅ Создать в Weeek", callback_data="weeek_create")]]
     if draft.get("target") == "weeek_subtask":
         rows.append([InlineKeyboardButton("🔁 Выбрать родителя заново", callback_data="weeek_repick_parent")])
-    rows.append([InlineKeyboardButton("🔁 Выбрать колонку заново", callback_data="weeek_repick_column")])
     rows.append([InlineKeyboardButton("✖️ Отмена", callback_data="weeek_cancel")])
     return InlineKeyboardMarkup(rows)
 
@@ -3536,9 +3577,242 @@ def _sort_weeek_columns(columns: list[dict], hint: str) -> list[dict]:
     return sorted(filtered, key=score)
 
 
-async def _send_weeek_project_picker(message, context: ContextTypes.DEFAULT_TYPE):
+async def _fail_weeek_flow(message, context: ContextTypes.DEFAULT_TYPE, user_text: str, log_code: str, exc: Exception):
+    _log_event(log_code, error=str(exc))
+    await message.reply_text(user_text, reply_markup=main_menu_keyboard())
+    _clear_weeek_draft(context)
+    _clear_active_flow(context)
+    return ConversationHandler.END
+
+
+def _weeek_browser_keyboard(options: list[dict], prefix: str) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(item["name"], callback_data=f"{prefix}:{item['id']}")] for item in options]
+    rows.append([InlineKeyboardButton("✖️ Закрыть", callback_data="weeek_list_close")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _weeek_browser_nav_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔙 К проектам", callback_data="weeek_list_back")],
+            [InlineKeyboardButton("✖️ Закрыть", callback_data="weeek_list_close")],
+        ]
+    )
+
+
+def _extract_weeek_task_board_id(task: dict) -> str:
+    return str(task.get("boardId") or task.get("board", {}).get("id") or "")
+
+
+def _extract_weeek_task_column_id(task: dict) -> str:
+    return str(
+        task.get("boardColumnId")
+        or task.get("columnId")
+        or task.get("statusId")
+        or task.get("boardColumn", {}).get("id")
+        or task.get("column", {}).get("id")
+        or task.get("status", {}).get("id")
+        or ""
+    )
+
+
+def _extract_weeek_task_column_name(task: dict, columns_by_id: dict[str, dict]) -> str:
+    column_id = _extract_weeek_task_column_id(task)
+    if column_id and column_id in columns_by_id:
+        return columns_by_id[column_id].get("name", "")
+    for key in ("boardColumn", "column", "status"):
+        value = task.get(key)
+        if isinstance(value, dict):
+            name = _compact_spaces(str(value.get("name") or value.get("title") or ""))
+            if name:
+                return name
+    return ""
+
+
+def _weeek_status_rank(status_name: str) -> tuple[int, str]:
+    normalized = _normalize_text(status_name)
+    if any(token in normalized for token in WEEEK_COLUMN_NAMES.get("to_work", ())):
+        return (0, normalized)
+    if any(token in normalized for token in WEEEK_COLUMN_NAMES.get("in_work", ())):
+        return (1, normalized)
+    if any(token in normalized for token in WEEEK_COLUMN_NAMES.get("done", ())):
+        return (2, normalized)
+    if not normalized:
+        return (4, "")
+    return (3, normalized)
+
+
+def _format_weeek_tasks_overview(project_name: str, tasks: list[dict], columns_by_id: dict[str, dict]) -> str:
+    grouped: dict[str, list[str]] = {}
+    for task in tasks:
+        raw = task.get("raw") or {}
+        status_name = _extract_weeek_task_column_name(raw, columns_by_id) or "Без статуса"
+        title = _compact_spaces(task.get("name") or "Без названия")
+        display_id = (
+            raw.get("number")
+            or raw.get("taskNumber")
+            or raw.get("seqNumber")
+            or raw.get("displayId")
+            or task.get("id")
+            or "?"
+        )
+        grouped.setdefault(status_name, []).append(f"• #{display_id} {title}")
+
+    lines = [f"📂 <b>{html.escape(project_name)}</b>"]
+    if not grouped:
+        lines.extend(["", "Задач в этом проекте не нашёл."])
+        return "\n".join(lines)
+
+    for status_name in sorted(grouped, key=lambda item: _weeek_status_rank(item)):
+        lines.extend(["", f"<b>{html.escape(status_name)}</b>"])
+        lines.extend(grouped[status_name])
+    return "\n".join(lines)
+
+
+async def _load_weeek_project_options() -> list[dict]:
     client = get_weeek_client()
     projects = await client.list_projects()
+    return [{"id": option.id, "name": option.name, "raw": option.raw} for option in projects]
+
+
+async def weeek_list_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not weeek_available():
+        await update.message.reply_text(
+            "Интеграция с Weeek пока не настроена. Проверь WEEEK_API_TOKEN.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return ConversationHandler.END
+
+    try:
+        projects = await _load_weeek_project_options()
+    except WeeekApiError as exc:
+        _log_event("weeek_list_projects_load_failed", error=str(exc))
+        await update.message.reply_text(
+            "Не удалось получить список проектов из Weeek. Попробуй ещё раз чуть позже.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return ConversationHandler.END
+
+    if not projects:
+        await update.message.reply_text(
+            "Не нашёл доступные проекты в Weeek.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return ConversationHandler.END
+
+    context.user_data["weeek_list_projects"] = projects
+    await update.message.reply_text(
+        "Выбери проект:",
+        reply_markup=_weeek_browser_keyboard(projects, "weeek_list_project"),
+    )
+    return ConversationHandler.END
+
+
+async def weeek_list_project_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    projects = context.user_data.get("weeek_list_projects") or []
+    project_id = (query.data or "").split(":", 1)[1]
+    project = next((item for item in projects if item["id"] == project_id), None)
+    if not project:
+        try:
+            projects = await _load_weeek_project_options()
+        except WeeekApiError as exc:
+            _log_event("weeek_list_projects_reload_failed", error=str(exc))
+            await query.message.reply_text(
+                "Не удалось заново получить список проектов из Weeek. Попробуй ещё раз чуть позже.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return ConversationHandler.END
+        context.user_data["weeek_list_projects"] = projects
+        project = next((item for item in projects if item["id"] == project_id), None)
+        if not project:
+            await query.message.reply_text("Проект устарел. Нажми «Задачи ВИК» ещё раз.", reply_markup=main_menu_keyboard())
+            return ConversationHandler.END
+
+    client = get_weeek_client()
+    try:
+        boards = await client.list_boards(project_id)
+        tasks = await client.list_tasks(project_id=project_id)
+    except WeeekApiError as exc:
+        _log_event("weeek_list_project_tasks_failed", project_id=project_id, error=str(exc))
+        await query.message.reply_text(
+            "Не удалось получить задачи этого проекта из Weeek. Попробуй ещё раз чуть позже.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return ConversationHandler.END
+
+    columns_by_id: dict[str, dict] = {}
+    for board in boards:
+        try:
+            columns = await client.list_columns(board.id)
+        except WeeekApiError:
+            continue
+        for column in columns:
+            columns_by_id[str(column.id)] = {"id": str(column.id), "name": column.name, "raw": column.raw}
+
+    mapped_tasks = [{"id": option.id, "name": option.name, "raw": option.raw} for option in tasks]
+    overview = _format_weeek_tasks_overview(project["name"], mapped_tasks, columns_by_id)
+    await query.message.reply_html(overview, reply_markup=_weeek_browser_nav_keyboard())
+    return ConversationHandler.END
+
+
+async def weeek_list_nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    if data == "weeek_list_close":
+        await query.message.reply_text("Ок.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    projects = context.user_data.get("weeek_list_projects") or []
+    if not projects:
+        try:
+            projects = await _load_weeek_project_options()
+        except WeeekApiError as exc:
+            _log_event("weeek_list_projects_back_failed", error=str(exc))
+            await query.message.reply_text(
+                "Не удалось получить список проектов из Weeek. Попробуй ещё раз чуть позже.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return ConversationHandler.END
+        context.user_data["weeek_list_projects"] = projects
+
+    await query.message.reply_text(
+        "Выбери проект:",
+        reply_markup=_weeek_browser_keyboard(projects, "weeek_list_project"),
+    )
+    return ConversationHandler.END
+
+
+async def legacy_menu_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Сейчас в главном меню доступен только раздел «Задачи ВИК».",
+        reply_markup=main_menu_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+async def vik_only_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Сейчас бот работает только как задачник ВИК. Скажи или напиши, какую задачу нужно добавить в ВИК.",
+        reply_markup=main_menu_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+async def _send_weeek_project_picker(message, context: ContextTypes.DEFAULT_TYPE):
+    client = get_weeek_client()
+    try:
+        projects = await client.list_projects()
+    except WeeekApiError as exc:
+        return await _fail_weeek_flow(
+            message,
+            context,
+            "Не удалось связаться с Weeek и получить список проектов. Попробуй ещё раз чуть позже.",
+            "weeek_projects_load_failed",
+            exc,
+        )
     if not projects:
         await message.reply_text(
             "Не смог найти проекты в Weeek. Проверь WEEEK_API_TOKEN, WEEEK_API_BASE_URL и доступы у токена.",
@@ -3562,7 +3836,16 @@ async def _send_weeek_board_picker(message, context: ContextTypes.DEFAULT_TYPE):
     draft = _get_weeek_draft(context)
     project_id = draft.get("project_id")
     client = get_weeek_client()
-    boards = await client.list_boards(project_id)
+    try:
+        boards = await client.list_boards(project_id)
+    except WeeekApiError as exc:
+        return await _fail_weeek_flow(
+            message,
+            context,
+            "Не удалось связаться с Weeek и получить список досок. Попробуй ещё раз чуть позже.",
+            "weeek_boards_load_failed",
+            exc,
+        )
     if not boards:
         await message.reply_text(
             "Для выбранного проекта не нашёл доски Weeek. Проверь структуру проекта в Weeek.",
@@ -3585,7 +3868,16 @@ async def _send_weeek_column_picker(message, context: ContextTypes.DEFAULT_TYPE)
     draft = _get_weeek_draft(context)
     board_id = draft.get("board_id")
     client = get_weeek_client()
-    columns = await client.list_columns(board_id)
+    try:
+        columns = await client.list_columns(board_id)
+    except WeeekApiError as exc:
+        return await _fail_weeek_flow(
+            message,
+            context,
+            "Не удалось связаться с Weeek и получить список колонок. Попробуй ещё раз чуть позже.",
+            "weeek_columns_load_failed",
+            exc,
+        )
     if not columns:
         await message.reply_text(
             "Не смог получить колонки этой доски Weeek. Возможно, API вернул непривычный формат.",
@@ -3600,25 +3892,48 @@ async def _send_weeek_column_picker(message, context: ContextTypes.DEFAULT_TYPE)
     filtered = _sort_weeek_columns(mapped, draft.get("column_hint", ""))
     draft["columns"] = filtered
     _log_event("weeek_columns_filtered", board_id=board_id, columns=[item["name"] for item in filtered])
-    hint = draft.get("column_hint", "")
-    if hint:
-        matched = [column for column in filtered if _column_matches_hint(column.get("name", ""), hint)]
-        if len(matched) == 1:
-            draft["column_id"] = matched[0]["id"]
-            draft["column_name"] = matched[0]["name"]
-            _log_event("weeek_column_auto_selected", board_id=board_id, column_id=matched[0]["id"], column_name=matched[0]["name"], hint=hint)
-            return await _show_weeek_preview(message, context)
-    await message.reply_text(
-        "И последним шагом выбери колонку:",
-        reply_markup=_weeek_options_keyboard(filtered, "weeek_column"),
+
+    preferred = None
+    to_work = [column for column in filtered if _column_matches_hint(column.get("name", ""), "to_work")]
+    if to_work:
+        preferred = to_work[0]
+    elif filtered:
+        preferred = filtered[0]
+
+    if not preferred:
+        await message.reply_text(
+            "Не смог выбрать колонку для новой задачи в Weeek.",
+            reply_markup=main_menu_keyboard(),
+        )
+        _clear_weeek_draft(context)
+        _clear_active_flow(context)
+        return ConversationHandler.END
+
+    draft["column_id"] = preferred["id"]
+    draft["column_name"] = preferred["name"]
+    _log_event(
+        "weeek_column_auto_selected",
+        board_id=board_id,
+        column_id=preferred["id"],
+        column_name=preferred["name"],
+        hint="to_work",
     )
-    return WEEEK_COLUMN
+    return await _show_weeek_preview(message, context)
 
 
 async def _send_weeek_parent_picker(message, context: ContextTypes.DEFAULT_TYPE):
     draft = _get_weeek_draft(context)
     client = get_weeek_client()
-    tasks = await client.list_tasks(draft.get("project_id", ""), draft.get("board_id", ""))
+    try:
+        tasks = await client.list_tasks(draft.get("project_id", ""), draft.get("board_id", ""))
+    except WeeekApiError as exc:
+        return await _fail_weeek_flow(
+            message,
+            context,
+            "Не удалось связаться с Weeek и получить список задач. Попробуй ещё раз чуть позже.",
+            "weeek_parent_tasks_load_failed",
+            exc,
+        )
     if not tasks:
         await message.reply_text(
             "Не смог получить список задач в этой доске Weeek.",
@@ -3947,6 +4262,10 @@ async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     capture["transcript_clean"] = capture.get("transcript_clean") or text
     _log_voice_capture(text, capture, speech_engine)
 
+    if capture_type == "idea":
+        _clear_active_flow(context)
+        return await vik_only_disabled(update, context)
+
     if _needs_reminder_time_clarification(capture):
         context.user_data["pending_reminder_capture"] = capture
         context.user_data["pending_reminder_attempts"] = 0
@@ -3954,7 +4273,10 @@ async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _ask_reminder_time_clarification(update, context)
         return CLARIFY_REMINDER_TIME
 
-    if capture_type in {"task", "reminder"}:
+    if capture_type == "task":
+        return await _start_weeek_capture(update, context, text, return_state=False)
+
+    if capture_type == "reminder":
         task_id = _create_task_from_capture(user_id, capture)
         await _send_created_task(update, capture, task_id, recognized_text=text, reminder=capture_type == "reminder")
         _clear_active_flow(context)
@@ -4150,9 +4472,6 @@ async def weeek_preview_callback(update: Update, context: ContextTypes.DEFAULT_T
         f"<b>Колонка:</b> {html.escape(draft.get('column_name', '—'))}",
         reply_markup=main_menu_keyboard(),
     )
-    transcription = transcription_message(capture.get("transcript_clean") or capture.get("transcript") or "", capture.get("speech_engine", ""))
-    if transcription:
-        await query.message.reply_html(transcription.lstrip(), reply_markup=main_menu_keyboard())
     _clear_weeek_draft(context)
     _clear_active_flow(context)
     return ConversationHandler.END
@@ -4231,6 +4550,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data or ""
 
+    if data.startswith("weeek_list_project:"):
+        return await weeek_list_project_callback(update, context)
+    if data in {"weeek_list_back", "weeek_list_close"}:
+        return await weeek_list_nav_callback(update, context)
     if data.startswith("weeek_project:"):
         return await weeek_project_callback(update, context)
     if data.startswith("weeek_board:"):
@@ -4242,6 +4565,69 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("weeek_"):
         return await weeek_preview_callback(update, context)
     return await _legacy_handle_callback(update, context)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    db.upsert_user(user_id)
+    schedule_user_reminders(context.application, user_id)
+
+    tz = effective_user_timezone(user_id)
+    text = (
+        "👋 <b>Привет!</b> Сейчас Mira работает только с задачами в Weeek.\n\n"
+        f"🌍 Часовой пояс: <b>{html.escape(tz)}</b>\n\n"
+        f"Внизу оставлена одна кнопка: <b>{html.escape(BTN_LIST_WEEEK_TASKS)}</b>.\n"
+        "Нажми её, чтобы выбрать проект и посмотреть список задач.\n\n"
+        "Можно также просто написать или наговорить, какую задачу нужно добавить в Weeek."
+    )
+    await update.message.reply_html(text, reply_markup=main_menu_keyboard())
+
+
+async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if voice_available():
+        voice_status = "включён — сначала OpenAI STT, при сбое Vosk fallback"
+    else:
+        voice_status = "выключен — команда /voice покажет, как включить"
+    text = (
+        "<b>Как это работает сейчас</b>\n\n"
+        f"• <b>{html.escape(BTN_LIST_WEEEK_TASKS)}</b> — показывает проекты из Weeek. После выбора проекта бот покажет задачи по статусам.\n"
+        "• Если просто написать или надиктовать задачу, Mira оформит её в Weeek.\n"
+        "• Проект бот спросит, а колонку выберет автоматически: по умолчанию «К работе».\n"
+        f"• <b>/voice</b> — показать текущий голосовой тракт (сейчас {voice_status})."
+    )
+    await update.message.reply_html(text, reply_markup=main_menu_keyboard())
+
+
+async def voice_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if voice_available():
+        text = (
+            "🎤 <b>Голосовой ввод включён.</b>\n\n"
+            f"🧠 Парсинг смысла: <b>{html.escape(OPENAI_PARSE_MODEL)}</b>.\n\n"
+            "Mira сначала пробует OpenAI STT через официальный API, а при сбое переключается на локальный Vosk. "
+            "Качество ниже Whisper, но для коротких фраз вполне приемлемо.\n\n"
+            "Просто запиши голосовое прямо в чате:\n"
+            "• Диктуй обычным языком, какую задачу нужно добавить в Weeek.\n"
+            "• Если в задаче нет явного проекта, Mira спросит, куда её отправить.\n"
+            "• После выбора проекта задача уйдёт в Weeek в колонку «К работе».\n"
+        )
+    else:
+        text = (
+            "🎤 <b>Голосовой ввод выключен.</b>\n\n"
+            "Для голосового ввода нужен OpenAI API key, а локальный Vosk и ffmpeg остаются fallback-вариантом:\n\n"
+            "• Установи зависимости из <code>requirements.txt</code>.\n"
+            "• На сервере нужен ffmpeg: <code>sudo apt install ffmpeg</code>.\n"
+            "• Vosk сам скачает русскую модель (~45 МБ) при первом голосовом.\n\n"
+            "После установки перезапусти сервис бота."
+        )
+    text += f"\n\n<b>Active STT path:</b> {html.escape(_voice_status_summary())}"
+    await update.message.reply_html(text, reply_markup=main_menu_keyboard(), disable_web_page_preview=True)
+
+
+async def vik_only_command_disabled(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Сейчас Mira работает только как задачник Weeek. Напиши задачу голосом или текстом, либо нажми «Задачи ВИК».",
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 def main():
@@ -4261,7 +4647,6 @@ def main():
     add_conv = ConversationHandler(
         entry_points=[
             CommandHandler("add", add_start),
-            MessageHandler(filters.Regex(f"^{BTN_ADD}$"), add_start),
         ],
         states={
             BRIEF: [
@@ -4289,7 +4674,6 @@ def main():
     task_conv = ConversationHandler(
         entry_points=[
             CommandHandler("addtask", task_add_start),
-            MessageHandler(filters.Regex(f"^{BTN_ADD_TASK}$"), task_add_start),
         ],
         states={
             TASK_TEXT: [
@@ -4310,7 +4694,6 @@ def main():
     weeek_conv = ConversationHandler(
         entry_points=[
             CommandHandler("addweeek", weeek_add_start),
-            MessageHandler(filters.Regex(f"^{re.escape(BTN_ADD_WEEEK_TASK)}$"), weeek_add_start),
         ],
         states={
             WEEEK_CAPTURE: [
@@ -4391,12 +4774,12 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", show_help))
-    application.add_handler(CommandHandler("list", list_ideas))
-    application.add_handler(CommandHandler("test", test_reminder))
-    application.add_handler(CommandHandler("reminders", reminders_show))
-    application.add_handler(CommandHandler("settime", reminders_show))
+    application.add_handler(CommandHandler("list", vik_only_command_disabled))
+    application.add_handler(CommandHandler("test", vik_only_command_disabled))
+    application.add_handler(CommandHandler("reminders", vik_only_command_disabled))
+    application.add_handler(CommandHandler("settime", vik_only_command_disabled))
     application.add_handler(CommandHandler("voice", voice_instructions))
-    application.add_handler(CommandHandler("tasks", list_tasks))
+    application.add_handler(CommandHandler("tasks", vik_only_command_disabled))
 
     application.add_handler(add_conv)
     application.add_handler(task_conv)
@@ -4405,12 +4788,13 @@ def main():
     application.add_handler(capture_conv)
 
     # Кнопки главного меню (вне диалогов)
-    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_LIST}$"), list_ideas))
-    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_LIST_TASKS}$"), list_tasks))
-    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_ADD_WEEEK_TASK)}$"), weeek_add_start))
-    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_TEST}$"), test_reminder))
-    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_HELP}$"), show_help))
-    application.add_handler(MessageHandler(filters.Regex(f"^{BTN_REMINDERS}$"), reminders_show))
+    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_LIST_WEEEK_TASKS)}$"), weeek_list_start))
+    application.add_handler(
+        MessageHandler(
+            filters.Regex("^(" + "|".join(re.escape(label) for label in LEGACY_MENU_BUTTONS + (BTN_ADD_WEEEK_TASK,)) + ")$"),
+            legacy_menu_disabled,
+        )
+    )
 
     application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_error_handler(error_handler)

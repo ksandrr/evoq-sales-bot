@@ -70,14 +70,19 @@ class WeeekClient:
 
     async def _request(self, method: str, path: str, *, params: dict | None = None, json_body: dict | None = None):
         url = f"{self.base_url}/{path.lstrip('/')}"
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.request(
-                method,
-                url,
-                headers=self._headers(),
-                params=params,
-                json=json_body,
-            )
+        httpx_error = getattr(httpx, "HTTPError", Exception)
+        try:
+            # Weeek is more reliable from the server without the global proxy route.
+            async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+                response = await client.request(
+                    method,
+                    url,
+                    headers=self._headers(),
+                    params=params,
+                    json=json_body,
+                )
+        except httpx_error as exc:
+            raise WeeekApiError(f"Weeek request failed: {exc}") from exc
         if response.status_code >= 400:
             snippet = response.text[:300]
             raise WeeekApiError(f"{response.status_code} {snippet}")
