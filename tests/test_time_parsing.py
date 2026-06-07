@@ -685,7 +685,7 @@ class WeeekProjectBoardSelectionTests(unittest.TestCase):
 
         self.assertEqual(result, bot.WEEEK_BOARD)
         self.assertEqual(draft["project_id"], "6")
-        self.assertEqual(draft["project_name"], "Ð›Ð¸Ñ‡Ð½Ð¾Ðµ")
+        self.assertEqual(draft["project_name"], bot.WEEEK_TARGETS["6"]["project_name"])
         board_picker.assert_awaited_once()
         column_picker.assert_not_awaited()
 
@@ -711,7 +711,7 @@ class WeeekProjectBoardSelectionTests(unittest.TestCase):
 
         self.assertEqual(result, bot.WEEEK_COLUMN)
         self.assertEqual(draft["board_id"], "9")
-        self.assertEqual(draft["board_name"], "SaaS Deck - Ð·Ð°Ð´Ð°Ñ‡Ð¸")
+        self.assertEqual(draft["board_name"], bot.WEEEK_TARGETS["5"]["board_name"])
         column_picker.assert_awaited_once()
         board_picker.assert_not_awaited()
 
