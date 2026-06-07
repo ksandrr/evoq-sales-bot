@@ -666,7 +666,7 @@ class WeeekProjectBoardSelectionTests(unittest.TestCase):
     def test_personal_project_opens_board_picker(self):
         draft = {
             "projects": [
-                {"id": "6", "name": "Ð›Ð¸Ñ‡Ð½Ð¾Ðµ", "raw": {}},
+                {"id": "6", "name": bot.WEEEK_TARGETS["6"]["project_name"], "raw": {}},
             ],
             "target": "weeek_task",
         }
