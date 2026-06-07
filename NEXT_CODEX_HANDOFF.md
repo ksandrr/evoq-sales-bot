@@ -1131,3 +1131,19 @@ journalctl -u mira-task-bot.service -n 18 --no-pager
 2. Create a Weeek task with exact time and verify the success message mentions `30` and `15` minute reminders.
 3. Inspect the server SQLite `tasks` table if reminders do not fire and confirm new reminder marker columns exist.
 4. If needed, fine-tune reminder text only after verifying live scheduling behavior.
+
+### Live Deploy Confirmation (same session)
+
+- Linux deploy completed successfully after the code changes above.
+- Live server checkout: `/home/sanya/mira-task-bot`
+- Live commit on server: `e1bdb6d`
+- Server validation after deploy:
+  - `.venv/bin/python -m py_compile bot.py database.py weeek_client.py tests/test_time_parsing.py` — passed
+  - `.venv/bin/python -m unittest tests.test_time_parsing` — passed (`47 tests`, `OK`)
+- Live service status after restart:
+  - `mira-task-bot.service` is `active (running)`
+  - `Main PID`: `63554`
+- Startup logs confirm live config still uses:
+  - parse model `gpt-5.4-mini`
+  - STT model `gpt-4o-mini-transcribe`
+  - `timeout=90`, `max_retries=3`
