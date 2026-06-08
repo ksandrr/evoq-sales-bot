@@ -76,6 +76,25 @@ OPENAI_TIMEOUT_SECONDS = _int_env("OPENAI_TIMEOUT_SECONDS", 90)
 OPENAI_MAX_RETRIES = _int_env("OPENAI_MAX_RETRIES", 3)
 
 
+def _append_no_proxy_host(env_name: str, host: str) -> bool:
+    raw_value = os.environ.get(env_name, "")
+    items = [item.strip() for item in raw_value.split(",") if item.strip()]
+    if host in items:
+        return False
+    items.append(host)
+    os.environ[env_name] = ",".join(items)
+    return True
+
+
+def _ensure_openai_direct_env() -> None:
+    # The server-wide proxy route is flaky for OpenAI; force direct API access.
+    changed = False
+    for env_name in ("NO_PROXY", "no_proxy"):
+        changed = _append_no_proxy_host(env_name, "api.openai.com") or changed
+    if changed:
+        logger.info("Updated NO_PROXY for direct OpenAI access")
+
+
 class SecretRedactionFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()
@@ -91,6 +110,8 @@ class SecretRedactionFilter(logging.Filter):
 
 for handler in logging.getLogger().handlers:
     handler.addFilter(SecretRedactionFilter())
+
+_ensure_openai_direct_env()
 
 
 def _openai_client_kwargs() -> dict:
