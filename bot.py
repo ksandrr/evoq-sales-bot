@@ -596,6 +596,7 @@ def detect_top_level_route(text: str) -> dict:
     return {
         "target": target,
         "project": project,
+        "board_name_candidate": extract_board_candidate(normalized),
         "column_hint": normalize_weeek_column_hint(normalized),
         "parent_task_candidate": extract_parent_task_candidate(normalized),
     }
@@ -607,16 +608,6 @@ def match_weeek_target(text: str) -> dict | None:
         if any(alias in normalized for alias in item["aliases"]):
             return dict(item)
     return None
-
-
-def _should_auto_select_project_board(project: dict | None) -> bool:
-    if not project:
-        return False
-    return bool(
-        str(project.get("project_id") or "") == "5"
-        and project.get("board_id")
-        and project.get("board_name")
-    )
 
 
 def extract_parent_task_candidate(text: str) -> str:
@@ -632,6 +623,50 @@ def extract_parent_task_candidate(text: str) -> str:
     if match:
         return _compact_spaces(match.group(1)).strip(" .,!?:;")
     return ""
+
+
+def extract_board_candidate(text: str) -> str:
+    normalized = _compact_spaces(text)
+    patterns = (
+        r"(?:в|во)\s+доск(?:у|е)\s+[\"«]?(.+?)[\"»]?(?:\s+(?:в|во)\s+проект\b|\s+(?:к|в)\s+работе\b|[,.!?:;]|$)",
+        r"доск(?:а|у|е)\s*[:\-]\s*[\"«]?(.+?)[\"»]?(?:\s+(?:в|во)\s+проект\b|\s+(?:к|в)\s+работе\b|[,.!?:;]|$)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, normalized, flags=re.IGNORECASE)
+        if match:
+            return _compact_spaces(match.group(1)).strip(" .,!?:;")
+    return ""
+
+
+def _match_weeek_board(boards: list[dict], candidate: str) -> tuple[dict | None, str]:
+    if not candidate:
+        return None, ""
+    normalized_candidate = _normalize_text(candidate)
+    exact = [board for board in boards if _compact_spaces(board.get("name") or "") == candidate]
+    if len(exact) == 1:
+        return exact[0], "exact"
+
+    normalized = [board for board in boards if _normalize_text(board.get("name") or "") == normalized_candidate]
+    if len(normalized) == 1:
+        return normalized[0], "normalized"
+
+    contains = [
+        board for board in boards
+        if normalized_candidate in _normalize_text(board.get("name") or "")
+        or _normalize_text(board.get("name") or "") in normalized_candidate
+    ]
+    if len(contains) == 1:
+        return contains[0], "fuzzy"
+
+    scored = []
+    for board in boards:
+        ratio = difflib.SequenceMatcher(None, normalized_candidate, _normalize_text(board.get("name") or "")).ratio()
+        if ratio >= 0.72:
+            scored.append((ratio, board))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    if scored and (len(scored) == 1 or scored[0][0] >= scored[1][0] + 0.12):
+        return scored[0][1], "fuzzy"
+    return None, ""
 
 
 def _column_matches_hint(name: str, hint: str) -> bool:
@@ -1565,7 +1600,7 @@ def classify_capture_text(text: str) -> dict:
         "clarification_reason": "не хватает точного времени" if needs_time_clarification else "",
         "target": route.get("target") or "",
         "project_name_candidate": (route.get("project") or {}).get("project_name", ""),
-        "board_name_candidate": (route.get("project") or {}).get("board_name", ""),
+        "board_name_candidate": route.get("board_name_candidate", ""),
         "column_hint": route.get("column_hint", ""),
         "parent_task_candidate": route.get("parent_task_candidate", ""),
         "transcript_clean": clean,
@@ -1609,7 +1644,7 @@ async def classify_capture(update: Update, text: str, forced_type: str | None = 
     capture["title"] = _compact_spaces(capture.get("title") or generate_capture_title(text, capture["type"]))
     capture["target"] = capture.get("target") or ""
     capture["project_name_candidate"] = capture.get("project_name_candidate") or ""
-    capture["board_name_candidate"] = capture.get("board_name_candidate") or ""
+    capture["board_name_candidate"] = capture.get("board_name_candidate") or extract_board_candidate(text)
     capture["column_hint"] = capture.get("column_hint") or normalize_weeek_column_hint(text)
     capture["parent_task_candidate"] = capture.get("parent_task_candidate") or extract_parent_task_candidate(text)
     capture["transcript_clean"] = _compact_spaces(capture.get("transcript_clean") or text)
@@ -1859,31 +1894,63 @@ def _build_reminder_text(ideas) -> str:
     )
 
 
+async def _build_weeek_daily_digest() -> str:
+    if not weeek_available():
+        return "Интеграция с Weeek не настроена."
+
+    client = get_weeek_client()
+    projects = await client.list_projects()
+    if not projects:
+        return "В Weeek пока нет доступных проектов."
+
+    blocks: list[str] = []
+    for project in projects:
+        try:
+            boards = await client.list_boards(project.id)
+            tasks = await client.list_tasks(project_id=project.id)
+        except WeeekApiError as exc:
+            _log_event("weeek_daily_digest_project_failed", project_id=project.id, error=str(exc))
+            continue
+
+        columns_by_id: dict[str, dict] = {}
+        for board in boards:
+            try:
+                columns = await client.list_columns(board.id)
+            except WeeekApiError:
+                continue
+            for column in columns:
+                columns_by_id[str(column.id)] = {"id": str(column.id), "name": column.name, "raw": column.raw}
+
+        mapped_tasks = [{"id": option.id, "name": option.name, "raw": option.raw} for option in tasks]
+        blocks.append(_format_weeek_tasks_overview(project.name, mapped_tasks, columns_by_id))
+
+    if not blocks:
+        return "Не удалось собрать ежедневную сводку по Weeek."
+
+    return "👋 Напоминаю про задачи в Weeek:\n\n" + "\n\n".join(blocks)
+
+
 async def test_reminder(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    ideas = db.get_user_ideas(user_id)
-    if not ideas:
+    try:
+        text = await _build_weeek_daily_digest()
+    except WeeekApiError as exc:
+        _log_event("weeek_daily_digest_manual_failed", error=str(exc))
         await update.message.reply_text(
-            "Сначала добавь хотя бы одну идею — тогда я смогу показать, как выглядит напоминание.",
+            "Не удалось получить ежедневную сводку из Weeek. Попробуй ещё раз чуть позже.",
             reply_markup=main_menu_keyboard(),
         )
         return
 
-    await update.message.reply_html(
-        _build_reminder_text(ideas),
-        reply_markup=main_menu_keyboard(),
-    )
+    await update.message.reply_html(text, reply_markup=main_menu_keyboard())
 
 
 async def send_daily_reminder(context: ContextTypes.DEFAULT_TYPE):
     user_id = context.job.data["user_id"]
-    ideas = db.get_user_ideas(user_id)
-    if not ideas:
-        return
     try:
+        text = await _build_weeek_daily_digest()
         await context.bot.send_message(
             chat_id=user_id,
-            text=_build_reminder_text(ideas),
+            text=text,
             parse_mode=ParseMode.HTML,
         )
     except Exception:
@@ -4009,6 +4076,21 @@ async def _send_weeek_board_picker(message, context: ContextTypes.DEFAULT_TYPE):
 
     draft["boards"] = [{"id": option.id, "name": option.name, "raw": option.raw} for option in boards]
     _log_event("weeek_boards_loaded", count=len(draft["boards"]), project_id=project_id)
+    candidate = draft.get("board_name_candidate") or ""
+    matched_board, match_source = _match_weeek_board(draft["boards"], candidate)
+    if matched_board:
+        draft["board_id"] = matched_board["id"]
+        draft["board_name"] = matched_board["name"]
+        _log_event(
+            "weeek_board_auto_selected",
+            board_id=matched_board["id"],
+            board_name=matched_board["name"],
+            match_source=match_source,
+        )
+        if draft.get("target") == "weeek_subtask":
+            return await _send_weeek_parent_picker(message, context)
+        return await _send_weeek_column_picker(message, context)
+
     await message.reply_text(
         "Теперь выбери доску:",
         reply_markup=_weeek_options_keyboard(draft["boards"], "weeek_board"),
@@ -4179,6 +4261,7 @@ async def _start_weeek_capture(update: Update, context: ContextTypes.DEFAULT_TYP
         {
             "capture": capture,
             "target": route.get("target") or capture.get("target") or "weeek_task",
+            "board_name_candidate": route.get("board_name_candidate") or capture.get("board_name_candidate") or "",
             "column_hint": route.get("column_hint") or capture.get("column_hint") or normalize_weeek_column_hint(raw_text),
             "parent_task_candidate": route.get("parent_task_candidate") or capture.get("parent_task_candidate") or "",
         }
@@ -4199,10 +4282,7 @@ async def _start_weeek_capture(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
     if auto_project:
-        if draft.get("target") == "weeek_subtask":
-            next_state = await _send_weeek_parent_picker(update.message, context)
-        else:
-            next_state = await _send_weeek_column_picker(update.message, context)
+        next_state = await _send_weeek_board_picker(update.message, context)
     else:
         next_state = await _send_weeek_project_picker(update.message, context)
     return next_state if return_state else ConversationHandler.END
@@ -4478,14 +4558,9 @@ async def weeek_project_callback(update: Update, context: ContextTypes.DEFAULT_T
         return await _send_weeek_project_picker(query.message, context)
     draft["project_id"] = project["id"]
     draft["project_name"] = project["name"]
+    for key in ("board_id", "board_name", "boards", "columns", "column_id", "column_name", "parent_tasks", "parent_task_id", "parent_task_name"):
+        draft.pop(key, None)
     _log_event("weeek_project_selected", project_id=project["id"], project_name=project["name"])
-    known_project = WEEEK_TARGETS.get(str(project["id"]))
-    if _should_auto_select_project_board(known_project):
-        draft["board_id"] = known_project["board_id"]
-        draft["board_name"] = known_project["board_name"]
-        if draft.get("target") == "weeek_subtask":
-            return await _send_weeek_parent_picker(query.message, context)
-        return await _send_weeek_column_picker(query.message, context)
     return await _send_weeek_board_picker(query.message, context)
 
 

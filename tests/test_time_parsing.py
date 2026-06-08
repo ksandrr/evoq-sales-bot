@@ -711,7 +711,7 @@ class WeeekProjectBoardSelectionTests(unittest.TestCase):
         board_picker.assert_awaited_once()
         column_picker.assert_not_awaited()
 
-    def test_vibecoding_project_keeps_auto_board(self):
+    def test_vibecoding_project_opens_board_picker(self):
         draft = {
             "projects": [
                 {"id": "5", "name": "Vibecoding SANYA&EGOR", "raw": {}},
@@ -731,11 +731,24 @@ class WeeekProjectBoardSelectionTests(unittest.TestCase):
         ) as column_picker:
             result = asyncio.run(bot.weeek_project_callback(update, context))
 
-        self.assertEqual(result, bot.WEEEK_COLUMN)
-        self.assertEqual(draft["board_id"], "9")
-        self.assertEqual(draft["board_name"], bot.WEEEK_TARGETS["5"]["board_name"])
-        column_picker.assert_awaited_once()
-        board_picker.assert_not_awaited()
+        self.assertEqual(result, bot.WEEEK_BOARD)
+        self.assertEqual(draft["project_id"], "5")
+        self.assertEqual(draft["project_name"], "Vibecoding SANYA&EGOR")
+        board_picker.assert_awaited_once()
+        column_picker.assert_not_awaited()
+
+    def test_match_weeek_board_finds_named_board(self):
+        boards = [
+            {"id": "10", "name": "Моя доска"},
+            {"id": "11", "name": "Мира"},
+            {"id": "12", "name": "CRM Бот"},
+            {"id": "13", "name": "Продажи"},
+        ]
+
+        board, source = bot._match_weeek_board(boards, "crm бот")
+
+        self.assertEqual(board["id"], "12")
+        self.assertIn(source, {"exact", "normalized", "fuzzy"})
 
 
 class WeeekPayloadTests(unittest.TestCase):
