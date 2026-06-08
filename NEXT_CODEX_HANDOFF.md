@@ -1451,3 +1451,105 @@ httpx.Client(timeout=30.0, trust_env=False).get('https://api.openai.com/v1/model
    - current likely case: OpenAI fails and bot reports fallback status in `/voice`
 3. If proxy is still failing, the next useful step is not prompt tuning but fixing the Xray/OpenAI transport itself.
 4. Specifically inspect the Xray config and outbound health with someone who has root access, because `/usr/local/etc/xray/config.json` is not readable by user `sanya`.
+
+## Session 2026-06-08: Replaced legacy idea reminders with Weeek digest and restored board choice
+
+### Session Goal
+
+- Remove the leftover legacy daily reminder about local ideas.
+- Make the daily reminder use Weeek data instead, grouped by project.
+- Stop auto-selecting a hidden default board and explicitly ask for the board unless it is clearly named in the user message.
+
+### Root Cause
+
+- The old local `ideas` subsystem still existed in code and was still the source for daily reminder jobs.
+- Because reminder jobs were scheduled from the `reminders` table and still called `send_daily_reminder(...)`, the bot could continue sending:
+  - `Привет! Напоминаю про твои идеи ...`
+- The Weeek task creation flow still had a project-specific auto-board shortcut for known projects, which skipped the board selection step even when the user did not specify a board.
+
+### Code Changes
+
+- In `bot.py`:
+  - added `extract_board_candidate(...)` to pull an explicit board name from voice/text phrases like `в доску CRM Бот`
+  - added `_match_weeek_board(...)` to fuzzy-match the parsed board candidate against boards returned by Weeek
+  - `detect_top_level_route(...)` now carries `board_name_candidate`
+  - `classify_capture_text(...)` and `classify_capture(...)` now preserve a real board candidate instead of filling it from a hidden default board
+  - `_start_weeek_capture(...)` now stores `board_name_candidate` in the draft
+  - `_send_weeek_board_picker(...)` now:
+    - auto-selects a board only when the user actually named one and the match is reliable
+    - otherwise shows the board picker
+  - `weeek_project_callback(...)` no longer auto-injects a board for Vibecoding or Personal projects
+  - daily reminder flow was switched from local `ideas` to a Weeek digest:
+    - added `_build_weeek_daily_digest()`
+    - `send_daily_reminder(...)` now sends project-grouped Weeek overview instead of local ideas
+    - `test_reminder(...)` now also previews the Weeek digest
+- In `tests/test_time_parsing.py`:
+  - updated project selection tests so both Personal and Vibecoding projects open the board picker
+  - added a regression test for `_match_weeek_board(...)`
+
+### Files Edited
+
+- `bot.py`
+- `tests/test_time_parsing.py`
+- `NEXT_CODEX_HANDOFF.md`
+
+### Validation Commands
+
+Local:
+
+```powershell
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m unittest tests.test_time_parsing
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m py_compile bot.py weeek_client.py tests\test_time_parsing.py
+```
+
+Linux server:
+
+```bash
+cd /home/sanya/mira-task-bot
+pwd
+whoami
+git status --short --branch
+git log --oneline -5
+git remote -v
+git fetch origin tembo/telegram-idea-bot-daily-reminders
+git reset --hard 36cf37b
+.venv/bin/python -m py_compile bot.py weeek_client.py tests/test_time_parsing.py
+.venv/bin/python -m unittest tests.test_time_parsing
+systemctl status mira-task-bot.service --no-pager -l
+journalctl -u mira-task-bot.service -n 30 --no-pager
+```
+
+### Validation Results
+
+- Local `unittest`: passed (`51 tests`, `OK`)
+- Local `py_compile`: passed
+- Server `unittest`: passed (`51 tests`, `OK`)
+- Server `py_compile`: passed
+- Live service restarted successfully after deploy
+- New live `Main PID`: `105669`
+
+### Deploy Status
+
+- GitHub commit with code fix: `36cf37b` (`Switch reminders and board picking to Weeek`)
+- Linux deploy: performed
+- Live server checkout reset to `36cf37b`
+- Live process restarted successfully via systemd auto-restart path
+
+### Server / Env Changes
+
+- Server `.env`: not changed in this session
+- Server systemd config: not changed in this session
+
+### Remaining Problems / Notes
+
+1. Legacy local `ideas` tables and callbacks still exist in the repository, but the daily reminder path is no longer using them.
+2. A fresh manual Telegram test is still needed for:
+   - one message without board name: should ask for project, then board
+   - one message with explicit board like `в доску CRM Бот`: should skip board picker if matched confidently
+3. OpenAI/Xray transport investigation remains a separate concern from this reminder/board fix.
+
+### First Checks For Next Codex
+
+1. Trigger `/start`, then send a new voice or text task without naming a board and verify the bot asks for the board after project selection.
+2. Send a task with an explicit board name and verify it is matched automatically.
+3. At the next daily reminder window, confirm the message is now a Weeek project digest instead of `Напоминаю про твои идеи`.
