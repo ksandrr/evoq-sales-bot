@@ -1319,3 +1319,135 @@ journalctl -u mira-task-bot.service -n 18 --no-pager
    - `capture_gpt_parse_succeeded`
 2. If OpenAI still fails intermittently, inspect server-side network stability/Xray path rather than prompt wording first.
 3. Only if OpenAI path is stable and summaries are still weak, then tune the GPT parse prompt/title-body shaping logic.
+
+## Session 2026-06-08: Reverted direct OpenAI bypass and confirmed Xray proxy failure mode
+
+### Session Goal
+
+- Re-check the live voice path after a manual Telegram test still showed poor transcript/title/body quality.
+- Verify whether Mira was really using `gpt-4o-mini-transcribe` / `gpt-5.4-mini` or only reporting them.
+- Restore the intended proxy-based OpenAI route instead of the temporary direct-route workaround.
+
+### Root Cause Confirmed
+
+- The previous direct-route fix in commit `da5fab8` was wrong for this production server.
+- Live server testing showed:
+  - direct OpenAI access returns `403 unsupported_country_region_territory`
+  - proxy/Xray access on `127.0.0.1:10809` fails before a usable TLS session is established
+  - explicit proxy probes from the server produced either:
+    - `HTTP/1.1 503 Service Unavailable`
+    - or `SSL: UNEXPECTED_EOF_WHILE_READING`
+- Recent live Mira logs from the bad Telegram examples also showed:
+  - `openai_stt_request_started model='gpt-4o-mini-transcribe'`
+  - `primary_stt_failed code=openai_stt_unsupported_region ...`
+  - `speech_engine=vosk`
+  - `capture_gpt_parse_failed ... source='rules'`
+- So the poor Telegram result is caused by real transport failure to OpenAI, after which the bot falls back to `Vosk + rules`.
+
+### Code Changes
+
+- In `bot.py`:
+  - removed `_append_no_proxy_host(...)`
+  - removed `_ensure_openai_direct_env()`
+  - stopped force-adding `api.openai.com` into `NO_PROXY`
+  - added lightweight runtime status tracking for:
+    - last OpenAI STT result
+    - last GPT parse result
+  - changed `/voice` output so it now shows:
+    - configured primary STT
+    - last OpenAI STT runtime result
+    - last GPT parse runtime result
+- In `tests/test_time_parsing.py`:
+  - removed the regression test for direct OpenAI bypass
+  - added a regression test for `_voice_runtime_status_lines()`
+
+### Files Edited
+
+- `bot.py`
+- `tests/test_time_parsing.py`
+- `NEXT_CODEX_HANDOFF.md`
+
+### Validation Commands
+
+Local:
+
+```powershell
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m unittest tests.test_time_parsing
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m py_compile bot.py weeek_client.py tests\test_time_parsing.py
+```
+
+Linux server:
+
+```bash
+cd /home/sanya/mira-task-bot
+pwd
+whoami
+git status --short --branch
+git log --oneline -5
+git remote -v
+git fetch origin tembo/telegram-idea-bot-daily-reminders
+git reset --hard 004b5e8
+.venv/bin/python -m py_compile bot.py weeek_client.py tests/test_time_parsing.py
+.venv/bin/python -m unittest tests.test_time_parsing
+systemctl status mira-task-bot.service --no-pager -l
+journalctl -u mira-task-bot.service -n 30 --no-pager
+```
+
+Additional proxy diagnostics on the Linux server:
+
+```bash
+curl -I --max-time 20 --proxy http://127.0.0.1:10809 https://api.openai.com/v1/models
+curl -I --max-time 20 --socks5-hostname 127.0.0.1:10808 https://api.openai.com/v1/models
+```
+
+Python connectivity probe on the Linux server:
+
+```bash
+httpx.Client(timeout=30.0, trust_env=False, proxy='http://127.0.0.1:10809').get('https://api.openai.com/v1/models', ...)
+httpx.Client(timeout=30.0, trust_env=False).get('https://api.openai.com/v1/models', ...)
+```
+
+### Validation Results
+
+- Local `unittest`: passed (`50 tests`, `OK`)
+- Local `py_compile`: passed
+- Server `unittest`: passed (`50 tests`, `OK`)
+- Server `py_compile`: passed
+- Direct OpenAI route from server returned `403 unsupported_country_region_territory`
+- Proxy OpenAI route through Xray still failed with `503` / TLS EOF behavior
+- Live service restarted successfully after deploy
+- New live `Main PID`: `102237`
+- Startup logs confirm live code still uses:
+  - parse model `gpt-5.4-mini`
+  - STT model `gpt-4o-mini-transcribe`
+  - timeout `90`
+  - max retries `3`
+
+### Deploy Status
+
+- GitHub commit with code fix: `004b5e8` (`Restore proxy route diagnostics for OpenAI voice`)
+- Linux deploy: performed
+- Live server checkout reset to `004b5e8`
+- Live process restarted successfully via systemd auto-restart path
+
+### Server / Env Changes
+
+- Server `.env`: not changed in this session
+- Server systemd proxy drop-ins: not changed in this session
+- Important live conclusion:
+  - the intended Xray proxy path exists, but it is not currently providing a healthy HTTPS route for OpenAI
+
+### Remaining Problems
+
+1. OpenAI over the intended Xray route is still broken at the server-network layer, outside normal bot-code logic.
+2. Because of that, live voice still degrades to `Vosk + rules`, which causes the poor transcript/title/body quality seen in Telegram.
+3. `/voice` is now more honest about runtime status, but it does not by itself repair the transport problem.
+
+### First Checks For Next Codex
+
+1. Test a fresh voice message in Telegram and then immediately open `journalctl -u mira-task-bot.service -n 80 --no-pager`.
+2. Expect one of two outcomes:
+   - best case: `openai_stt_request_succeeded` and `capture_gpt_parse_succeeded`
+   - current likely case: OpenAI fails and bot reports fallback status in `/voice`
+3. If proxy is still failing, the next useful step is not prompt tuning but fixing the Xray/OpenAI transport itself.
+4. Specifically inspect the Xray config and outbound health with someone who has root access, because `/usr/local/etc/xray/config.json` is not readable by user `sanya`.
