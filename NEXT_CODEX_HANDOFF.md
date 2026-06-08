@@ -1244,3 +1244,78 @@ journalctl -u mira-task-bot.service -n 18 --no-pager
   - parse model `gpt-5.4-mini`
   - STT model `gpt-4o-mini-transcribe`
   - `timeout=90`, `max_retries=3`
+
+## Session 2026-06-08: Fixed degraded voice quality by bypassing proxy for OpenAI
+
+### Session Goal
+
+- Investigate why live Mira voice capture suddenly produced poor transcripts and poor task summaries despite reporting `gpt-4o-mini-transcribe` and `gpt-5.4-mini`.
+- Verify latest remote/server state first to avoid debugging an outdated checkout.
+
+### What Was Verified First
+
+- Local branch was behind remote by newer commits from another session.
+- Remote/server branch had newer commits up to `213e898` before this fix.
+- Live server checkout `/home/sanya/mira-task-bot` was already ahead of the old local state.
+
+### Root Cause Found
+
+- The issue was not primarily prompt quality.
+- In live server logs, the bad voice cases showed:
+  - `primary_stt_failed ... error=Connection error.`
+  - `speech_engine=vosk`
+  - `capture_gpt_parse_failed ... source='rules'`
+- So the bot was frequently failing both OpenAI STT and GPT parsing, then falling back to `Vosk + rules`, which explains the visibly bad transcript/title/body quality in Telegram.
+- Server config confirmed the service inherited a global proxy route from systemd (`10-proxy.conf`) and only Telegram had been excluded from proxying. OpenAI was still going through the flaky proxy path.
+
+### Code Fix
+
+- In `bot.py`:
+  - added `_append_no_proxy_host(...)`
+  - added `_ensure_openai_direct_env()`
+  - now force-add `api.openai.com` to both `NO_PROXY` and `no_proxy` before OpenAI client initialization
+  - added startup log `Updated NO_PROXY for direct OpenAI access`
+- In `tests/test_time_parsing.py`:
+  - added regression test to verify `_ensure_openai_direct_env()` appends `api.openai.com` exactly once to both env vars
+
+### Files Edited
+
+- `bot.py`
+- `tests/test_time_parsing.py`
+- `NEXT_CODEX_HANDOFF.md`
+
+### Validation
+
+- Local `unittest`: passed (`50 tests`, `OK`)
+- Local `py_compile`: passed
+- Server `unittest`: passed (`50 tests`, `OK`)
+- Server `py_compile`: passed
+
+### Deploy Status
+
+- GitHub commit with code fix: `da5fab8` (`Bypass proxy for OpenAI API`)
+- Linux deploy: performed
+- Live server checkout reset to `da5fab8`
+- Live process restarted successfully via systemd auto-restart path
+- New live `Main PID`: `99365`
+
+### Live Evidence After Deploy
+
+- Startup log includes: `Updated NO_PROXY for direct OpenAI access`
+- Service is `active (running)` after restart
+- Existing proxy env still exists for the service, but the process now explicitly excludes OpenAI API from proxy routing at runtime
+
+### Remaining Risks / Manual Checks
+
+1. This fix addresses the observed network-path failure, which was the direct cause of `Vosk + rules` fallback in the bad examples.
+2. A fresh manual Telegram voice test is still required to confirm the OpenAI path now stays on `gpt-4o-mini-transcribe` and `gpt-5.4-mini` in practice for new messages.
+3. The SSH alias `ksandrr-linux` on this PC is still occasionally flaky; direct key-based SSH to `92.124.137.131:2324` remains the reliable fallback.
+
+### First Checks For Next Codex
+
+1. Send a new long voice task in Telegram and inspect live logs for:
+   - `openai_stt_request_succeeded`
+   - `speech_engine=openai:gpt-4o-mini-transcribe`
+   - `capture_gpt_parse_succeeded`
+2. If OpenAI still fails intermittently, inspect server-side network stability/Xray path rather than prompt wording first.
+3. Only if OpenAI path is stable and summaries are still weak, then tune the GPT parse prompt/title-body shaping logic.
