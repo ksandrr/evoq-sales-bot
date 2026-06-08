@@ -60,6 +60,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+_last_openai_stt_status = "not_tested"
+_last_openai_stt_error = ""
+_last_capture_parse_status = "not_tested"
+
 
 def _int_env(name: str, default: int) -> int:
     raw_value = (os.getenv(name) or "").strip()
@@ -74,25 +78,6 @@ def _int_env(name: str, default: int) -> int:
 
 OPENAI_TIMEOUT_SECONDS = _int_env("OPENAI_TIMEOUT_SECONDS", 90)
 OPENAI_MAX_RETRIES = _int_env("OPENAI_MAX_RETRIES", 3)
-
-
-def _append_no_proxy_host(env_name: str, host: str) -> bool:
-    raw_value = os.environ.get(env_name, "")
-    items = [item.strip() for item in raw_value.split(",") if item.strip()]
-    if host in items:
-        return False
-    items.append(host)
-    os.environ[env_name] = ",".join(items)
-    return True
-
-
-def _ensure_openai_direct_env() -> None:
-    # The server-wide proxy route is flaky for OpenAI; force direct API access.
-    changed = False
-    for env_name in ("NO_PROXY", "no_proxy"):
-        changed = _append_no_proxy_host(env_name, "api.openai.com") or changed
-    if changed:
-        logger.info("Updated NO_PROXY for direct OpenAI access")
 
 
 class SecretRedactionFilter(logging.Filter):
@@ -110,8 +95,6 @@ class SecretRedactionFilter(logging.Filter):
 
 for handler in logging.getLogger().handlers:
     handler.addFilter(SecretRedactionFilter())
-
-_ensure_openai_direct_env()
 
 
 def _openai_client_kwargs() -> dict:
@@ -167,6 +150,36 @@ def _voice_status_summary() -> str:
     if _vosk_available() and shutil.which("ffmpeg"):
         return "Vosk fallback"
     return "disabled"
+
+
+def _record_openai_stt_status(status: str, error_code: str = "") -> None:
+    global _last_openai_stt_status, _last_openai_stt_error
+    _last_openai_stt_status = status
+    _last_openai_stt_error = error_code
+
+
+def _record_capture_parse_status(status: str) -> None:
+    global _last_capture_parse_status
+    _last_capture_parse_status = status
+
+
+def _voice_runtime_status_lines() -> list[str]:
+    lines = [f"<b>Configured primary STT:</b> {html.escape(_voice_status_summary())}"]
+    if _last_openai_stt_status == "ok":
+        lines.append("<b>Last OpenAI STT result:</b> success")
+    elif _last_openai_stt_status == "fallback":
+        detail = html.escape(_last_openai_stt_error or "unknown_error")
+        lines.append(f"<b>Last OpenAI STT result:</b> fallback to Vosk ({detail})")
+    else:
+        lines.append("<b>Last OpenAI STT result:</b> not tested since current startup")
+
+    if _last_capture_parse_status == "gpt":
+        lines.append("<b>Last GPT parse result:</b> success")
+    elif _last_capture_parse_status == "rules":
+        lines.append("<b>Last GPT parse result:</b> rules fallback")
+    else:
+        lines.append("<b>Last GPT parse result:</b> not tested since current startup")
+    return lines
 
 
 def _vosk_model_dir() -> str:
@@ -1809,7 +1822,7 @@ async def voice_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "• Vosk сам скачает русскую модель (~45 МБ) при первом голосовом.\n\n"
             "После установки перезапусти сервис бота."
         )
-    text += f"\n\n<b>Active STT path:</b> {html.escape(_voice_status_summary())}"
+    text += "\n\n" + "\n".join(_voice_runtime_status_lines())
     await update.message.reply_html(text, reply_markup=main_menu_keyboard(), disable_web_page_preview=True)
 
 
@@ -3586,11 +3599,13 @@ async def transcribe_voice(voice_file, update: Update | None = None):
                 _log_event("openai_stt_request_started", model=OPENAI_STT_MODEL, **meta)
                 text = await _async_call(_openai_transcribe_file, tmp_path)
                 if text:
+                    _record_openai_stt_status("ok")
                     _log_event("openai_stt_request_succeeded", model=OPENAI_STT_MODEL, transcript=text, **meta)
                     logger.info("voice transcription engine=%s", _openai_stt_engine_label())
                     return {"text": text, "engine": _openai_stt_engine_label()}
             except Exception as exc:
                 openai_error = _openai_stt_error_code(exc)
+                _record_openai_stt_status("fallback", openai_error)
                 logger.warning(
                     "primary_stt_failed code=%s model=%s official_api=true fallback=vosk error=%s",
                     openai_error,
@@ -3599,6 +3614,7 @@ async def transcribe_voice(voice_file, update: Update | None = None):
                 )
             else:
                 openai_error = "openai_stt_empty"
+                _record_openai_stt_status("fallback", openai_error)
         else:
             openai_error = ""
 
@@ -4320,6 +4336,7 @@ async def classify_capture(update: Update, text: str, forced_type: str | None = 
     _log_event("capture_gpt_parse_started", model=OPENAI_PARSE_MODEL, forced_type=forced_type or "", transcript=text)
     parsed = await parse_capture_with_gpt(text, default_timezone)
     if parsed:
+        _record_capture_parse_status("gpt")
         capture = parsed
         _log_event(
             "capture_gpt_parse_succeeded",
@@ -4330,6 +4347,7 @@ async def classify_capture(update: Update, text: str, forced_type: str | None = 
             source=capture.get("source", ""),
         )
     else:
+        _record_capture_parse_status("rules")
         capture = classify_capture_text(text)
         _log_event(
             "capture_gpt_parse_failed",
@@ -4763,7 +4781,7 @@ async def voice_instructions(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "• Vosk сам скачает русскую модель (~45 МБ) при первом голосовом.\n\n"
             "После установки перезапусти сервис бота."
         )
-    text += f"\n\n<b>Active STT path:</b> {html.escape(_voice_status_summary())}"
+    text += "\n\n" + "\n".join(_voice_runtime_status_lines())
     await update.message.reply_html(text, reply_markup=main_menu_keyboard(), disable_web_page_preview=True)
 
 

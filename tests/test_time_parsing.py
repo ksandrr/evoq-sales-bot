@@ -237,27 +237,27 @@ class VoiceAndWeeekTests(unittest.TestCase):
         self.assertEqual(kwargs["timeout"], bot.OPENAI_TIMEOUT_SECONDS)
         self.assertEqual(kwargs["max_retries"], bot.OPENAI_MAX_RETRIES)
 
-    def test_ensure_openai_direct_env_adds_api_host_to_no_proxy(self):
-        old_upper = os.environ.get("NO_PROXY")
-        old_lower = os.environ.get("no_proxy")
+    def test_voice_runtime_status_lines_report_last_fallback(self):
+        old_stt_status = bot._last_openai_stt_status
+        old_stt_error = bot._last_openai_stt_error
+        old_parse_status = bot._last_capture_parse_status
+        old_summary = bot._voice_status_summary
         try:
-            os.environ["NO_PROXY"] = "127.0.0.1,localhost"
-            os.environ["no_proxy"] = "127.0.0.1,localhost"
-            bot._ensure_openai_direct_env()
+            bot._last_openai_stt_status = "fallback"
+            bot._last_openai_stt_error = "openai_stt_failed"
+            bot._last_capture_parse_status = "rules"
+            bot._voice_status_summary = lambda: "OpenAI STT: gpt-4o-mini-transcribe"
 
-            self.assertIn("api.openai.com", os.environ["NO_PROXY"])
-            self.assertIn("api.openai.com", os.environ["no_proxy"])
-            self.assertEqual(os.environ["NO_PROXY"].count("api.openai.com"), 1)
-            self.assertEqual(os.environ["no_proxy"].count("api.openai.com"), 1)
+            lines = bot._voice_runtime_status_lines()
+
+            self.assertEqual(lines[0], "<b>Configured primary STT:</b> OpenAI STT: gpt-4o-mini-transcribe")
+            self.assertIn("fallback to Vosk (openai_stt_failed)", lines[1])
+            self.assertIn("rules fallback", lines[2])
         finally:
-            if old_upper is None:
-                os.environ.pop("NO_PROXY", None)
-            else:
-                os.environ["NO_PROXY"] = old_upper
-            if old_lower is None:
-                os.environ.pop("no_proxy", None)
-            else:
-                os.environ["no_proxy"] = old_lower
+            bot._last_openai_stt_status = old_stt_status
+            bot._last_openai_stt_error = old_stt_error
+            bot._last_capture_parse_status = old_parse_status
+            bot._voice_status_summary = old_summary
 
     def test_official_request_kwargs_include_json_mode_without_temperature(self):
         kwargs = bot._chat_json_request_kwargs(
