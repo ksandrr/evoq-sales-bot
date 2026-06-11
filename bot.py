@@ -754,6 +754,12 @@ def _apply_weeek_draft_edit(draft: dict, field: str, value: str) -> bool:
     return True
 
 
+def _has_editable_weeek_draft(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    draft = _get_weeek_draft(context)
+    capture = draft.get("capture") or {}
+    return bool(draft.get("project_id") and draft.get("board_id") and draft.get("column_id") and capture)
+
+
 def weeek_preview_message(draft: dict) -> str:
     capture = draft.get("capture") or {}
     project = draft.get("project_name") or "—"
@@ -2913,6 +2919,7 @@ async def weeek_preview_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     data = query.data or ""
+    _log_event("weeek_preview_callback", data=data, active_flow=context.user_data.get("_active_flow", ""))
 
     if data == "weeek_cancel":
         _clear_weeek_draft(context)
@@ -2923,6 +2930,7 @@ async def weeek_preview_callback(update: Update, context: ContextTypes.DEFAULT_T
         return await _send_weeek_parent_picker(query.message, context)
 
     if data == "weeek_edit":
+        await query.answer("Выбираем, что менять в черновике.")
         return await _show_weeek_edit_menu(query.message, context)
 
     if data != "weeek_create":
@@ -4299,6 +4307,12 @@ async def _show_weeek_edit_menu(message, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     _set_active_flow(context, "weeek_edit")
     draft.pop("edit_field", None)
+    _log_event(
+        "weeek_edit_menu_opened",
+        project_id=draft.get("project_id", ""),
+        board_id=draft.get("board_id", ""),
+        column_id=draft.get("column_id", ""),
+    )
     await message.reply_text(
         "Что именно поправить в черновике? Можно нажать кнопку ниже или сразу написать/надиктовать: "
         "отредактируй описание ... или отредактируй название ...",
@@ -4358,6 +4372,24 @@ async def _apply_weeek_edit_from_text(message, context: ContextTypes.DEFAULT_TYP
         reply_markup=weeek_preview_keyboard(draft),
     )
     return await _show_weeek_preview(message, context)
+
+
+async def _maybe_handle_weeek_live_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, source: str):
+    if not _has_editable_weeek_draft(context):
+        return None
+    draft = _get_weeek_draft(context)
+    active_flow = context.user_data.get("_active_flow", "")
+    parsed = parse_weeek_edit_request(text)
+    if not parsed and not draft.get("edit_field") and active_flow not in {"weeek_preview", "weeek_edit"}:
+        return None
+    _log_event(
+        "weeek_live_edit_intercepted",
+        source=source,
+        active_flow=active_flow,
+        has_edit_field=bool(draft.get("edit_field")),
+        parsed_field=(parsed or {}).get("field", ""),
+    )
+    return await _apply_weeek_edit_from_text(update.message, context, text)
 
 
 async def _start_weeek_capture(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_text: str, return_state: bool = False):
@@ -4643,11 +4675,16 @@ async def voice_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    _clear_active_flow(context)
     await context.bot.send_chat_action(update.effective_chat.id, ChatAction.TYPING)
     text = await _transcribe_or_warn(update, context)
     if not text:
         return ConversationHandler.END
+
+    edit_result = await _maybe_handle_weeek_live_edit(update, context, text, "voice_top_level")
+    if edit_result is not None:
+        return edit_result
+
+    _clear_active_flow(context)
 
     route = detect_top_level_route(text)
     _log_event(
@@ -4894,6 +4931,10 @@ async def text_top_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     if not text:
         return ConversationHandler.END
+
+    edit_result = await _maybe_handle_weeek_live_edit(update, context, text, "text_top_level")
+    if edit_result is not None:
+        return edit_result
 
     route = detect_top_level_route(text)
     if route.get("target") in {"weeek_task", "weeek_subtask"}:

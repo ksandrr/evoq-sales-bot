@@ -788,6 +788,27 @@ class WeeekProjectBoardSelectionTests(unittest.TestCase):
         self.assertEqual(result, bot.WEEEK_PREVIEW)
         self.assertEqual(draft["capture"]["body"], "Новое описание для задачи")
 
+    def test_text_top_level_intercepts_edit_for_active_weeek_draft(self):
+        draft = {
+            "project_id": "6",
+            "board_id": "10",
+            "column_id": "29",
+            "capture": {"title": "Старый заголовок", "body": "Старое описание"},
+        }
+        context = types.SimpleNamespace(user_data={"weeek_draft": draft, "_active_flow": "weeek_preview"})
+        message = types.SimpleNamespace(
+            text="отредактируй название на Купить молоко",
+            reply_text=AsyncMock(),
+            reply_html=AsyncMock(),
+        )
+        update = types.SimpleNamespace(message=message)
+
+        with patch.object(bot, "_show_weeek_preview", AsyncMock(return_value=bot.WEEEK_PREVIEW)):
+            result = asyncio.run(bot.text_top_level(update, context))
+
+        self.assertEqual(result, bot.WEEEK_PREVIEW)
+        self.assertEqual(draft["capture"]["title"], "Купить молоко")
+
 
 class WeeekPayloadTests(unittest.TestCase):
     def test_due_datetime_is_sent_without_conflicting_due_fields(self):
