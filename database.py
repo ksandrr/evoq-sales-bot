@@ -1,0 +1,348 @@
+import os
+import sqlite3
+from datetime import datetime
+from contextlib import contextmanager
+
+DB_PATH = os.environ.get("DB_PATH", "ideas.db")
+DEFAULT_TIMEZONE = os.environ.get("DEFAULT_TIMEZONE", "Asia/Omsk")
+SQL_DEFAULT_TIMEZONE = DEFAULT_TIMEZONE.replace("'", "''")
+
+
+@contextmanager
+def _conn():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _table_columns(c, table: str):
+    return [row[1] for row in c.execute(f"PRAGMA table_info({table})").fetchall()]
+
+
+def init_db():
+    parent = os.path.dirname(DB_PATH)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with _conn() as c:
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ideas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                brief TEXT NOT NULL,
+                details TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY
+            )
+            """
+        )
+
+        user_cols = _table_columns(c, "users")
+        if "timezone" not in user_cols:
+            c.execute(f"ALTER TABLE users ADD COLUMN timezone TEXT NOT NULL DEFAULT '{SQL_DEFAULT_TIMEZONE}'")
+
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                hour INTEGER NOT NULL,
+                minute INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(user_id, hour, minute)
+            )
+            """
+        )
+
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                body TEXT NOT NULL DEFAULT '',
+                due_date TEXT NOT NULL DEFAULT '',
+                due_time TEXT NOT NULL DEFAULT '',
+                timezone TEXT NOT NULL DEFAULT '',
+                notified_at TEXT NOT NULL DEFAULT '',
+                reminder_day_sent_at TEXT NOT NULL DEFAULT '',
+                reminder_30_sent_at TEXT NOT NULL DEFAULT '',
+                reminder_15_sent_at TEXT NOT NULL DEFAULT '',
+                done INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+        task_cols = _table_columns(c, "tasks")
+        if "title" not in task_cols:
+            c.execute("ALTER TABLE tasks ADD COLUMN title TEXT NOT NULL DEFAULT ''")
+        if "body" not in task_cols:
+            c.execute("ALTER TABLE tasks ADD COLUMN body TEXT NOT NULL DEFAULT ''")
+        if "due_date" not in task_cols:
+            c.execute("ALTER TABLE tasks ADD COLUMN due_date TEXT NOT NULL DEFAULT ''")
+        if "due_time" not in task_cols:
+            c.execute("ALTER TABLE tasks ADD COLUMN due_time TEXT NOT NULL DEFAULT ''")
+        if "timezone" not in task_cols:
+            c.execute("ALTER TABLE tasks ADD COLUMN timezone TEXT NOT NULL DEFAULT ''")
+        if "notified_at" not in task_cols:
+            c.execute("ALTER TABLE tasks ADD COLUMN notified_at TEXT NOT NULL DEFAULT ''")
+        if "reminder_day_sent_at" not in task_cols:
+            c.execute("ALTER TABLE tasks ADD COLUMN reminder_day_sent_at TEXT NOT NULL DEFAULT ''")
+        if "reminder_30_sent_at" not in task_cols:
+            c.execute("ALTER TABLE tasks ADD COLUMN reminder_30_sent_at TEXT NOT NULL DEFAULT ''")
+        if "reminder_15_sent_at" not in task_cols:
+            c.execute("ALTER TABLE tasks ADD COLUMN reminder_15_sent_at TEXT NOT NULL DEFAULT ''")
+
+        # Миграция: если в старой схеме были reminder_hour/reminder_minute —
+        # перенесём их в таблицу reminders, чтобы существующие напоминания не пропали.
+        user_cols = _table_columns(c, "users")
+        if "reminder_hour" in user_cols and "reminder_minute" in user_cols:
+            c.execute(
+                """
+                INSERT OR IGNORE INTO reminders (user_id, hour, minute)
+                SELECT user_id, reminder_hour, reminder_minute
+                FROM users
+                WHERE reminder_hour IS NOT NULL
+                """
+            )
+
+
+def add_idea(user_id: int, brief: str, details: str) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO ideas (user_id, brief, details, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, brief, details, datetime.utcnow().isoformat()),
+        )
+        return cur.lastrowid
+
+
+def get_user_ideas(user_id: int):
+    with _conn() as c:
+        return c.execute(
+            "SELECT id, brief, details FROM ideas WHERE user_id = ? ORDER BY id",
+            (user_id,),
+        ).fetchall()
+
+
+def get_idea(idea_id: int, user_id: int):
+    with _conn() as c:
+        return c.execute(
+            "SELECT id, brief, details FROM ideas WHERE id = ? AND user_id = ?",
+            (idea_id, user_id),
+        ).fetchone()
+
+
+def delete_idea(idea_id: int, user_id: int):
+    with _conn() as c:
+        c.execute(
+            "DELETE FROM ideas WHERE id = ? AND user_id = ?",
+            (idea_id, user_id),
+        )
+
+
+def get_all_user_ids():
+    with _conn() as c:
+        rows = c.execute("SELECT user_id FROM users").fetchall()
+        return [r[0] for r in rows]
+
+
+def upsert_user(user_id: int, default_hour: int = 10, default_minute: int = 0):
+    """Создаёт пользователя, если его нет, и сразу одно дефолтное напоминание."""
+    with _conn() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
+            (user_id,),
+        )
+        # Если у пользователя нет ни одного напоминания — добавляем дефолтное.
+        has = c.execute(
+            "SELECT 1 FROM reminders WHERE user_id = ? LIMIT 1", (user_id,)
+        ).fetchone()
+        if not has:
+            c.execute(
+                "INSERT OR IGNORE INTO reminders (user_id, hour, minute) VALUES (?, ?, ?)",
+                (user_id, default_hour, default_minute),
+            )
+
+
+def get_user_timezone(user_id: int) -> str:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT timezone FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return row[0] if row and row[0] else DEFAULT_TIMEZONE
+
+
+def set_user_timezone(user_id: int, tz: str):
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO users (user_id, timezone) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET timezone = excluded.timezone",
+            (user_id, tz),
+        )
+
+
+def get_user_reminders(user_id: int):
+    with _conn() as c:
+        return c.execute(
+            "SELECT id, hour, minute FROM reminders WHERE user_id = ? ORDER BY hour, minute",
+            (user_id,),
+        ).fetchall()
+
+
+def add_reminder(user_id: int, hour: int, minute: int) -> bool:
+    """Возвращает True, если добавлено; False, если уже есть такое же время."""
+    with _conn() as c:
+        try:
+            c.execute(
+                "INSERT INTO reminders (user_id, hour, minute) VALUES (?, ?, ?)",
+                (user_id, hour, minute),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+
+def delete_reminder(reminder_id: int, user_id: int):
+    with _conn() as c:
+        c.execute(
+            "DELETE FROM reminders WHERE id = ? AND user_id = ?",
+            (reminder_id, user_id),
+        )
+
+
+def add_task(
+    user_id: int,
+    text: str,
+    title: str | None = None,
+    body: str | None = None,
+    due_date: str = "",
+    due_time: str = "",
+    timezone: str = "",
+) -> int:
+    title = (title or text or "").strip()
+    body = (body or text or "").strip()
+    text = (text or title or body).strip()
+    with _conn() as c:
+        cur = c.execute(
+            """
+            INSERT INTO tasks (user_id, text, title, body, due_date, due_time, timezone, notified_at, done, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, '', 0, ?)
+            """,
+            (user_id, text, title, body, due_date or "", due_time or "", timezone or "", datetime.utcnow().isoformat()),
+        )
+        return cur.lastrowid
+
+
+def get_user_tasks(user_id: int):
+    with _conn() as c:
+        return c.execute(
+            """
+            SELECT
+                id,
+                COALESCE(NULLIF(title, ''), text) AS title,
+                done,
+                COALESCE(NULLIF(body, ''), text) AS body,
+                due_date,
+                due_time,
+                timezone
+            FROM tasks
+            WHERE user_id = ?
+            ORDER BY done, id
+            """,
+            (user_id,),
+        ).fetchall()
+
+
+def get_task(task_id: int, user_id: int):
+    with _conn() as c:
+        return c.execute(
+            """
+            SELECT
+                id,
+                COALESCE(NULLIF(title, ''), text) AS title,
+                done,
+                COALESCE(NULLIF(body, ''), text) AS body,
+                due_date,
+                due_time,
+                timezone
+            FROM tasks
+            WHERE id = ? AND user_id = ?
+            """,
+            (task_id, user_id),
+        ).fetchone()
+
+
+def set_task_done(task_id: int, user_id: int, done: bool):
+    with _conn() as c:
+        c.execute(
+            "UPDATE tasks SET done = ? WHERE id = ? AND user_id = ?",
+            (1 if done else 0, task_id, user_id),
+        )
+
+
+def get_due_tasks():
+    with _conn() as c:
+        return c.execute(
+            """
+            SELECT
+                id,
+                user_id,
+                COALESCE(NULLIF(title, ''), text) AS title,
+                done,
+                COALESCE(NULLIF(body, ''), text) AS body,
+                due_date,
+                due_time,
+                timezone,
+                reminder_day_sent_at,
+                reminder_30_sent_at,
+                reminder_15_sent_at
+            FROM tasks
+            WHERE done = 0
+              AND due_date != ''
+            ORDER BY due_date, due_time, id
+            """
+        ).fetchall()
+
+
+def mark_task_notified(task_id: int, user_id: int):
+    with _conn() as c:
+        c.execute(
+            "UPDATE tasks SET notified_at = ? WHERE id = ? AND user_id = ?",
+            (datetime.utcnow().isoformat(), task_id, user_id),
+        )
+
+
+def mark_task_reminder_sent(task_id: int, user_id: int, reminder_kind: str):
+    columns = {
+        "day": "reminder_day_sent_at",
+        "pre30": "reminder_30_sent_at",
+        "pre15": "reminder_15_sent_at",
+    }
+    column = columns.get(reminder_kind)
+    if not column:
+        raise ValueError(f"Unknown reminder kind: {reminder_kind}")
+    now_iso = datetime.utcnow().isoformat()
+    with _conn() as c:
+        c.execute(
+            f"UPDATE tasks SET {column} = ?, notified_at = CASE WHEN notified_at = '' THEN ? ELSE notified_at END WHERE id = ? AND user_id = ?",
+            (now_iso, now_iso, task_id, user_id),
+        )
+
+
+def delete_task(task_id: int, user_id: int):
+    with _conn() as c:
+        c.execute(
+            "DELETE FROM tasks WHERE id = ? AND user_id = ?",
+            (task_id, user_id),
+        )
