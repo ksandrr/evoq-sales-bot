@@ -729,9 +729,10 @@ def parse_weeek_edit_request(text: str) -> dict | None:
     if not normalized:
         return None
 
+    verb = r"(?:отредактируй|редактируй|измен(?:и|ить|ение|ие)?|поменяй|обнови)"
     patterns = (
-        (r"^(?:мира[,:\s-]*)?(?:пожалуйста\s+)?(?:отредактируй|редактируй|измени|поменяй|обнови)\s+(?:тему|название|заголовок)\s*(?:на|вот на)?\s+(.+)$", "title"),
-        (r"^(?:мира[,:\s-]*)?(?:пожалуйста\s+)?(?:отредактируй|редактируй|измени|поменяй|обнови)\s+описани[ея]\s*(?:на|вот на)?\s+(.+)$", "body"),
+        (rf"^(?:мир(?:а)?[,:\s-]*)?(?:пожалуйста\s+)?{verb}\s+(?:тему|название|заголовок)\s*(?:на|вот на)?\s+(.+)$", "title"),
+        (rf"^(?:мир(?:а)?[,:\s-]*)?(?:пожалуйста\s+)?{verb}\s+описани[ея]\s*(?:на|вот на)?\s+(.+)$", "body"),
     )
     for pattern, field in patterns:
         match = re.match(pattern, normalized, flags=re.IGNORECASE)
@@ -3825,7 +3826,16 @@ def weeek_edit_keyboard() -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("Менять название", callback_data="weeek_edit_field:title")],
             [InlineKeyboardButton("Менять описание", callback_data="weeek_edit_field:body")],
-            [InlineKeyboardButton("До черновика", callback_data="weeek_edit_back")],
+            [InlineKeyboardButton("Назад", callback_data="weeek_edit_back")],
+            [InlineKeyboardButton("✖️ Отмена", callback_data="weeek_cancel")],
+        ]
+    )
+
+
+def weeek_edit_value_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Назад", callback_data="weeek_edit_back")],
             [InlineKeyboardButton("✖️ Отмена", callback_data="weeek_cancel")],
         ]
     )
@@ -4331,7 +4341,7 @@ async def _prompt_weeek_edit_field(message, context: ContextTypes.DEFAULT_TYPE, 
     _set_active_flow(context, "weeek_edit")
     await message.reply_text(
         f"Пришли новое {_weeek_edit_field_label(field)} текстом или голосом.",
-        reply_markup=weeek_edit_keyboard(),
+        reply_markup=weeek_edit_value_keyboard(),
     )
     return WEEEK_EDIT
 
@@ -4363,7 +4373,7 @@ async def _apply_weeek_edit_from_text(message, context: ContextTypes.DEFAULT_TYP
     if not _apply_weeek_draft_edit(draft, field, value):
         await message.reply_text(
             f"Не смог обновить {_weeek_edit_field_label(field)}. Пришли непустой текст ещё раз.",
-            reply_markup=weeek_edit_keyboard(),
+            reply_markup=weeek_edit_value_keyboard() if draft.get("edit_field") else weeek_edit_keyboard(),
         )
         return WEEEK_EDIT
 
@@ -4389,7 +4399,10 @@ async def _maybe_handle_weeek_live_edit(update: Update, context: ContextTypes.DE
         has_edit_field=bool(draft.get("edit_field")),
         parsed_field=(parsed or {}).get("field", ""),
     )
-    return await _apply_weeek_edit_from_text(update.message, context, text)
+    result = await _apply_weeek_edit_from_text(update.message, context, text)
+    if source in {"voice_top_level", "text_top_level"}:
+        return ConversationHandler.END
+    return result
 
 
 async def _start_weeek_capture(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_text: str, return_state: bool = False):
@@ -4838,6 +4851,7 @@ async def weeek_preview_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     data = query.data or ""
+    _log_event("weeek_preview_callback", data=data, active_flow=context.user_data.get("_active_flow", ""))
 
     if data == "weeek_cancel":
         _clear_weeek_draft(context)
@@ -4850,6 +4864,10 @@ async def weeek_preview_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     if data == "weeek_repick_parent":
         return await _send_weeek_parent_picker(query.message, context)
+
+    if data == "weeek_edit":
+        await query.answer("Выбираем, что менять в черновике.")
+        return await _show_weeek_edit_menu(query.message, context)
 
     if data != "weeek_create":
         return WEEEK_PREVIEW

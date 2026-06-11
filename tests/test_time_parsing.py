@@ -760,6 +760,16 @@ class WeeekProjectBoardSelectionTests(unittest.TestCase):
 
         self.assertEqual(parsed, {"field": "title", "value": "Срочно позвонить клиенту"})
 
+    def test_parse_weeek_edit_request_accepts_mir_prefix_and_change_verb(self):
+        parsed = bot.parse_weeek_edit_request("Мир, измени описание на купить велосипед")
+
+        self.assertEqual(parsed, {"field": "body", "value": "купить велосипед"})
+
+    def test_parse_weeek_edit_request_accepts_typo_like_izmenie(self):
+        parsed = bot.parse_weeek_edit_request("измение описание на купить велосипед")
+
+        self.assertEqual(parsed, {"field": "body", "value": "купить велосипед"})
+
     def test_apply_weeek_draft_edit_updates_capture_and_clears_pending_field(self):
         draft = {
             "capture": {"title": "Старый заголовок", "body": "Старое описание"},
@@ -806,8 +816,29 @@ class WeeekProjectBoardSelectionTests(unittest.TestCase):
         with patch.object(bot, "_show_weeek_preview", AsyncMock(return_value=bot.WEEEK_PREVIEW)):
             result = asyncio.run(bot.text_top_level(update, context))
 
-        self.assertEqual(result, bot.WEEEK_PREVIEW)
+        self.assertEqual(result, bot.ConversationHandler.END)
         self.assertEqual(draft["capture"]["title"], "Купить молоко")
+
+    def test_text_top_level_returns_end_after_live_edit_interception(self):
+        draft = {
+            "project_id": "6",
+            "board_id": "10",
+            "column_id": "29",
+            "capture": {"title": "Старый заголовок", "body": "Старое описание"},
+        }
+        context = types.SimpleNamespace(user_data={"weeek_draft": draft, "_active_flow": "weeek_preview"})
+        message = types.SimpleNamespace(
+            text="измени описание на купить велосипед",
+            reply_text=AsyncMock(),
+            reply_html=AsyncMock(),
+        )
+        update = types.SimpleNamespace(message=message)
+
+        with patch.object(bot, "_show_weeek_preview", AsyncMock(return_value=bot.WEEEK_PREVIEW)):
+            result = asyncio.run(bot.text_top_level(update, context))
+
+        self.assertEqual(result, bot.ConversationHandler.END)
+        self.assertEqual(draft["capture"]["body"], "купить велосипед")
 
 
 class WeeekPayloadTests(unittest.TestCase):
