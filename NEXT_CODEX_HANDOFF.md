@@ -1,5 +1,93 @@
 # NEXT CODEX HANDOFF
 
+## Session 2026-06-11: Deployed editable Weeek draft preview to live server
+
+### Session Goal
+
+- Investigate a live-user report that the new `Редактировать` button was missing in the Weeek draft preview and that a voice phrase like `Мира, отредактируй название ...` created a new draft instead of editing the current one.
+- Verify whether the bug was in code or in deploy/runtime state, then bring live Telegram behavior in sync with the current branch.
+
+### What Changed
+
+- No new application code changes were required in this session.
+- Investigation showed:
+  - local branch already contained the new editable preview code (`a5b195d`, `aa00d24`)
+  - the Linux checkout at `/home/sanya/mira-task-bot` was still on old commit `36cf37b`
+  - `mira-task-bot.service` had been running continuously since `2026-06-08`, so Telegram was serving the stale process
+  - live logs for the user's `2026-06-11 23:43` voice message confirmed the old runtime interpreted `Мира, отредактируй название ...` as a brand-new Weeek task flow, not a preview edit flow
+- On the Linux server:
+  - pulled the branch forward to `aa00d24`
+  - ran server-side compile/test checks in `.venv`
+  - restarted `mira-task-bot.service` successfully via `sudo -n`
+  - confirmed the service is now active on the updated checkout
+
+### Files Edited
+
+- `C:\Users\gorbi\OneDrive\Документы\mira-task-bot\NEXT_CODEX_HANDOFF.md`
+
+### Commands Run
+
+```powershell
+git log --oneline -3
+rg -n "Редактировать|weeek_edit|weeek_preview_voice|weeek_preview_text|WEEEK_EDIT" bot.py tests\test_time_parsing.py -S
+git status --short --branch
+```
+
+```bash
+ssh ksandrr-linux
+cd /home/sanya/mira-task-bot
+pwd
+whoami
+git status --short --branch
+git log --oneline -5
+git remote -v
+systemctl status mira-task-bot.service --no-pager -l | head -n 25
+journalctl -u mira-task-bot.service -n 60 --no-pager
+git pull --ff-only origin tembo/telegram-idea-bot-daily-reminders
+.venv/bin/python -m py_compile bot.py weeek_client.py tests/test_time_parsing.py
+.venv/bin/python -m unittest discover -s tests
+sudo -n systemctl restart mira-task-bot.service
+systemctl is-active mira-task-bot.service
+systemctl status mira-task-bot.service --no-pager -l | head -n 12
+```
+
+### Tests
+
+- Server-side `.venv/bin/python -m py_compile bot.py weeek_client.py tests/test_time_parsing.py`: passed
+- Server-side `.venv/bin/python -m unittest discover -s tests`: passed (`55 tests`, `OK`)
+
+### Deploy Status
+
+- Linux checkout updated from `36cf37b` to `aa00d24`
+- `mira-task-bot.service` restarted successfully
+- Service status after restart:
+  - `active (running)`
+  - restart time: `2026-06-11 17:46:13 UTC`
+
+### .env / Secrets
+
+- No secrets were added or committed
+- No local `.env` changes
+- No server `.env` changes
+
+### Remaining Issues
+
+- The root cause of the user-visible bug was stale live deploy state, not missing code in the current branch.
+- A fresh manual Telegram smoke test is still required after the restart to confirm:
+  - the preview now shows `Редактировать`
+  - a voice command on preview like `Мира, отредактируй название на ...` edits the active draft instead of starting a new one
+
+### What Next Codex Should Check First
+
+1. In Telegram, open a new Weeek draft preview and confirm the `Редактировать` button is visible.
+2. While that preview is active, send voice: `Мира, отредактируй название на Купить апельсиновый сок`.
+3. If the live bot still misbehaves after the restart, inspect fresh logs after `2026-06-11 17:46:13 UTC` for:
+   - `weeek_preview_rendered`
+   - `weeek_edit`
+   - `voice_transcribed`
+   - `voice_route_detected`
+   - `weeek_capture_started`
+
 ## Session 2026-06-11: Added editable Weeek draft preview for title/description
 
 ### Session Goal
