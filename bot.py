@@ -281,6 +281,7 @@ WEEEK_PROJECT = 510
 WEEEK_BOARD = 520
 WEEEK_PARENT = 525
 WEEEK_COLUMN = 530
+WEEEK_EDIT = 535
 WEEEK_PREVIEW = 540
 
 REMINDER_JOB_PREFIX = "reminder:"
@@ -713,6 +714,44 @@ def build_weeek_task_title(capture: dict) -> str:
     if body and body.casefold() != title.casefold() and "см. описание" not in title.lower():
         title = f"{title} — см. описание"
     return title[:120]
+
+
+def _weeek_edit_field_label(field: str) -> str:
+    if field == "title":
+        return "название"
+    if field == "body":
+        return "описание"
+    return "поле"
+
+
+def parse_weeek_edit_request(text: str) -> dict | None:
+    normalized = _compact_spaces(text).strip()
+    if not normalized:
+        return None
+
+    patterns = (
+        (r"^(?:мира[,:\s-]*)?(?:пожалуйста\s+)?(?:отредактируй|редактируй|измени|поменяй|обнови)\s+(?:тему|название|заголовок)\s*(?:на|вот на)?\s+(.+)$", "title"),
+        (r"^(?:мира[,:\s-]*)?(?:пожалуйста\s+)?(?:отредактируй|редактируй|измени|поменяй|обнови)\s+описани[ея]\s*(?:на|вот на)?\s+(.+)$", "body"),
+    )
+    for pattern, field in patterns:
+        match = re.match(pattern, normalized, flags=re.IGNORECASE)
+        if not match:
+            continue
+        value = _compact_spaces(match.group(1)).strip(" .,!?:;\"'«»")
+        if value:
+            return {"field": field, "value": value}
+    return None
+
+
+def _apply_weeek_draft_edit(draft: dict, field: str, value: str) -> bool:
+    capture = draft.get("capture") or {}
+    clean_value = _compact_spaces(value).strip()
+    if field not in {"title", "body"} or not clean_value:
+        return False
+    capture[field] = clean_value
+    draft["capture"] = capture
+    draft.pop("edit_field", None)
+    return True
 
 
 def weeek_preview_message(draft: dict) -> str:
@@ -2883,6 +2922,9 @@ async def weeek_preview_callback(update: Update, context: ContextTypes.DEFAULT_T
     if data == "weeek_repick_parent":
         return await _send_weeek_parent_picker(query.message, context)
 
+    if data == "weeek_edit":
+        return await _show_weeek_edit_menu(query.message, context)
+
     if data != "weeek_create":
         return WEEEK_PREVIEW
 
@@ -3757,6 +3799,7 @@ def weeek_preview_keyboard(draft: dict | None = None) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton("✅ Создать в Weeek", callback_data="weeek_create")]]
     if draft.get("target") == "weeek_subtask":
         rows.append([InlineKeyboardButton("🔁 Выбрать родителя заново", callback_data="weeek_repick_parent")])
+    rows.append([InlineKeyboardButton("🎨 Редактировать", callback_data="weeek_edit")])
     rows.append([InlineKeyboardButton("✖️ Отмена", callback_data="weeek_cancel")])
     return InlineKeyboardMarkup(rows)
 
@@ -3767,6 +3810,17 @@ def weeek_preview_message_ex(draft: dict) -> str:
 
 def weeek_preview_keyboard_ex(draft: dict | None = None) -> InlineKeyboardMarkup:
     return weeek_preview_keyboard(draft)
+
+
+def weeek_edit_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Менять название", callback_data="weeek_edit_field:title")],
+            [InlineKeyboardButton("Менять описание", callback_data="weeek_edit_field:body")],
+            [InlineKeyboardButton("До черновика", callback_data="weeek_edit_back")],
+            [InlineKeyboardButton("✖️ Отмена", callback_data="weeek_cancel")],
+        ]
+    )
 
 
 def _is_done_weeek_column(column: dict) -> bool:
@@ -3802,6 +3856,23 @@ async def _fail_weeek_flow(message, context: ContextTypes.DEFAULT_TYPE, user_tex
     _clear_weeek_draft(context)
     _clear_active_flow(context)
     return ConversationHandler.END
+
+
+async def weeek_edit_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+
+    if data == "weeek_edit_back":
+        return await _show_weeek_preview(query.message, context)
+    if data == "weeek_cancel":
+        return await weeek_preview_callback(update, context)
+    if not data.startswith("weeek_edit_field:"):
+        return WEEEK_EDIT
+    field = data.split(":", 1)[1]
+    if field not in {"title", "body"}:
+        return WEEEK_EDIT
+    return await _prompt_weeek_edit_field(query.message, context, field)
 
 
 def _weeek_browser_keyboard(options: list[dict], prefix: str) -> InlineKeyboardMarkup:
@@ -4204,6 +4275,7 @@ async def _send_weeek_parent_picker(message, context: ContextTypes.DEFAULT_TYPE)
 async def _show_weeek_preview(message, context: ContextTypes.DEFAULT_TYPE):
     draft = _get_weeek_draft(context)
     _set_active_flow(context, "weeek_preview")
+    draft.pop("edit_field", None)
     _log_event(
         "weeek_preview_rendered",
         project_id=draft.get("project_id", ""),
@@ -4217,6 +4289,75 @@ async def _show_weeek_preview(message, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=weeek_preview_keyboard(draft),
     )
     return WEEEK_PREVIEW
+
+
+async def _show_weeek_edit_menu(message, context: ContextTypes.DEFAULT_TYPE):
+    draft = _get_weeek_draft(context)
+    if not draft:
+        await message.reply_text("Черновик задачи Weeek потерян. Начни заново.", reply_markup=main_menu_keyboard())
+        _clear_active_flow(context)
+        return ConversationHandler.END
+    _set_active_flow(context, "weeek_edit")
+    draft.pop("edit_field", None)
+    await message.reply_text(
+        "Что именно поправить в черновике? Можно нажать кнопку ниже или сразу написать/надиктовать: "
+        "отредактируй описание ... или отредактируй название ...",
+        reply_markup=weeek_edit_keyboard(),
+    )
+    return WEEEK_EDIT
+
+
+async def _prompt_weeek_edit_field(message, context: ContextTypes.DEFAULT_TYPE, field: str):
+    draft = _get_weeek_draft(context)
+    if not draft:
+        await message.reply_text("Черновик задачи Weeek потерян. Начни заново.", reply_markup=main_menu_keyboard())
+        _clear_active_flow(context)
+        return ConversationHandler.END
+    draft["edit_field"] = field
+    _set_active_flow(context, "weeek_edit")
+    await message.reply_text(
+        f"Пришли новое {_weeek_edit_field_label(field)} текстом или голосом.",
+        reply_markup=weeek_edit_keyboard(),
+    )
+    return WEEEK_EDIT
+
+
+async def _apply_weeek_edit_from_text(message, context: ContextTypes.DEFAULT_TYPE, text: str):
+    draft = _get_weeek_draft(context)
+    if not draft:
+        await message.reply_text("Черновик задачи Weeek потерян. Начни заново.", reply_markup=main_menu_keyboard())
+        _clear_active_flow(context)
+        return ConversationHandler.END
+
+    parsed = parse_weeek_edit_request(text)
+    field = ""
+    value = ""
+    if parsed:
+        field = parsed["field"]
+        value = parsed["value"]
+    else:
+        field = draft.get("edit_field") or ""
+        value = text
+
+    if not field:
+        await message.reply_text(
+            "Не понял, что именно менять. Выбери поле кнопкой ниже или напиши: отредактируй описание ...",
+            reply_markup=weeek_edit_keyboard(),
+        )
+        return WEEEK_EDIT
+
+    if not _apply_weeek_draft_edit(draft, field, value):
+        await message.reply_text(
+            f"Не смог обновить {_weeek_edit_field_label(field)}. Пришли непустой текст ещё раз.",
+            reply_markup=weeek_edit_keyboard(),
+        )
+        return WEEEK_EDIT
+
+    await message.reply_html(
+        f"Обновил поле <b>{html.escape(_weeek_edit_field_label(field))}</b>.",
+        reply_markup=weeek_preview_keyboard(draft),
+    )
+    return await _show_weeek_preview(message, context)
 
 
 async def _start_weeek_capture(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_text: str, return_state: bool = False):
@@ -4397,6 +4538,41 @@ async def weeek_capture_voice(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not text:
         return WEEEK_CAPTURE
     return await _start_weeek_capture(update, context, text, return_state=True)
+
+
+async def weeek_preview_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text:
+        return WEEEK_PREVIEW
+    parsed = parse_weeek_edit_request(text)
+    if not parsed:
+        await update.message.reply_text(
+            "Сейчас открыт черновик Weeek. Нажми «Редактировать» или напиши команду вроде: отредактируй описание ...",
+            reply_markup=weeek_preview_keyboard(_get_weeek_draft(context)),
+        )
+        return WEEEK_PREVIEW
+    return await _apply_weeek_edit_from_text(update.message, context, text)
+
+
+async def weeek_preview_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = await _transcribe_or_warn(update, context, failure_reply_markup=weeek_preview_keyboard(_get_weeek_draft(context)))
+    if not text:
+        return WEEEK_PREVIEW
+    return await _apply_weeek_edit_from_text(update.message, context, text)
+
+
+async def weeek_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text:
+        return WEEEK_EDIT
+    return await _apply_weeek_edit_from_text(update.message, context, text)
+
+
+async def weeek_edit_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = await _transcribe_or_warn(update, context, failure_reply_markup=weeek_edit_keyboard())
+    if not text:
+        return WEEEK_EDIT
+    return await _apply_weeek_edit_from_text(update.message, context, text)
 
 
 async def clarify_reminder_time_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4799,6 +4975,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await weeek_parent_callback(update, context)
     if data.startswith("weeek_column:"):
         return await weeek_column_callback(update, context)
+    if data == "weeek_edit_back" or data.startswith("weeek_edit_field:"):
+        return await weeek_edit_callback(update, context)
     if data.startswith("weeek_"):
         return await weeek_preview_callback(update, context)
     return await _legacy_handle_callback(update, context)
@@ -4957,7 +5135,21 @@ def main():
                 CallbackQueryHandler(weeek_preview_callback, pattern="^weeek_cancel$"),
             ],
             WEEEK_PREVIEW: [
-                CallbackQueryHandler(weeek_preview_callback, pattern="^weeek_(create|repick_column|repick_parent|cancel)$"),
+                CallbackQueryHandler(weeek_preview_callback, pattern="^weeek_(create|repick_column|repick_parent|edit|cancel)$"),
+                MessageHandler(filters.VOICE | filters.AUDIO, weeek_preview_voice),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{BTN_CANCEL}$"),
+                    weeek_preview_text,
+                ),
+            ],
+            WEEEK_EDIT: [
+                CallbackQueryHandler(weeek_edit_callback, pattern="^weeek_edit_(field:.+|back)$"),
+                CallbackQueryHandler(weeek_preview_callback, pattern="^weeek_cancel$"),
+                MessageHandler(filters.VOICE | filters.AUDIO, weeek_edit_voice),
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND & ~filters.Regex(f"^{BTN_CANCEL}$"),
+                    weeek_edit_text,
+                ),
             ],
         },
         fallbacks=[

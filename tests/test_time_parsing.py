@@ -750,6 +750,44 @@ class WeeekProjectBoardSelectionTests(unittest.TestCase):
         self.assertEqual(board["id"], "12")
         self.assertIn(source, {"exact", "normalized", "fuzzy"})
 
+    def test_parse_weeek_edit_request_detects_description(self):
+        parsed = bot.parse_weeek_edit_request("Мира, отредактируй описание на Купить молоко и хлеб")
+
+        self.assertEqual(parsed, {"field": "body", "value": "Купить молоко и хлеб"})
+
+    def test_parse_weeek_edit_request_detects_title(self):
+        parsed = bot.parse_weeek_edit_request("редактируй название Срочно позвонить клиенту")
+
+        self.assertEqual(parsed, {"field": "title", "value": "Срочно позвонить клиенту"})
+
+    def test_apply_weeek_draft_edit_updates_capture_and_clears_pending_field(self):
+        draft = {
+            "capture": {"title": "Старый заголовок", "body": "Старое описание"},
+            "edit_field": "body",
+        }
+
+        result = bot._apply_weeek_draft_edit(draft, "body", "  Новое описание  ")
+
+        self.assertTrue(result)
+        self.assertEqual(draft["capture"]["body"], "Новое описание")
+        self.assertNotIn("edit_field", draft)
+
+    def test_weeek_preview_text_applies_direct_edit_command(self):
+        draft = {"capture": {"title": "Задача", "body": "Старое описание"}}
+        context = types.SimpleNamespace(user_data={"weeek_draft": draft})
+        message = types.SimpleNamespace(
+            text="отредактируй описание на Новое описание для задачи",
+            reply_text=AsyncMock(),
+            reply_html=AsyncMock(),
+        )
+        update = types.SimpleNamespace(message=message)
+
+        with patch.object(bot, "_show_weeek_preview", AsyncMock(return_value=bot.WEEEK_PREVIEW)):
+            result = asyncio.run(bot.weeek_preview_text(update, context))
+
+        self.assertEqual(result, bot.WEEEK_PREVIEW)
+        self.assertEqual(draft["capture"]["body"], "Новое описание для задачи")
+
 
 class WeeekPayloadTests(unittest.TestCase):
     def test_due_datetime_is_sent_without_conflicting_due_fields(self):

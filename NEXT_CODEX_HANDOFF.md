@@ -1,5 +1,83 @@
 # NEXT CODEX HANDOFF
 
+## Session 2026-06-11: Added editable Weeek draft preview for title/description
+
+### Session Goal
+
+- Check current git sync state before new work.
+- Add a `Редактировать` path to the Weeek draft preview after board selection so the user can change task title/description by button, text, or voice before creating the task.
+
+### What Changed
+
+- In `bot.py`:
+  - verified local branch had no unpushed commits and no new commits on `origin/tembo/telegram-idea-bot-daily-reminders` after `git fetch`
+  - added new conversation state `WEEEK_EDIT`
+  - added `🎨 Редактировать` button to the Weeek preview keyboard
+  - added edit helpers:
+    - `parse_weeek_edit_request(...)`
+    - `_apply_weeek_draft_edit(...)`
+    - `_show_weeek_edit_menu(...)`
+    - `_prompt_weeek_edit_field(...)`
+    - `_apply_weeek_edit_from_text(...)`
+  - added preview/edit handlers so the user can:
+    - tap `Редактировать`, choose `название` or `описание`, then send text or voice
+    - stay on preview and directly send text/voice like `отредактируй описание ...`
+  - kept the existing create/cancel flow intact after edit
+- In `tests/test_time_parsing.py`:
+  - added regression tests for parsing edit commands
+  - added a regression test for draft mutation after direct preview edit text
+
+### Files Edited
+
+- `C:\Users\gorbi\OneDrive\Документы\mira-task-bot\bot.py`
+- `C:\Users\gorbi\OneDrive\Документы\mira-task-bot\tests\test_time_parsing.py`
+- `C:\Users\gorbi\OneDrive\Документы\mira-task-bot\NEXT_CODEX_HANDOFF.md`
+
+### Commands Run
+
+```powershell
+git status --short --branch
+git log --oneline -5
+git remote -v
+git branch -vv
+git rev-list --left-right --count origin/tembo/telegram-idea-bot-daily-reminders...HEAD
+git fetch origin
+rg -n "Weeek|board|draft|cancel|создат|отмен|voice|selected_board|choose board|task draft|чернов" bot.py README.md NEXT_CODEX_HANDOFF.md docs -S
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m py_compile bot.py weeek_client.py tests\test_time_parsing.py
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m unittest discover -s tests
+```
+
+### Tests
+
+- `py_compile` on `bot.py`, `weeek_client.py`, `tests/test_time_parsing.py`: passed
+- `unittest discover -s tests`: passed (`55 tests`, `OK`)
+
+### Deploy Status
+
+- No new commit created in this session
+- No push was needed because local branch was already synchronized before edits
+- No Linux deploy was performed in this session
+
+### .env / Secrets
+
+- No secrets were added or committed
+- No `.env` values were changed locally
+- No server `.env` values were changed
+
+### Remaining Issues
+
+- The new editable preview flow is covered by unit tests, but still needs one real Telegram smoke test for:
+  - button path: preview -> `Редактировать` -> `описание` -> voice/text edit -> `Создать в Weeek`
+  - direct command path from preview: `отредактируй описание ...`
+
+### What Next Codex Should Check First
+
+1. Run a real Telegram check with a voice task that reaches board selection and preview.
+2. On preview, test both:
+   - tap `Редактировать` and send a replacement description by voice
+   - send a direct phrase like `отредактируй описание на ...` without pressing the button first
+3. If users want richer editing later, extend the same flow to due date/time and board/column re-selection from one unified edit menu.
+
 ## Session Goal
 
 Make Mira ask which Weeek board to use inside the `Личное` project now that the project contains multiple boards (`Моя доска`, `Мира`, `CRM Бот`), push the fix, update the Linux server checkout, and verify the deploy path as far as current permissions safely allow.
