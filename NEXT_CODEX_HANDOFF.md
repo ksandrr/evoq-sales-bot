@@ -1,5 +1,94 @@
 # NEXT CODEX HANDOFF
 
+## Session 2026-06-11: Fixed live edit interception for active Weeek drafts
+
+### Session Goal
+
+- Investigate the follow-up live bug after deploy:
+  - `Редактировать` button was visible
+  - but voice like `Мира, отредактируй название ...` still started a brand-new Weeek flow
+  - and the button action itself did not appear to transition the user into a usable edit mode
+
+### What Changed
+
+- In `bot.py`:
+  - identified the real architectural issue: most user-created Weeek drafts come from the top-level `capture_conv`, not from `weeek_conv`
+  - because of that, preview voice/text edits inside `weeek_conv` were not protecting the live top-level handlers
+  - added `_has_editable_weeek_draft(...)`
+  - added `_maybe_handle_weeek_live_edit(...)`
+  - changed `voice_top_level(...)` so it now checks for an active editable Weeek draft before starting a new task flow
+  - changed `text_top_level(...)` with the same interception logic
+  - added logging:
+    - `weeek_preview_callback`
+    - `weeek_edit_menu_opened`
+    - `weeek_live_edit_intercepted`
+- In `tests/test_time_parsing.py`:
+  - added a regression test verifying `text_top_level(...)` edits the active draft instead of starting a new task flow
+
+### Files Edited
+
+- `C:\Users\gorbi\OneDrive\Документы\mira-task-bot\bot.py`
+- `C:\Users\gorbi\OneDrive\Документы\mira-task-bot\tests\test_time_parsing.py`
+- `C:\Users\gorbi\OneDrive\Документы\mira-task-bot\NEXT_CODEX_HANDOFF.md`
+
+### Commands Run
+
+```powershell
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m py_compile bot.py weeek_client.py tests\test_time_parsing.py
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m unittest discover -s tests
+git add bot.py tests/test_time_parsing.py
+git commit -m "Fix live Weeek draft edit interception"
+git push origin tembo/telegram-idea-bot-daily-reminders
+```
+
+```bash
+ssh ksandrr-linux
+cd /home/sanya/mira-task-bot
+git pull --ff-only origin tembo/telegram-idea-bot-daily-reminders
+.venv/bin/python -m py_compile bot.py weeek_client.py tests/test_time_parsing.py
+.venv/bin/python -m unittest discover -s tests
+sudo -n systemctl restart mira-task-bot.service
+systemctl is-active mira-task-bot.service
+git log --oneline -3
+```
+
+### Tests
+
+- Local bundled Python `py_compile`: passed
+- Local bundled Python `unittest discover -s tests`: passed (`56 tests`, `OK`)
+- Server-side `.venv/bin/python -m py_compile ...`: passed
+- Server-side `.venv/bin/python -m unittest discover -s tests`: passed (`56 tests`, `OK`)
+
+### Deploy Status
+
+- GitHub branch updated to commit:
+  - `82ae704` `Fix live Weeek draft edit interception`
+- Linux checkout updated to `82ae704`
+- `mira-task-bot.service` restarted successfully after deploy
+
+### .env / Secrets
+
+- No secrets were added or committed
+- No local `.env` changes
+- No server `.env` changes
+
+### Remaining Issues
+
+- Manual Telegram smoke test is still needed after commit `82ae704` to confirm:
+  - pressing `Редактировать` visibly opens the edit menu
+  - voice while the preview is active edits the current draft instead of opening project/board pickers again
+
+### What Next Codex Should Check First
+
+1. In Telegram, create a fresh Weeek draft preview.
+2. Tap `Редактировать` and confirm a new message appears asking what to change.
+3. Without leaving the active draft, send voice:
+   - `Мира, отредактируй название на Купить молоко`
+4. If anything still opens a new flow, inspect fresh server logs for:
+   - `weeek_preview_callback`
+   - `weeek_edit_menu_opened`
+   - `weeek_live_edit_intercepted`
+
 ## Session 2026-06-11: Deployed editable Weeek draft preview to live server
 
 ### Session Goal
