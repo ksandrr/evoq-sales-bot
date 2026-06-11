@@ -1,5 +1,98 @@
 # NEXT CODEX HANDOFF
 
+## Session 2026-06-12: Fixed Weeek edit button callback and simplified edit UX
+
+### Session Goal
+
+- Fix the remaining issues in the live Weeek draft edit flow reported after midnight local time:
+  - tapping `Редактировать` did not reliably open the edit menu
+  - after choosing a field, the bot still kept showing `Менять название / Менять описание`
+  - `До черновика` label felt wrong
+  - phrases like `измени описание ...` or typo-like variants were not always recognized
+
+### What Changed
+
+- In `bot.py`:
+  - found a second later `weeek_preview_callback(...)` definition that was overriding the earlier version and silently dropping the `weeek_edit` branch
+  - patched the active later callback so `weeek_edit` now really opens the edit menu
+  - added logging for the active callback path via `weeek_preview_callback`
+  - expanded `parse_weeek_edit_request(...)`:
+    - accepts `Мир, ...` and `Мира, ...`
+    - accepts broader edit verbs including `измени`, `изменить`, `измение`, `изменение`
+  - added `weeek_edit_value_keyboard()` for the second step after a field is already chosen
+  - changed `_prompt_weeek_edit_field(...)` so it now shows only:
+    - `Назад`
+    - `Отмена`
+  - renamed `До черновика` to `Назад`
+  - kept the full field picker keyboard only for the first choice step
+  - kept top-level live edit interception returning `ConversationHandler.END`, so PTB no longer needs to track `WEEEK_PREVIEW` / `WEEEK_EDIT` as a state of the top-level capture conversation
+- In `tests/test_time_parsing.py`:
+  - added regression tests for `Мир, измени описание ...`
+  - added regression tests for typo-like `измение описание ...`
+  - updated top-level live edit expectations to the new `ConversationHandler.END` behavior
+
+### Files Edited
+
+- `C:\Users\gorbi\OneDrive\Документы\mira-task-bot\bot.py`
+- `C:\Users\gorbi\OneDrive\Документы\mira-task-bot\tests\test_time_parsing.py`
+- `C:\Users\gorbi\OneDrive\Документы\mira-task-bot\NEXT_CODEX_HANDOFF.md`
+
+### Commands Run
+
+```powershell
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m py_compile bot.py weeek_client.py tests\test_time_parsing.py
+& 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m unittest discover -s tests
+git add bot.py tests/test_time_parsing.py
+git commit -m "Fix Weeek edit menu UX and parsing"
+git push origin tembo/telegram-idea-bot-daily-reminders
+```
+
+```bash
+ssh ksandrr-linux
+cd /home/sanya/mira-task-bot
+git pull --ff-only origin tembo/telegram-idea-bot-daily-reminders
+.venv/bin/python -m py_compile bot.py weeek_client.py tests/test_time_parsing.py
+.venv/bin/python -m unittest discover -s tests
+sudo -n systemctl restart mira-task-bot.service
+systemctl is-active mira-task-bot.service
+git log --oneline -3
+```
+
+### Tests
+
+- Local bundled Python `py_compile`: passed
+- Local bundled Python `unittest discover -s tests`: passed (`59 tests`, `OK`)
+- Server-side `.venv/bin/python -m py_compile ...`: passed
+- Server-side `.venv/bin/python -m unittest discover -s tests`: passed (`59 tests`, `OK`)
+
+### Deploy Status
+
+- GitHub branch updated to commit:
+  - `fdf31a8` `Fix Weeek edit menu UX and parsing`
+- Linux checkout updated to `fdf31a8`
+- `mira-task-bot.service` restarted successfully after deploy
+
+### .env / Secrets
+
+- No secrets were added or committed
+- No local `.env` changes
+- No server `.env` changes
+
+### Remaining Issues
+
+- Manual Telegram smoke test is still required for the exact user UX:
+  - tap `Редактировать`
+  - tap `Менять название`
+  - confirm only `Назад` / `Отмена` remain
+  - send text or voice replacement
+  - send `измени описание на ...` directly from preview
+
+### What Next Codex Should Check First
+
+1. Reproduce the exact midnight flow from the user screenshots on live Telegram.
+2. Confirm `weeek_preview_callback` and `weeek_edit_menu_opened` appear in logs after tapping `Редактировать`.
+3. If STT still emits edge-case phrases that do not match edit parsing, inspect fresh `voice_transcribed` text and extend `parse_weeek_edit_request(...)` again from real transcripts.
+
 ## Session 2026-06-11: Fixed live edit interception for active Weeek drafts
 
 ### Session Goal
