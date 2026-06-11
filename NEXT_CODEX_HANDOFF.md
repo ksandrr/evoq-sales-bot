@@ -45,6 +45,9 @@ git fetch origin
 rg -n "Weeek|board|draft|cancel|создат|отмен|voice|selected_board|choose board|task draft|чернов" bot.py README.md NEXT_CODEX_HANDOFF.md docs -S
 & 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m py_compile bot.py weeek_client.py tests\test_time_parsing.py
 & 'C:\Users\gorbi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m unittest discover -s tests
+git add bot.py tests/test_time_parsing.py NEXT_CODEX_HANDOFF.md
+git commit -m "Add editable Weeek draft preview"
+git push origin tembo/telegram-idea-bot-daily-reminders
 ```
 
 ### Tests
@@ -54,8 +57,9 @@ rg -n "Weeek|board|draft|cancel|создат|отмен|voice|selected_board|cho
 
 ### Deploy Status
 
-- No new commit created in this session
-- No push was needed because local branch was already synchronized before edits
+- GitHub branch updated: `tembo/telegram-idea-bot-daily-reminders`
+- New commit pushed:
+  - `a5b195d` `Add editable Weeek draft preview`
 - No Linux deploy was performed in this session
 
 ### .env / Secrets
